@@ -181,6 +181,22 @@ impl Hvs {
         Hvs { regs }
     }
 
+    /// An HVS in normal memory with channel 1 enabled at this size, for
+    /// testing everything but the picture where there is no HVS (QEMU).
+    pub fn fake(width: u32, height: u32) -> Self {
+        let regs = Box::leak(vec![0u32; HVS_SIZE / 4].into_boxed_slice()).as_mut_ptr();
+        let hvs = Hvs { regs };
+        hvs.set_reg(SCALER_DISPCTRL, SCALER_DISPCTRL_ENABLE);
+        hvs.set_reg(
+            scaler_dispctrlx(1),
+            SCALER_DISPCTRLX_ENABLE
+                | SCALER_DISPCTRLX_WIDTH.set(width)
+                | SCALER_DISPCTRLX_HEIGHT.set(height),
+        );
+        hvs.set_reg(SCALER_DLIST_START, SCALER_CTL0_END);
+        hvs
+    }
+
     fn reg(&self, offset: usize) -> u32 {
         unsafe { self.regs.add(offset / 4).read_volatile() }
     }

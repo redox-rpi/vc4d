@@ -47,7 +47,14 @@ pub struct Vc4Adapter {
     pub cursor: Option<Shown>,
     /// A client set no mode: the screen shows only the background.
     pub blanked: bool,
+    /// Log every new display list, not only the first few.
+    pub log_lists: bool,
+    /// Display lists written so far.
+    pub lists: u32,
 }
+
+/// The first display lists always go to the log.
+const LOGGED_LISTS: u32 = 4;
 
 /// A plane in the current display list, with its buffer, which must live
 /// as long as the HVS reads it.
@@ -63,7 +70,7 @@ impl Vc4Adapter {
     fn update(&mut self) {
         let index = self.channel.index;
         let Some(primary) = &self.primary else {
-            // Back to the firmware's framebuffer.
+            println!("vc4d: no primary plane, firmware list again");
             self.hvs.set_list_start(index, self.firmware_list);
             return;
         };
@@ -81,6 +88,10 @@ impl Vc4Adapter {
         self.hvs.write_dlist(start, &list);
         self.hvs.set_list_start(index, start);
         self.next_slot = 1 - self.next_slot;
+        self.lists += 1;
+        if self.log_lists || self.lists <= LOGGED_LISTS {
+            println!("vc4d: list {} at {start}: {planes:?} {list:08x?}", self.lists);
+        }
     }
 
     /// The part of the framebuffer that is on screen, with the top left

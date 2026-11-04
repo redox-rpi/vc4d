@@ -36,7 +36,10 @@ and leaves one HVS channel running with its own display list. `vc4d`:
 Not yet: EDID and other modes, vertical blank interrupts, windows as
 planes (needs Orbital changes), the pixel valve and HDMI.
 
-`VC4D=off` in the environment leaves the display to `vesad` or `rpi-fbd`.
+Environment (the bootloader's): `VC4D=off` leaves the display to `vesad` or
+`rpi-fbd`. `VC4D_FAKE=WIDTHxHEIGHT` runs against an HVS in normal memory, for
+QEMU, which has none: everything but the picture. `VC4D_LOG=1` logs every
+new display list (the first four always are).
 
 ## Build
 

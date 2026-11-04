@@ -15,7 +15,10 @@
 // adapter.rs for the files). soc_phys() and ram_bus_offset() come from
 // redox-rpi's rpi-fbd (MIT).
 //
-// VC4D=off in the environment leaves the display to vesad or rpi-fbd.
+// Environment: VC4D=off leaves the display to vesad or rpi-fbd.
+// VC4D_FAKE=WIDTHxHEIGHT runs against an HVS in memory (QEMU has none):
+// everything but the picture. VC4D_LOG=1 logs every new display list (the
+// first ones are always logged).
 
 use std::env;
 use std::thread;
@@ -64,13 +67,22 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     let phys = fdt.as_ref().map_or(bus_addr, |fdt| soc_phys(fdt, bus_addr));
     let ram_bus_offset = fdt.as_ref().map_or(RAM_BUS_OFFSET, ram_bus_offset);
 
-    let regs = match unsafe {
-        common::physmap(phys, HVS_SIZE, common::Prot::RW, common::MemoryType::DeviceMemory)
-    } {
-        Ok(regs) => regs as *mut u32,
-        Err(err) => give_up(daemon, &format!("failed to map the HVS at {phys:#x}: {err:?}")),
+    let fake = env::var("VC4D_FAKE").ok().and_then(|v| parse_size(&v));
+    let hvs = match fake {
+        Some((width, height)) => {
+            println!("vc4d: VC4D_FAKE: an HVS in memory at {width}x{height}, nothing on the screen");
+            Hvs::fake(width, height)
+        }
+        None => {
+            let regs = match unsafe {
+                common::physmap(phys, HVS_SIZE, common::Prot::RW, common::MemoryType::DeviceMemory)
+            } {
+                Ok(regs) => regs as *mut u32,
+                Err(err) => give_up(daemon, &format!("failed to map the HVS at {phys:#x}: {err:?}")),
+            };
+            unsafe { Hvs::new(regs) }
+        }
     };
-    let hvs = unsafe { Hvs::new(regs) };
     println!(
         "vc4d: HVS at {phys:#x}, id {:#010x}, {}",
         hvs.id(),
@@ -98,7 +110,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     // nothing; its frame count moves only when it runs.
     let before = hvs.frame_count(channel.index);
     thread::sleep(Duration::from_millis(50));
-    if hvs.frame_count(channel.index) == before {
+    if fake.is_none() && hvs.frame_count(channel.index) == before {
         give_up(daemon, &format!("channel {} does not run", channel.index));
     }
     println!(
@@ -115,6 +127,8 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         primary: None,
         cursor: None,
         blanked: false,
+        log_lists: fake.is_some() || env::var("VC4D_LOG").is_ok(),
+        lists: 0,
     };
     let mut scheme = GraphicsScheme::new(adapter, "display.vc4".to_owned(), false);
 
@@ -143,6 +157,12 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     }
 
     panic!();
+}
+
+fn parse_size(value: &str) -> Option<(u32, u32)> {
+    let (w, h) = value.split_once('x')?;
+    let (w, h) = (w.parse().ok()?, h.parse().ok()?);
+    ((1..=4096).contains(&w) && (1..=4096).contains(&h)).then_some((w, h))
 }
 
 /// The CPU physical address of a peripheral's bus address, through `/soc`'s
