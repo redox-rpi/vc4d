@@ -182,6 +182,8 @@ pub struct Channel {
 /// The mapped HVS.
 pub struct Hvs {
     regs: *mut u32,
+    /// Normal memory, not an HVS (VC4D_FAKE): nothing clears on write.
+    fake: bool,
 }
 
 // The registers are device memory that stays mapped for the whole run; the
@@ -199,14 +201,14 @@ impl Hvs {
     /// `regs` maps `HVS_SIZE` bytes of the HVS as device memory, for as long
     /// as this value lives.
     pub unsafe fn new(regs: *mut u32) -> Self {
-        Hvs { regs }
+        Hvs { regs, fake: false }
     }
 
     /// An HVS in normal memory with channel 1 enabled at this size, for
     /// testing everything but the picture where there is no HVS (QEMU).
     pub fn fake(width: u32, height: u32) -> Self {
         let regs = Box::leak(vec![0u32; HVS_SIZE / 4].into_boxed_slice()).as_mut_ptr();
-        let hvs = Hvs { regs };
+        let hvs = Hvs { regs, fake: true };
         hvs.set_reg(SCALER_DISPCTRL, SCALER_DISPCTRL_ENABLE);
         hvs.set_reg(
             scaler_dispctrlx(1),
@@ -228,7 +230,7 @@ impl Hvs {
 
     /// A second handle on the same registers, for the watch thread.
     pub fn share(&self) -> Hvs {
-        Hvs { regs: self.regs }
+        Hvs { regs: self.regs, fake: self.fake }
     }
 
     /// Whether the firmware left the HVS running.
@@ -302,6 +304,9 @@ impl Hvs {
 
     /// Clears the channel's error bits and the DMA error.
     pub fn clear_errors(&self, index: usize) {
+        if self.fake {
+            return;
+        }
         self.set_reg(SCALER_DISPSTAT, scaler_dispstat_errors(index) | SCALER_DISPSTAT_DMA_ERROR);
     }
 
@@ -331,14 +336,26 @@ impl Hvs {
     }
 
     /// The words of the list at `start` up to its end word (at most `max`).
+    /// Each plane's control word gives its size; only a control word can be
+    /// the end word (other words, like an alpha of 0xff, may have bit 31).
     pub fn read_list(&self, start: usize, max: usize) -> Vec<u32> {
+        let end = (start + max).min(SCALER_DLIST_WORDS);
         let mut words = Vec::new();
-        for word in start..(start + max).min(SCALER_DLIST_WORDS) {
-            let value = self.dlist_word(word);
-            words.push(value);
-            if value & SCALER_CTL0_END != 0 {
+        let mut word = start;
+        while word < end {
+            let ctl0 = self.dlist_word(word);
+            let size = if ctl0 & SCALER_CTL0_END != 0 {
+                1
+            } else {
+                (SCALER_CTL0_SIZE.get(ctl0) as usize).max(1)
+            };
+            for i in word..(word + size).min(end) {
+                words.push(self.dlist_word(i));
+            }
+            if ctl0 & SCALER_CTL0_END != 0 {
                 break;
             }
+            word += size;
         }
         words
     }
@@ -399,5 +416,16 @@ mod tests {
         let words = plane.words();
         assert_eq!(words[1], 0xff00_0000 | 50 << 12 | 100);
         assert_eq!(words[2], 64 << 16 | 64);
+    }
+
+    #[test]
+    fn read_list_past_alpha() {
+        // Position word 0 has the alpha 0xff in its top byte, bit 31.
+        let hvs = Hvs::fake(640, 480);
+        let plane = Plane { bus: 0xc000_0000, pitch: 2560, x: 0, y: 0, width: 640, height: 480, alpha: false };
+        let list = display_list(&[plane, plane]);
+        hvs.write_dlist(0x800, &list);
+        assert_eq!(hvs.read_list(0x800, 32), list);
+        assert_eq!(hvs.read_list(0x800, 3), list[..3]);
     }
 }
