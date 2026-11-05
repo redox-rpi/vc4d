@@ -84,7 +84,7 @@ const HVS_PIXEL_FORMAT_RGBA8888: u32 = 7;
 const HVS_PIXEL_ORDER_ABGR: u32 = 3;
 
 /// Written where the HVS keeps its own state while it scans a plane out.
-const CONTEXT: u32 = 0xc0c0_c0c0;
+pub const CONTEXT: u32 = 0xc0c0_c0c0;
 
 /// Bits `.0` down to `.1` of a register.
 #[derive(Clone, Copy)]

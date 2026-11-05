@@ -79,7 +79,16 @@ fn show(hvs: &Hvs, channel: Channel, slot: usize, list: &[u32], fake: bool, r: &
     let frames_go_on = fake || wait_frames(hvs, index, 2);
     let back = hvs.read_list(slot, list.len());
     r.report(hvs.list_start(index) == slot, &format!("channel {index} list start is {slot}"));
-    r.report(back == list, &format!("list at {slot} reads back as written: {back:08x?}"));
+    // The HVS keeps its own state in the context words while it scans the
+    // plane out (seen on the Pi, row 220a): a changed context word shows it
+    // read the list. All other words must read back as written.
+    let same = back.len() == list.len()
+        && back.iter().zip(list).all(|(&b, &w)| w == hvs::CONTEXT || b == w);
+    let used = back.iter().zip(list).filter(|&(&b, &w)| w == hvs::CONTEXT && b != w).count();
+    r.report(
+        same,
+        &format!("list at {slot} reads back as written, {used} context words filled in by the HVS: {back:08x?}"),
+    );
     if !fake {
         r.report(frames_go_on, "frame count advances (2 frames)");
         let active = hvs.active(index);
