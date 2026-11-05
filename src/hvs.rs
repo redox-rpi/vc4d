@@ -21,6 +21,14 @@ pub const HVS_SIZE: usize = 0x6000;
 
 const SCALER_DISPCTRL: usize = 0x00;
 const SCALER_DISPCTRL_ENABLE: u32 = 1 << 31;
+const SCALER_DISPSTAT: usize = 0x04;
+/// The channel's error bits in SCALER_DISPSTAT (write 1 to clear): COBLOW,
+/// EOLN, ESFRAME, ESLINE, EUFLOW (underrun). EOF (bit 8) is not an error.
+const fn scaler_dispstat_errors(x: usize) -> u32 {
+    0x3e << (8 + x * 8)
+}
+const SCALER_DISPSTAT_DMA_ERROR: u32 = 1 << 7;
+const SCALER_DISPSTAT_RESP: Field = Field(15, 14);
 const SCALER_DISPID: usize = 0x08;
 /// Start of channel `x`'s display list, in words of display list memory.
 const fn scaler_displist(x: usize) -> usize {
@@ -36,10 +44,14 @@ const fn scaler_dispctrlx(x: usize) -> usize {
 const fn scaler_dispstatx(x: usize) -> usize {
     0x48 + x * 0x10
 }
+const fn scaler_dispbkgndx(x: usize) -> usize {
+    0x44 + 0x10 * x
+}
 const SCALER_DISPCTRLX_ENABLE: u32 = 1 << 31;
 const SCALER_DISPCTRLX_WIDTH: Field = Field(23, 12);
 const SCALER_DISPCTRLX_HEIGHT: Field = Field(11, 0);
 const SCALER_DISPSTATX_FRAME_COUNT: Field = Field(17, 12);
+const SCALER_DISPSTATX_MODE: Field = Field(31, 30);
 
 const SCALER_DLIST_START: usize = 0x2000;
 /// Words of display list memory.
@@ -154,6 +166,11 @@ pub fn display_list(planes: &[Plane]) -> Vec<u32> {
     list
 }
 
+/// The start (x, y) in a plane's position word 0 (its second word).
+pub fn plane_start(pos0: u32) -> (u32, u32) {
+    (SCALER_POS0_START_X.get(pos0), SCALER_POS0_START_Y.get(pos0))
+}
+
 /// An enabled output channel of the HVS.
 #[derive(Clone, Copy, Debug)]
 pub struct Channel {
@@ -166,6 +183,10 @@ pub struct Channel {
 pub struct Hvs {
     regs: *mut u32,
 }
+
+// The registers are device memory that stays mapped for the whole run; the
+// watch thread only reads them.
+unsafe impl Send for Hvs {}
 
 impl fmt::Debug for Hvs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -205,6 +226,11 @@ impl Hvs {
         unsafe { self.regs.add(offset / 4).write_volatile(value) }
     }
 
+    /// A second handle on the same registers, for the watch thread.
+    pub fn share(&self) -> Hvs {
+        Hvs { regs: self.regs }
+    }
+
     /// Whether the firmware left the HVS running.
     pub fn enabled(&self) -> bool {
         self.reg(SCALER_DISPCTRL) & SCALER_DISPCTRL_ENABLE != 0
@@ -229,13 +255,54 @@ impl Hvs {
     pub fn describe(&self, index: usize) -> String {
         let stat = self.reg(scaler_dispstatx(index));
         format!(
-            "ctrl {:#010x} list {} active {} stat {:#010x} (frame {})",
+            "ctrl {:#010x} bkgnd {:#010x} list {} active {} stat {:#010x} (mode {}, frame {})",
             self.reg(scaler_dispctrlx(index)),
+            self.reg(scaler_dispbkgndx(index)),
             self.list_start(index),
-            self.reg(scaler_displact(index)),
+            self.active(index),
             stat,
+            SCALER_DISPSTATX_MODE.get(stat),
             SCALER_DISPSTATX_FRAME_COUNT.get(stat)
         )
+    }
+
+    /// SCALER_DISPCTRL and SCALER_DISPSTAT, for the log.
+    pub fn describe_global(&self) -> String {
+        format!(
+            "dispctrl {:#010x} dispstat {:#010x}",
+            self.reg(SCALER_DISPCTRL),
+            self.reg(SCALER_DISPSTAT)
+        )
+    }
+
+    /// The word the channel reads in the display list memory now.
+    pub fn active(&self, index: usize) -> usize {
+        self.reg(scaler_displact(index)) as usize
+    }
+
+    /// The errors seen on the channel since they were last cleared, and the
+    /// HVS-wide ones (DMA error, bus response); empty when there are none.
+    pub fn errors(&self, index: usize) -> Vec<&'static str> {
+        let stat = self.reg(SCALER_DISPSTAT);
+        let mut errors = Vec::new();
+        let channel = stat >> (8 + index * 8);
+        for (bit, name) in [(5, "COBLOW"), (4, "EOLN"), (3, "ESFRAME"), (2, "ESLINE"), (1, "EUFLOW")] {
+            if channel & (1 << bit) != 0 {
+                errors.push(name);
+            }
+        }
+        if stat & SCALER_DISPSTAT_DMA_ERROR != 0 {
+            errors.push("DMA_ERROR");
+        }
+        if SCALER_DISPSTAT_RESP.get(stat) >= 2 {
+            errors.push("RESP_ERROR");
+        }
+        errors
+    }
+
+    /// Clears the channel's error bits and the DMA error.
+    pub fn clear_errors(&self, index: usize) {
+        self.set_reg(SCALER_DISPSTAT, scaler_dispstat_errors(index) | SCALER_DISPSTAT_DMA_ERROR);
     }
 
     pub fn frame_count(&self, index: usize) -> u32 {

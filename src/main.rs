@@ -18,7 +18,8 @@
 // Environment: VC4D=off leaves the display to vesad or rpi-fbd.
 // VC4D_FAKE=WIDTHxHEIGHT runs against an HVS in memory (QEMU has none):
 // everything but the picture. VC4D_LOG=1 logs every new display list (the
-// first ones are always logged).
+// first ones are always logged). VC4D_CHECK=off skips the check without a
+// screen (check.rs) that runs before the handover and watches after it.
 
 use std::env;
 use std::thread;
@@ -32,6 +33,7 @@ use crate::adapter::Vc4Adapter;
 use crate::hvs::{Hvs, CHANNELS, HVS_BUS_ADDR, HVS_SIZE};
 
 mod adapter;
+mod check;
 mod hvs;
 
 /// Bus address minus physical address of RAM when the devicetree has no
@@ -95,6 +97,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     // The firmware's channels and lists, for the log: what the Pi tests
     // compare against.
     let mut found = None;
+    println!("vc4d: {}", hvs.describe_global());
     for index in 0..CHANNELS {
         println!("vc4d: channel {index}: {}", hvs.describe(index));
         if let Some(channel) = hvs.channel(index) {
@@ -117,6 +120,13 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         "vc4d: taking over channel {} at {}x{}",
         channel.index, channel.width, channel.height
     );
+
+    let checking = !env::var("VC4D_CHECK").is_ok_and(|v| v == "off");
+    if checking {
+        let passed = check::self_check(&hvs, channel, ram_bus_offset, fake.is_some());
+        println!("vc4d: check: {}", if passed { "PASSED" } else { "FAILED" });
+    }
+    let watched = hvs.share();
 
     let adapter = Vc4Adapter {
         firmware_list: hvs.list_start(channel.index),
@@ -144,6 +154,9 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         .unwrap();
 
     daemon.ready();
+    if checking {
+        check::watch(watched, channel.index, fake.is_some());
+    }
 
     let all = [Source::Scheme];
     for event in all.into_iter().chain(event_queue.filter_map(|e| match e {

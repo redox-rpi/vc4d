@@ -39,7 +39,20 @@ planes (needs Orbital changes), the pixel valve and HDMI.
 Environment (the bootloader's): `VC4D=off` leaves the display to `vesad` or
 `rpi-fbd`. `VC4D_FAKE=WIDTHxHEIGHT` runs against an HVS in normal memory, for
 QEMU, which has none: everything but the picture. `VC4D_LOG=1` logs every
-new display list (the first four always are).
+new display list (the first four always are). `VC4D_CHECK=off` skips the
+check below.
+
+## Check without a screen
+
+Before it registers as a display, `vc4d` shows colour bars with a cursor
+square for a few frames, moves the cursor once, and reads back from the
+HVS: the channel points at its list, the list reads back as written, the
+active word is inside it, the frame count advances, the cursor's position
+word is the new one, and no error bits (underrun and the like) are set.
+Then it goes back to the firmware's list. A thread logs the channel 2, 5,
+10, 30, 60 and 120 s after the handover. All lines start with
+`vc4d: check:` and say `PASS` or `FAIL`. This needs no monitor, only an
+enabled HVS channel.
 
 ## Build
 
