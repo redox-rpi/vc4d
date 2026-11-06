@@ -166,6 +166,60 @@ pub fn display_list(planes: &[Plane]) -> Vec<u32> {
     list
 }
 
+/// A plane as read back from a display list, for vc4shot.
+#[derive(Clone, Copy, Debug)]
+pub struct ListPlane {
+    /// Unscaled (UNITY); scaled planes have a different word layout and
+    /// only their position is decoded.
+    pub unity: bool,
+    pub format: u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bus: u32,
+    pub pitch: u32,
+    /// Per-pixel alpha (SCALER_POS2_ALPHA_MODE_PIPELINE).
+    pub alpha: bool,
+}
+
+/// The planes of a display list as `Hvs::read_list` returns it. An
+/// unscaled plane's words are those `Plane::words` writes; a scaled
+/// plane (the firmware's) has position word 1 (its size on the screen)
+/// after position word 0, then the source size.
+pub fn decode_list(words: &[u32]) -> Vec<ListPlane> {
+    let mut planes = Vec::new();
+    let mut i = 0;
+    while i < words.len() && words[i] & SCALER_CTL0_END == 0 {
+        let ctl0 = words[i];
+        let size = (SCALER_CTL0_SIZE.get(ctl0) as usize).max(1);
+        let w = &words[i..(i + size).min(words.len())];
+        let unity = ctl0 & SCALER_CTL0_UNITY != 0;
+        let (pos2, rest) = if unity { (2, 3) } else { (3, 4) };
+        if w.len() >= rest + 4 {
+            let (width, height) = if unity {
+                (SCALER_POS2_WIDTH.get(w[pos2]), SCALER_POS2_HEIGHT.get(w[pos2]))
+            } else {
+                // Position word 1: the size on the screen.
+                (w[2] & 0xfff, (w[2] >> 16) & 0xfff)
+            };
+            planes.push(ListPlane {
+                unity,
+                format: SCALER_CTL0_PIXEL_FORMAT.get(ctl0),
+                x: SCALER_POS0_START_X.get(w[1]),
+                y: SCALER_POS0_START_Y.get(w[1]),
+                width,
+                height,
+                bus: w[rest + 1],
+                pitch: SCALER_SRC_PITCH.get(w[rest + 3]),
+                alpha: SCALER_POS2_ALPHA_MODE.get(w[pos2]) == SCALER_POS2_ALPHA_MODE_PIPELINE,
+            });
+        }
+        i += size;
+    }
+    planes
+}
+
 /// The start (x, y) in a plane's position word 0 (its second word).
 pub fn plane_start(pos0: u32) -> (u32, u32) {
     (SCALER_POS0_START_X.get(pos0), SCALER_POS0_START_Y.get(pos0))
@@ -427,5 +481,32 @@ mod tests {
         hvs.write_dlist(0x800, &list);
         assert_eq!(hvs.read_list(0x800, 32), list);
         assert_eq!(hvs.read_list(0x800, 3), list[..3]);
+    }
+
+    #[test]
+    fn decode_own_list() {
+        let cursor = Plane { bus: 0xc100_0000, pitch: 256, x: 5, y: 7, width: 64, height: 64, alpha: true };
+        let screen = Plane { bus: 0xc000_0000, pitch: 7680, x: 0, y: 0, width: 1920, height: 1080, alpha: false };
+        let planes = decode_list(&display_list(&[screen, cursor]));
+        assert_eq!(planes.len(), 2);
+        let c = planes[1];
+        assert!(c.unity && c.alpha);
+        assert_eq!((c.x, c.y, c.width, c.height, c.bus, c.pitch), (5, 7, 64, 64, 0xc100_0000, 256));
+        assert!(!planes[0].alpha);
+    }
+
+    #[test]
+    fn decode_firmware_list() {
+        // Pi 3B+ firmware list from row 220a: 1824x984 scaled to 1920x1035 at y 22.
+        let words = [
+            0x4e005807, 0xff016000, 0x040b0780, 0x43d80720, 0x03d70000, 0xfe914000, 0xfefeaf80,
+            0x00001c80, 0x00008300, 0x40f33261, 0x40f36260, 0x00017d36, 0x00000ff4, 0x00000ff4,
+            0x80000000,
+        ];
+        let planes = decode_list(&words);
+        assert_eq!(planes.len(), 1);
+        let p = planes[0];
+        assert!(!p.unity);
+        assert_eq!((p.x, p.y, p.width, p.height), (0, 22, 1920, 1035));
     }
 }

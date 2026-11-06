@@ -56,6 +56,14 @@ Then it goes back to the firmware's list. A thread logs the channel 2, 5,
 `vc4d: check:` and say `PASS` or `FAIL`. This needs no monitor, only an
 enabled HVS channel.
 
+## vc4shot
+
+`vc4shot [file.ppm] [channel]` saves what the HVS scans out as a PPM
+picture (default `/tmp/vc4shot.ppm`), for checks without a person. It
+only reads: the enabled channel's display list, then the buffers of its
+unscaled planes, composed with the cursor's alpha. Scaled planes (the
+firmware's own) are listed but not drawn.
+
 ## Build
 
 redox-rpi's experiment `vc4d` builds a pinned commit of this repository

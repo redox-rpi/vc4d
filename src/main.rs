@@ -34,6 +34,7 @@ use crate::hvs::{Hvs, CHANNELS, HVS_BUS_ADDR, HVS_SIZE};
 
 mod adapter;
 mod check;
+#[allow(dead_code)]
 mod hvs;
 
 /// Bus address minus physical address of RAM when the devicetree has no
