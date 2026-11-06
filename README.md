@@ -58,11 +58,13 @@ enabled HVS channel.
 
 ## vc4shot
 
-`vc4shot [file.ppm] [channel]` saves what the HVS scans out as a PPM
-picture (default `/tmp/vc4shot.ppm`), for checks without a person. It
-only reads: the enabled channel's display list, then the buffers of its
-unscaled planes, composed with the cursor's alpha. Scaled planes (the
-firmware's own) are listed but not drawn.
+`vc4shot [file.ppm] [channel]` saves what vc4d shows as a PPM picture
+(default `/tmp/vc4shot.ppm`), for checks without a person. It lists the
+planes of the enabled channel's display list (read-only), then asks vc4d
+for the picture: Redox lets no program map RAM by its physical address,
+so vc4d, which has the buffers mapped, composes them (cursor alpha
+included) when `/tmp/vc4shot.request` appears and writes
+`/tmp/vc4shot.ppm`. The watch thread looks every 3 s.
 
 ## Build
 

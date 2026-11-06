@@ -24,6 +24,7 @@ use driver_graphics::{Buffer, Damage, DumbBufferConfig, GraphicsAdapter};
 use syscall::PAGE_SIZE;
 
 use crate::hvs::{self, Channel, Hvs, Plane};
+use crate::shot::{self, ShotPlane};
 
 /// Two places for our display lists, far above the firmware's. A new list
 /// goes into the one the HVS is not using, then the channel is pointed at
@@ -51,6 +52,8 @@ pub struct Vc4Adapter {
     pub log_lists: bool,
     /// Display lists written so far.
     pub lists: u32,
+    /// The planes shown now, for screenshots (shot.rs).
+    pub shown: shot::Shown,
 }
 
 /// The first display lists always go to the log.
@@ -61,6 +64,8 @@ const LOGGED_LISTS: u32 = 4;
 #[derive(Debug)]
 pub struct Shown {
     plane: Plane,
+    /// The first visible pixel in our memory.
+    pixels: *const u8,
     _buffer: Arc<Vc4Buffer>,
 }
 
@@ -72,6 +77,7 @@ impl Vc4Adapter {
         let Some(primary) = &self.primary else {
             println!("vc4d: no primary plane, firmware list again");
             self.hvs.set_list_start(index, self.firmware_list);
+            self.shown.lock().unwrap().clear();
             return;
         };
         let planes: Vec<Plane> = if self.blanked {
@@ -81,6 +87,15 @@ impl Vc4Adapter {
                 .into_iter()
                 .flatten()
                 .map(|shown| shown.plane)
+                .collect()
+        };
+        *self.shown.lock().unwrap() = if self.blanked {
+            Vec::new()
+        } else {
+            [Some(primary), self.cursor.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|s| ShotPlane { plane: s.plane, pixels: s.pixels, _buffer: s._buffer.clone() })
                 .collect()
         };
         let list = hvs::display_list(&planes);
@@ -120,6 +135,7 @@ impl Vc4Adapter {
                 height: height as u32,
                 alpha,
             },
+            pixels: unsafe { fb.buffer.ptr.as_ptr().cast::<u8>().add(offset) },
             _buffer: fb.buffer.clone(),
         })
     }
@@ -269,6 +285,11 @@ pub struct Vc4Buffer {
     ptr: NonNull<[u32]>,
     dma: Option<Dma<[u32]>>,
 }
+
+// The buffer's memory stays mapped as long as it lives; the watch thread
+// only reads it for screenshots.
+unsafe impl Send for Vc4Buffer {}
+unsafe impl Sync for Vc4Buffer {}
 
 impl fmt::Debug for Vc4Buffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

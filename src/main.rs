@@ -36,6 +36,7 @@ mod adapter;
 mod check;
 #[allow(dead_code)]
 mod hvs;
+mod shot;
 
 /// Bus address minus physical address of RAM when the devicetree has no
 /// dma-ranges: the BCM283x's uncached alias.
@@ -128,6 +129,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         println!("vc4d: check: {}", if passed { "PASSED" } else { "FAILED" });
     }
     let watched = hvs.share();
+    let shown = shot::Shown::default();
 
     let adapter = Vc4Adapter {
         firmware_list: hvs.list_start(channel.index),
@@ -140,6 +142,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         blanked: false,
         log_lists: fake.is_some() || env::var("VC4D_LOG").is_ok(),
         lists: 0,
+        shown: shown.clone(),
     };
     let mut scheme = GraphicsScheme::new(adapter, "display.vc4".to_owned(), false);
 
@@ -155,9 +158,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         .unwrap();
 
     daemon.ready();
-    if checking {
-        check::watch(watched, channel.index, fake.is_some());
-    }
+    check::watch(watched, channel, fake.is_some(), checking, shown);
 
     let all = [Source::Scheme];
     for event in all.into_iter().chain(event_queue.filter_map(|e| match e {

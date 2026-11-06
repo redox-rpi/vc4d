@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use common::dma::Dma;
 
 use crate::hvs::{self, Channel, Hvs, Plane};
+use crate::shot;
 
 /// Where the check's lists go: apart from the adapter's.
 const CHECK_SLOTS: [usize; 2] = [0x880, 0x8c0];
@@ -172,17 +173,26 @@ pub fn self_check(hvs: &Hvs, channel: Channel, ram_bus_offset: usize, fake: bool
     r.failed == 0
 }
 
+/// How often the watch thread looks for a screenshot request.
+const SHOT_POLL: Duration = Duration::from_secs(3);
+
 /// Logs the channel's state a few times over two minutes after the
 /// handover, while fbcond and Orbital draw: the list it points at, whether
-/// frames go on, and new errors.
-pub fn watch(hvs: Hvs, index: usize, fake: bool) {
+/// frames go on, and new errors. Then (and in between) it answers
+/// screenshot requests.
+pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot::Shown) {
+    let index = channel.index;
+    let (width, height) = (channel.width as usize, channel.height as usize);
     thread::spawn(move || {
         hvs.clear_errors(index);
         let start = Instant::now();
         let mut frame = hvs.frame_count(index);
-        for seconds in WATCH_SECONDS {
-            let wait = Duration::from_secs(seconds).saturating_sub(start.elapsed());
-            thread::sleep(wait);
+        for seconds in WATCH_SECONDS.iter().copied().filter(|_| checking) {
+            while start.elapsed() < Duration::from_secs(seconds) {
+                let wait = Duration::from_secs(seconds).saturating_sub(start.elapsed());
+                thread::sleep(wait.min(SHOT_POLL));
+                shot::serve(&shown, width, height);
+            }
             let now = hvs.frame_count(index);
             let errors = hvs.errors(index);
             let moving = fake || now != frame || wait_frames(&hvs, index, 1);
@@ -193,6 +203,10 @@ pub fn watch(hvs: Hvs, index: usize, fake: bool) {
                 hvs.describe(index)
             );
             frame = now;
+        }
+        loop {
+            thread::sleep(SHOT_POLL);
+            shot::serve(&shown, width, height);
         }
     });
 }
