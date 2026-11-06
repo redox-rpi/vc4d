@@ -27,6 +27,7 @@ const RAM_BUS_OFFSET: usize = 0xc000_0000;
 const HVS_PIXEL_FORMAT_RGBA8888: u32 = 7;
 
 fn main() {
+    common::init();
     let args: Vec<String> = env::args().skip(1).collect();
     let out = args.first().cloned().unwrap_or_else(|| "/tmp/vc4shot.ppm".to_owned());
     let wanted: Option<usize> = args.get(1).and_then(|a| a.parse().ok());
