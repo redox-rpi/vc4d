@@ -396,7 +396,9 @@ impl Hvs {
     }
 
     /// The first word of the last written list that the list memory no
-    /// longer holds, as (word, written, now); None if all are intact.
+    /// longer holds, as (word, written, now); None if all are intact. The
+    /// context words (CONTEXT) are for the HVS to write while it scans
+    /// out, so they do not count.
     pub fn changed_list_word(&self) -> Option<(usize, u32, u32)> {
         let written = self.written.lock().unwrap();
         let (start, words) = written.as_ref()?;
@@ -404,7 +406,7 @@ impl Hvs {
             .iter()
             .enumerate()
             .map(|(i, &word)| (start + i, word, self.dlist_word(start + i)))
-            .find(|&(_, word, now)| word != now)
+            .find(|&(_, word, now)| word != CONTEXT && word != now)
     }
 
     /// Where the last written list starts.
