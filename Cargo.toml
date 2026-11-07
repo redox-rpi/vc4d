@@ -14,5 +14,6 @@ daemon = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "eddcaa2
 driver-graphics = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "eddcaa21fb2d11b4a6bd64478e0639153266dc04" }
 drm-sys = "0.8.1"
 fdt = { git = "https://github.com/repnop/fdt.git", rev = "059bb23" }
+libredox = "0.1.25"
 redox_event = "0.4.8"
 redox_syscall = { version = "0.9.5", features = ["std"] }

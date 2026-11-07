@@ -176,10 +176,17 @@ pub fn self_check(hvs: &Hvs, channel: Channel, ram_bus_offset: usize, fake: bool
 /// How often the watch thread looks for a screenshot request.
 const SHOT_POLL: Duration = Duration::from_secs(3);
 
+/// After the checks, how often the watch thread reads (and clears) the
+/// HVS error bits, and how often it logs a summary.
+const ERROR_POLL: Duration = Duration::from_secs(1);
+const ERROR_SUMMARY: Duration = Duration::from_secs(60);
+
 /// Logs the channel's state a few times over two minutes after the
 /// handover, while fbcond and Orbital draw: the list it points at, whether
-/// frames go on, and new errors. Then (and in between) it answers
-/// screenshot requests.
+/// frames go on, and new errors. Then it keeps reading the error bits every
+/// second, logging each underrun with its time and a summary every minute
+/// (Pi test #275: bands on HDMI while Orbital drew, vc4shot clean), and
+/// answers screenshot requests.
 pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot::Shown) {
     let index = channel.index;
     let (width, height) = (channel.width as usize, channel.height as usize);
@@ -204,9 +211,34 @@ pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot
             );
             frame = now;
         }
+        hvs.clear_errors(index);
+        let (mut shot_at, mut summary_at) = (Instant::now(), Instant::now());
+        let (mut polls, mut with_errors) = (0u32, 0u32);
         loop {
-            thread::sleep(SHOT_POLL);
-            shot::serve(&shown, width, height);
+            thread::sleep(ERROR_POLL);
+            polls += 1;
+            let errors = hvs.errors(index);
+            if !errors.is_empty() {
+                with_errors += 1;
+                println!(
+                    "vc4d: scanout: {} s: errors {errors:?}, {}, {}",
+                    start.elapsed().as_secs(),
+                    hvs.describe(index),
+                    hvs.describe_global()
+                );
+                hvs.clear_errors(index);
+            }
+            if shot_at.elapsed() >= SHOT_POLL {
+                shot::serve(&shown, width, height);
+                shot_at = Instant::now();
+            }
+            if summary_at.elapsed() >= ERROR_SUMMARY {
+                println!(
+                    "vc4d: scanout: {} s: errors in {with_errors} of {polls} reads in the last minute",
+                    start.elapsed().as_secs()
+                );
+                (polls, with_errors, summary_at) = (0, 0, Instant::now());
+            }
         }
     });
 }
