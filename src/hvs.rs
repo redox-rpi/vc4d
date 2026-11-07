@@ -13,6 +13,7 @@
 // tiling, no HVS5 (BCM2711).
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 /// Bus address of the HVS on all BCM283x, if the devicetree has none.
 pub const HVS_BUS_ADDR: usize = 0x7e40_0000;
@@ -238,6 +239,9 @@ pub struct Hvs {
     regs: *mut u32,
     /// Normal memory, not an HVS (VC4D_FAKE): nothing clears on write.
     fake: bool,
+    /// The last list written and where, shared with the watch thread's
+    /// handle, which checks that the list memory still holds it.
+    written: Arc<Mutex<Option<(usize, Vec<u32>)>>>,
 }
 
 // The registers are device memory that stays mapped for the whole run; the
@@ -255,14 +259,14 @@ impl Hvs {
     /// `regs` maps `HVS_SIZE` bytes of the HVS as device memory, for as long
     /// as this value lives.
     pub unsafe fn new(regs: *mut u32) -> Self {
-        Hvs { regs, fake: false }
+        Hvs { regs, fake: false, written: Arc::default() }
     }
 
     /// An HVS in normal memory with channel 1 enabled at this size, for
     /// testing everything but the picture where there is no HVS (QEMU).
     pub fn fake(width: u32, height: u32) -> Self {
         let regs = Box::leak(vec![0u32; HVS_SIZE / 4].into_boxed_slice()).as_mut_ptr();
-        let hvs = Hvs { regs, fake: true };
+        let hvs = Hvs { regs, fake: true, written: Arc::default() };
         hvs.set_reg(SCALER_DISPCTRL, SCALER_DISPCTRL_ENABLE);
         hvs.set_reg(
             scaler_dispctrlx(1),
@@ -284,7 +288,7 @@ impl Hvs {
 
     /// A second handle on the same registers, for the watch thread.
     pub fn share(&self) -> Hvs {
-        Hvs { regs: self.regs, fake: self.fake }
+        Hvs { regs: self.regs, fake: self.fake, written: self.written.clone() }
     }
 
     /// Whether the firmware left the HVS running.
@@ -384,9 +388,28 @@ impl Hvs {
 
     pub fn write_dlist(&self, start: usize, words: &[u32]) {
         assert!(start >= HVS_BOOTLOADER_DLIST_END && start + words.len() <= SCALER_DLIST_WORDS);
+        let mut written = self.written.lock().unwrap();
         for (i, &word) in words.iter().enumerate() {
             self.set_reg(SCALER_DLIST_START + (start + i) * 4, word);
         }
+        *written = Some((start, words.to_vec()));
+    }
+
+    /// The first word of the last written list that the list memory no
+    /// longer holds, as (word, written, now); None if all are intact.
+    pub fn changed_list_word(&self) -> Option<(usize, u32, u32)> {
+        let written = self.written.lock().unwrap();
+        let (start, words) = written.as_ref()?;
+        words
+            .iter()
+            .enumerate()
+            .map(|(i, &word)| (start + i, word, self.dlist_word(start + i)))
+            .find(|&(_, word, now)| word != now)
+    }
+
+    /// Where the last written list starts.
+    pub fn written_start(&self) -> Option<usize> {
+        self.written.lock().unwrap().as_ref().map(|(start, _)| *start)
     }
 
     /// The words of the list at `start` up to its end word (at most `max`).

@@ -184,7 +184,8 @@ const ERROR_SUMMARY: Duration = Duration::from_secs(60);
 /// Logs the channel's state a few times over two minutes after the
 /// handover, while fbcond and Orbital draw: the list it points at, whether
 /// frames go on, and new errors. Then it keeps reading the error bits every
-/// second, logging each underrun with its time and a summary every minute
+/// second, logging the first underruns of each minute with their time, a
+/// summary every minute, and changes to its display list by others
 /// (Pi test #275: bands on HDMI while Orbital drew, vc4shot clean), and
 /// answers screenshot requests.
 pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot::Shown) {
@@ -214,18 +215,42 @@ pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot
         hvs.clear_errors(index);
         let (mut shot_at, mut summary_at) = (Instant::now(), Instant::now());
         let (mut polls, mut with_errors) = (0u32, 0u32);
+        let mut was_elsewhere = false;
+        // List findings per minute; only the first few are logged.
+        let mut list_findings = 0u32;
         loop {
             thread::sleep(ERROR_POLL);
             polls += 1;
+            // Something else (the firmware) writing the list memory or
+            // pointing the channel elsewhere would show garbage planes.
+            if let Some((word, written, now)) = hvs.changed_list_word() {
+                list_findings += 1;
+                if list_findings <= 3 {
+                    println!("vc4d: scanout: {} s: list word {word} is {now:#010x}, written {written:#010x}", start.elapsed().as_secs());
+                }
+            }
+            // Twice in a row: the adapter points the channel right after
+            // writing a list, so one read may fall in between.
+            let list = hvs.list_start(index);
+            let elsewhere = hvs.written_start().is_some_and(|written| written != list);
+            if elsewhere && was_elsewhere {
+                list_findings += 1;
+                if list_findings <= 3 {
+                    println!("vc4d: scanout: {} s: channel reads the list at {list}, not ours", start.elapsed().as_secs());
+                }
+            }
+            was_elsewhere = elsewhere;
             let errors = hvs.errors(index);
             if !errors.is_empty() {
                 with_errors += 1;
-                println!(
-                    "vc4d: scanout: {} s: errors {errors:?}, {}, {}",
-                    start.elapsed().as_secs(),
-                    hvs.describe(index),
-                    hvs.describe_global()
-                );
+                if with_errors <= 5 {
+                    println!(
+                        "vc4d: scanout: {} s: errors {errors:?}, {}, {}",
+                        start.elapsed().as_secs(),
+                        hvs.describe(index),
+                        hvs.describe_global()
+                    );
+                }
                 hvs.clear_errors(index);
             }
             if shot_at.elapsed() >= SHOT_POLL {
@@ -234,10 +259,10 @@ pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot
             }
             if summary_at.elapsed() >= ERROR_SUMMARY {
                 println!(
-                    "vc4d: scanout: {} s: errors in {with_errors} of {polls} reads in the last minute",
+                    "vc4d: scanout: {} s: errors in {with_errors} of {polls} reads, {list_findings} list findings in the last minute",
                     start.elapsed().as_secs()
                 );
-                (polls, with_errors, summary_at) = (0, 0, Instant::now());
+                (polls, with_errors, list_findings, summary_at) = (0, 0, 0, Instant::now());
             }
         }
     });

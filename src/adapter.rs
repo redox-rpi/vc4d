@@ -11,7 +11,6 @@
 
 use std::alloc::{self, Layout};
 use std::fmt;
-use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 
@@ -113,7 +112,7 @@ impl Vc4Adapter {
     /// The part of the framebuffer that is on screen, with the top left
     /// corner at (x, y) on the screen; None if nothing of it is.
     fn place(&self, fb: &KmsFramebuffer<Self>, x: i32, y: i32, alpha: bool) -> Option<Shown> {
-        let Some(mem) = &fb.buffer.contiguous else {
+        let Some(mem) = &fb.buffer.dma else {
             println!("vc4d: buffer {}x{} not in contiguous memory, not shown", fb.width, fb.height);
             return None;
         };
@@ -278,77 +277,13 @@ impl GraphicsAdapter for Vc4Adapter {
     }
 }
 
-/// A dumb buffer: in physically contiguous memory, so the HVS can read it,
-/// else in normal memory, which cannot be shown.
+/// A dumb buffer: in DMA memory (physically contiguous, so the HVS can
+/// read it), else in normal memory, which cannot be shown.
 pub struct Vc4Buffer {
     width: usize,
     height: usize,
     ptr: NonNull<[u32]>,
-    contiguous: Option<Contiguous>,
-}
-
-/// With this file (experiment vc4d-wc) the buffers are mapped
-/// write-combining instead of uncached: Orbital's stores then reach RAM in
-/// bursts instead of one bus write each, which leaves the HVS more of the
-/// bus (Pi test #275, bands on HDMI while Orbital drew).
-const WRITE_COMBINING_FLAG: &str = "/etc/vc4d-wc";
-
-/// Physically contiguous memory for a buffer: common's DMA memory
-/// (uncached on aarch64), or write-combining memory from the same memory
-/// scheme.
-enum Contiguous {
-    Uncached(Dma<[u32]>),
-    WriteCombining { phys: usize, virt: *mut u32, size: usize },
-}
-
-impl Contiguous {
-    fn physical(&self) -> usize {
-        match self {
-            Contiguous::Uncached(dma) => dma.physical(),
-            Contiguous::WriteCombining { phys, .. } => *phys,
-        }
-    }
-
-    /// `len` zeroed pixels, write-combining.
-    fn write_combining(len: usize) -> Result<Contiguous, String> {
-        let size = (len * 4).next_multiple_of(PAGE_SIZE);
-        let fd = common::memory_root_fd()
-            .openat("zeroed@wc?phys_contiguous", libredox::flag::O_CLOEXEC, 0)
-            .map_err(|err| format!("open: {err}"))?;
-        let map = syscall::Map {
-            offset: 0,
-            size,
-            flags: syscall::MapFlags::MAP_PRIVATE | syscall::MapFlags::PROT_READ | syscall::MapFlags::PROT_WRITE,
-            address: 0,
-        };
-        let virt = unsafe { syscall::fmap(fd.raw(), &map) }.map_err(|err| format!("fmap: {err}"))?;
-        let phys = common::VirtaddrTranslationHandle::new()
-            .and_then(|handle| handle.translate(virt))
-            .map_err(|err| format!("translate: {err}"))?;
-        Ok(Contiguous::WriteCombining { phys, virt: virt as *mut u32, size })
-    }
-
-    /// Logs where the buffer is and whether every page really follows the
-    /// one before it in physical memory, as the HVS reads it.
-    fn report(&self, width: usize, height: usize, virt: usize, size: usize) {
-        let kind = match self {
-            Contiguous::Uncached(_) => "uncached",
-            Contiguous::WriteCombining { .. } => "write-combining",
-        };
-        let phys = self.physical();
-        let gap = common::VirtaddrTranslationHandle::new().ok().and_then(|handle| {
-            (1..size.div_ceil(PAGE_SIZE))
-                .find(|i| handle.translate(virt + i * PAGE_SIZE).ok() != Some(phys + i * PAGE_SIZE))
-        });
-        match gap {
-            None => println!("vc4d: buffer {width}x{height}: {kind}, physical {phys:#x}-{:#x}, contiguous", phys + size),
-            Some(page) => println!(
-                "vc4d: buffer {width}x{height}: {kind}, physical {phys:#x}, NOT CONTIGUOUS from page {page} (byte {:#x}, row {})",
-                page * PAGE_SIZE,
-                page * PAGE_SIZE / (width * 4).max(1)
-            ),
-        }
-    }
+    dma: Option<Dma<[u32]>>,
 }
 
 // The buffer's memory stays mapped as long as it lives; the watch thread
@@ -361,7 +296,7 @@ impl fmt::Debug for Vc4Buffer {
         f.debug_struct("Vc4Buffer")
             .field("width", &self.width)
             .field("height", &self.height)
-            .field("contiguous", &self.contiguous.is_some())
+            .field("dma", &self.dma.is_some())
             .finish()
     }
 }
@@ -369,24 +304,12 @@ impl fmt::Debug for Vc4Buffer {
 impl Vc4Buffer {
     fn new(width: usize, height: usize) -> Vc4Buffer {
         let len = width * height;
-        if Path::new(WRITE_COMBINING_FLAG).exists() {
-            match Contiguous::write_combining(len) {
-                Ok(mem) => {
-                    let Contiguous::WriteCombining { virt, size, .. } = mem else { unreachable!() };
-                    mem.report(width, height, virt as usize, size);
-                    let ptr = NonNull::new(ptr::slice_from_raw_parts_mut(virt, len)).unwrap();
-                    return Vc4Buffer { width, height, ptr, contiguous: Some(mem) };
-                }
-                Err(err) => println!("vc4d: buffer {width}x{height}: no write-combining memory ({err}), uncached"),
-            }
-        }
         match Dma::<[u32]>::zeroed_slice(len) {
             Ok(dma) => {
                 let mut dma = unsafe { dma.assume_init() };
                 let ptr = NonNull::from(&mut *dma);
-                let mem = Contiguous::Uncached(dma);
-                mem.report(width, height, ptr.as_ptr() as *mut u32 as usize, (len * 4).next_multiple_of(PAGE_SIZE));
-                Vc4Buffer { width, height, ptr, contiguous: Some(mem) }
+                report_contiguous(width, height, dma.physical(), ptr.as_ptr() as *mut u32 as usize, len * 4);
+                Vc4Buffer { width, height, ptr, dma: Some(dma) }
             }
             Err(err) => {
                 println!("vc4d: dumb buffer {width}x{height} in normal memory: {err}");
@@ -394,7 +317,7 @@ impl Vc4Buffer {
                 let ptr = unsafe { alloc::alloc_zeroed(layout) };
                 let ptr = ptr::slice_from_raw_parts_mut(ptr.cast(), len);
                 let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
-                Vc4Buffer { width, height, ptr, contiguous: None }
+                Vc4Buffer { width, height, ptr, dma: None }
             }
         }
     }
@@ -404,17 +327,26 @@ impl Vc4Buffer {
     }
 }
 
+/// Logs where a buffer is and whether every page really follows the one
+/// before it in physical memory, as the HVS reads it (Pi test #275).
+fn report_contiguous(width: usize, height: usize, phys: usize, virt: usize, size: usize) {
+    let gap = common::VirtaddrTranslationHandle::new().ok().and_then(|handle| {
+        (1..size.div_ceil(PAGE_SIZE)).find(|i| handle.translate(virt + i * PAGE_SIZE).ok() != Some(phys + i * PAGE_SIZE))
+    });
+    match gap {
+        None => println!("vc4d: buffer {width}x{height}: physical {phys:#x}-{:#x}, contiguous", phys + size),
+        Some(page) => println!(
+            "vc4d: buffer {width}x{height}: physical {phys:#x}, NOT CONTIGUOUS from page {page} (row {})",
+            page * PAGE_SIZE / (width * 4).max(1)
+        ),
+    }
+}
+
 impl Drop for Vc4Buffer {
     fn drop(&mut self) {
-        match self.contiguous {
-            None => {
-                let layout = Self::layout(self.ptr.len());
-                unsafe { alloc::dealloc(self.ptr.as_ptr().cast(), layout) };
-            }
-            Some(Contiguous::WriteCombining { virt, size, .. }) => {
-                let _ = unsafe { syscall::funmap(virt as usize, size) };
-            }
-            Some(Contiguous::Uncached(_)) => (),
+        if self.dma.is_none() {
+            let layout = Self::layout(self.ptr.len());
+            unsafe { alloc::dealloc(self.ptr.as_ptr().cast(), layout) };
         }
     }
 }
