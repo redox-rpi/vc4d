@@ -4,7 +4,12 @@ A display and 3D driver for the Broadcom VideoCore IV GPU (Raspberry Pi 3,
 3B+ and Zero 2 W) on [Redox OS](https://www.redox-os.org/), for the
 [redox-rpi](https://github.com/redox-rpi/redox-rpi) project.
 
-Status: planning. No code yet. The plan is
+Status: stage 1 (display: HVS planes) has code, on branch `stage1-hvs`
+([#1](https://github.com/redox-rpi/vc4d/pull/1)), and runs on the Pi 3B+:
+the desktop with a hardware cursor plane at 1920x1080 (redox-rpi Pi tests
+220a, 256, 259 and 276). redox-rpi builds a pinned commit of it (experiment
+`vc4d` on its branch `graphics-vc4d`). The firmware still sets up HDMI and
+the mode. Stages 2 and 3 have no code yet. The plan is
 [redox-rpi#188](https://github.com/redox-rpi/redox-rpi/issues/188).
 
 ## Plan
