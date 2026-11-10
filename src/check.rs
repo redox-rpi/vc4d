@@ -264,6 +264,7 @@ pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot
                 let wait = Duration::from_secs(seconds).saturating_sub(start.elapsed());
                 thread::sleep(wait.min(SHOT_POLL));
                 shot::serve(&shown, width, height);
+                serve_cob(&hvs, index);
             }
             let now = hvs.frame_count(index);
             let errors = hvs.errors(index);
