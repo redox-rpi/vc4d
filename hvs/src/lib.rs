@@ -11,6 +11,9 @@
 //
 // Only what an unscaled, linear 32-bit plane needs: no scaling, no YUV, no
 // tiling, no HVS5 (BCM2711).
+//
+// A crate of its own with no dependencies, so its tests run on any host
+// (redox-rpi#271); the driver in ../src uses it as `hvs`.
 
 use std::fmt;
 
