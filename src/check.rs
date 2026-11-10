@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use common::dma::Dma;
 
 use crate::hvs::{self, Channel, Hvs, Plane};
+use crate::pv::PixelValve;
 use crate::shot;
 
 /// Where the check's lists go: apart from the adapter's.
@@ -197,14 +198,33 @@ struct FifoStats {
     reads: u64,
     empty: u64,
     by_part: [u64; 9],
+    /// Pixel valve reads, those where PV_HACT_ACT was not the active
+    /// width, its smallest value, and the PV_STAT values seen.
+    pv_reads: u64,
+    pv_short: u64,
+    pv_min: Option<u32>,
+    pv_stats: Vec<u32>,
 }
 
 impl FifoStats {
     /// Reads the FIFO state for FIFO_SAMPLE; returns this sample's numbers.
-    fn sample(&mut self, hvs: &Hvs, index: usize, height: u32) -> FifoStats {
+    fn sample(&mut self, hvs: &Hvs, pv: Option<&PixelValve>, index: usize, height: u32) -> FifoStats {
         let mut now = FifoStats::default();
         let start = Instant::now();
+        let hactive = pv.map(PixelValve::hactive);
         while start.elapsed() < FIFO_SAMPLE {
+            if let (Some(pv), Some(hactive)) = (pv, hactive) {
+                let act = pv.hact_act();
+                now.pv_reads += 1;
+                if act != hactive {
+                    now.pv_short += 1;
+                }
+                now.pv_min = Some(now.pv_min.map_or(act, |m| m.min(act)));
+                let stat = pv.stat();
+                if now.pv_stats.len() < 8 && !now.pv_stats.contains(&stat) {
+                    now.pv_stats.push(stat);
+                }
+            }
             let fifo = hvs.fifo(index);
             if fifo.mode != hvs::MODE_RUN {
                 continue;
@@ -220,6 +240,17 @@ impl FifoStats {
         self.empty += now.empty;
         for (sum, n) in self.by_part.iter_mut().zip(now.by_part) {
             *sum += n;
+        }
+        self.pv_reads += now.pv_reads;
+        self.pv_short += now.pv_short;
+        self.pv_min = match (self.pv_min, now.pv_min) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        for &stat in &now.pv_stats {
+            if self.pv_stats.len() < 8 && !self.pv_stats.contains(&stat) {
+                self.pv_stats.push(stat);
+            }
         }
         now
     }
@@ -251,7 +282,7 @@ fn serve_cob(hvs: &Hvs, index: usize) {
 /// answers screenshot requests. Every second it also reads the live FIFO
 /// state for 20 ms: the latched underrun bit (EUFLOW) may never show,
 /// because the firmware still takes the HVS interrupts and clears it.
-pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot::Shown) {
+pub fn watch(hvs: Hvs, pv: Option<PixelValve>, channel: Channel, fake: bool, checking: bool, shown: shot::Shown) {
     let index = channel.index;
     let (width, height) = (channel.width as usize, channel.height as usize);
     thread::spawn(move || {
@@ -290,16 +321,19 @@ pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot
             polls += 1;
             serve_cob(&hvs, index);
             if !fake {
-                let now = fifo.sample(&hvs, index, height as u32);
-                if now.empty > 0 {
+                let now = fifo.sample(&hvs, pv.as_ref(), index, height as u32);
+                if now.empty > 0 || now.pv_short > 0 {
                     fifo_logged += 1;
                     if fifo_logged <= 5 {
                         println!(
-                            "vc4d: fifo: {} s: empty in {} of {} reads, by eighth {:?}",
+                            "vc4d: fifo: {} s: empty in {} of {} reads, by eighth {:?}; pv2 short lines in {} of {} reads, min {:?}",
                             start.elapsed().as_secs(),
                             now.empty,
                             now.reads,
-                            now.by_part
+                            now.by_part,
+                            now.pv_short,
+                            now.pv_reads,
+                            now.pv_min
                         );
                     }
                 }
@@ -347,11 +381,16 @@ pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot
                 );
                 if !fake {
                     println!(
-                        "vc4d: fifo: {} s: empty in {} of {} reads in the last minute, by eighth {:?}",
+                        "vc4d: fifo: {} s: empty in {} of {} reads in the last minute, by eighth {:?}; pv2 short lines in {} of {} reads, min {:?}, stat {:08x?}, intstat {:#06x}",
                         start.elapsed().as_secs(),
                         fifo.empty,
                         fifo.reads,
-                        fifo.by_part
+                        fifo.by_part,
+                        fifo.pv_short,
+                        fifo.pv_reads,
+                        fifo.pv_min,
+                        fifo.pv_stats,
+                        pv.as_ref().map_or(0, PixelValve::intstat)
                     );
                 }
                 (polls, with_errors, list_findings, summary_at) = (0, 0, 0, Instant::now());

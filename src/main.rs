@@ -36,6 +36,7 @@ mod adapter;
 mod check;
 #[allow(dead_code)]
 mod hvs;
+mod pv;
 mod shot;
 
 /// Bus address minus physical address of RAM when the devicetree has no
@@ -95,6 +96,31 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     if !hvs.enabled() {
         give_up(daemon, "the firmware left the HVS off (or this is QEMU, which has none)");
     }
+
+    // The pixel valve behind HVS channel 1 (HDMI), read only: what the
+    // HVS hands on (Pi test #275).
+    let pv = match (&fake, fdt.as_ref()) {
+        (None, Some(fdt)) => {
+            let bus = fdt
+                .find_compatible(&["brcm,bcm2835-pixelvalve2"])
+                .and_then(|node| node.reg())
+                .and_then(|mut reg| reg.next())
+                .map_or(pv::PV2_BUS_ADDR, |reg| reg.starting_address as usize);
+            let pv_phys = soc_phys(fdt, bus);
+            match unsafe { common::physmap(pv_phys, pv::PV_SIZE, common::Prot::RW, common::MemoryType::DeviceMemory) } {
+                Ok(regs) => {
+                    let pv = unsafe { pv::PixelValve::new(regs as *mut u32) };
+                    println!("vc4d: pv2 at {pv_phys:#x}: {}", pv.describe());
+                    Some(pv)
+                }
+                Err(err) => {
+                    println!("vc4d: pv2: cannot map {pv_phys:#x}: {err:?}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
 
     // The firmware's channels and lists, for the log: what the Pi tests
     // compare against.
@@ -158,7 +184,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         .unwrap();
 
     daemon.ready();
-    check::watch(watched, channel, fake.is_some(), checking, shown);
+    check::watch(watched, pv, channel, fake.is_some(), checking, shown);
 
     let all = [Source::Scheme];
     for event in all.into_iter().chain(event_queue.filter_map(|e| match e {
