@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use common::dma::Dma;
 
 use crate::hvs::{self, Channel, Hvs, Plane};
+use crate::hdmi::Hdmi;
 use crate::pv::PixelValve;
 use crate::shot;
 
@@ -282,7 +283,7 @@ fn serve_cob(hvs: &Hvs, index: usize) {
 /// answers screenshot requests. Every second it also reads the live FIFO
 /// state for 20 ms: the latched underrun bit (EUFLOW) may never show,
 /// because the firmware still takes the HVS interrupts and clears it.
-pub fn watch(hvs: Hvs, pv: Option<PixelValve>, channel: Channel, fake: bool, checking: bool, shown: shot::Shown) {
+pub fn watch(hvs: Hvs, pv: Option<PixelValve>, hdmi: Option<Hdmi>, channel: Channel, fake: bool, checking: bool, shown: shot::Shown) {
     let index = channel.index;
     let (width, height) = (channel.width as usize, channel.height as usize);
     thread::spawn(move || {
@@ -315,6 +316,7 @@ pub fn watch(hvs: Hvs, pv: Option<PixelValve>, channel: Channel, fake: bool, che
         // List findings per minute; only the first few are logged.
         let mut list_findings = 0u32;
         let mut fifo = FifoStats::default();
+        let mut hdmi_frames = hdmi.as_ref().map(Hdmi::frame_count);
         let mut fifo_logged = 0u32;
         loop {
             thread::sleep(ERROR_POLL);
@@ -395,6 +397,16 @@ pub fn watch(hvs: Hvs, pv: Option<PixelValve>, channel: Channel, fake: bool, che
                 }
                 (polls, with_errors, list_findings, summary_at) = (0, 0, 0, Instant::now());
                 (fifo, fifo_logged) = (FifoStats::default(), 0);
+                if let (Some(hdmi), Some(before)) = (&hdmi, hdmi_frames) {
+                    let now = hdmi.frame_count();
+                    println!(
+                        "vc4d: hdmi: {} s: {} frames in the last minute, {}",
+                        start.elapsed().as_secs(),
+                        now.wrapping_sub(before),
+                        hdmi.status()
+                    );
+                    hdmi_frames = Some(now);
+                }
             }
         }
     });

@@ -36,6 +36,7 @@ mod adapter;
 mod check;
 #[allow(dead_code)]
 mod hvs;
+mod hdmi;
 mod pv;
 mod shot;
 
@@ -121,6 +122,33 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         }
         _ => None,
     };
+    // The HDMI encoder, read only (stage 2b, #188): its two register blocks.
+    let hdmi = match (&fake, fdt.as_ref()) {
+        (None, Some(fdt)) => {
+            let mut regs = fdt
+                .find_compatible(&["brcm,bcm2835-hdmi"])
+                .and_then(|node| node.reg())
+                .map(|regs| regs.map(|r| r.starting_address as usize).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter();
+            let core_bus = regs.next().unwrap_or(hdmi::HDMI_BUS_ADDR);
+            let hd_bus = regs.next().unwrap_or(hdmi::HD_BUS_ADDR);
+            let (core_phys, hd_phys) = (soc_phys(fdt, core_bus), soc_phys(fdt, hd_bus));
+            let map = |phys, size| unsafe { common::physmap(phys, size, common::Prot::RW, common::MemoryType::DeviceMemory) };
+            match (map(core_phys, hdmi::HDMI_SIZE), map(hd_phys, hdmi::HD_SIZE)) {
+                (Ok(core), Ok(hd)) => {
+                    let hdmi = unsafe { hdmi::Hdmi::new(core as *mut u32, hd as *mut u32) };
+                    println!("vc4d: hdmi at {core_phys:#x} and {hd_phys:#x}: {}", hdmi.describe());
+                    Some(hdmi)
+                }
+                (core, hd) => {
+                    println!("vc4d: hdmi: cannot map {core_phys:#x} ({:?}) or {hd_phys:#x} ({:?})", core.err(), hd.err());
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
 
     // The firmware's channels and lists, for the log: what the Pi tests
     // compare against.
@@ -184,7 +212,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         .unwrap();
 
     daemon.ready();
-    check::watch(watched, pv, channel, fake.is_some(), checking, shown);
+    check::watch(watched, pv, hdmi, channel, fake.is_some(), checking, shown);
 
     let all = [Source::Scheme];
     for event in all.into_iter().chain(event_queue.filter_map(|e| match e {
