@@ -47,9 +47,32 @@ fn bits(reg: u32, high: u32, low: u32) -> u32 {
     (reg >> low) & (u32::MAX >> (31 - (high - low)))
 }
 
+/// GPIO block registers for the hotplug line (BCM2835 GPLEV0/1).
+pub const GPIO_SIZE: usize = 0x1000;
+const GPIO_GPLEV0: usize = 0x0034;
+
+/// The hotplug line when the board wires it to a SoC GPIO (devicetree
+/// `hpd-gpios`, as on the Pi 3B+: GPIO 28 "HDMI_HPD_N", active low)
+/// instead of the HDMI core's HOTPLUG bit.
+pub struct HpdGpio {
+    pub gpio: *mut u32,
+    pub pin: u32,
+    pub active_low: bool,
+}
+
+impl HpdGpio {
+    /// Whether the line says a monitor is there, and the raw level.
+    pub fn read(&self) -> (bool, u32) {
+        let reg = unsafe { ptr::read_volatile(self.gpio.add((GPIO_GPLEV0 + 4 * (self.pin / 32) as usize) / 4)) };
+        let level = (reg >> (self.pin % 32)) & 1;
+        ((level == 1) != self.active_low, level)
+    }
+}
+
 pub struct Hdmi {
     hdmi: *mut u32,
     hd: *mut u32,
+    hpd: Option<HpdGpio>,
 }
 
 // Device registers, only read.
@@ -59,7 +82,12 @@ impl Hdmi {
     /// # Safety
     /// `hdmi` and `hd` map the two blocks (HDMI_SIZE and HD_SIZE bytes).
     pub unsafe fn new(hdmi: *mut u32, hd: *mut u32) -> Self {
-        Hdmi { hdmi, hd }
+        Hdmi { hdmi, hd, hpd: None }
+    }
+
+    /// Read hotplug from this GPIO too.
+    pub fn set_hpd(&mut self, hpd: HpdGpio) {
+        self.hpd = Some(hpd);
     }
 
     fn core(&self, offset: usize) -> u32 {
@@ -80,8 +108,16 @@ impl Hdmi {
         let hotplug = self.core(HDMI_HOTPLUG);
         let fifo = self.core(HDMI_FIFO_CTL);
         let vid = self.hd(HD_VID_CTL);
+        let gpio = self.hpd.as_ref().map_or(String::new(), |hpd| {
+            let (connected, level) = hpd.read();
+            format!(
+                ", hpd gpio {} level {level} ({})",
+                hpd.pin,
+                if connected { "connected" } else { "not connected" }
+            )
+        });
         format!(
-            "hotplug {hotplug:#x} ({}), fifo_ctl {fifo:#06x} (recenter done {}), vid_ctl {vid:#010x}",
+            "hotplug {hotplug:#x} ({}){gpio}, fifo_ctl {fifo:#06x} (recenter done {}), vid_ctl {vid:#010x}",
             if hotplug & HDMI_HOTPLUG_CONNECTED != 0 { "connected" } else { "not connected" },
             u32::from(fifo & HDMI_FIFO_CTL_RECENTER_DONE != 0),
         )

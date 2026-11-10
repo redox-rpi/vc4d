@@ -137,7 +137,10 @@ fn daemon(daemon: daemon::Daemon) -> ! {
             let map = |phys, size| unsafe { common::physmap(phys, size, common::Prot::RW, common::MemoryType::DeviceMemory) };
             match (map(core_phys, hdmi::HDMI_SIZE), map(hd_phys, hdmi::HD_SIZE)) {
                 (Ok(core), Ok(hd)) => {
-                    let hdmi = unsafe { hdmi::Hdmi::new(core as *mut u32, hd as *mut u32) };
+                    let mut hdmi = unsafe { hdmi::Hdmi::new(core as *mut u32, hd as *mut u32) };
+                    if let Some(hpd) = hpd_gpio(fdt) {
+                        hdmi.set_hpd(hpd);
+                    }
                     println!("vc4d: hdmi at {core_phys:#x} and {hd_phys:#x}: {}", hdmi.describe());
                     Some(hdmi)
                 }
@@ -236,6 +239,32 @@ fn parse_size(value: &str) -> Option<(u32, u32)> {
 
 /// The CPU physical address of a peripheral's bus address, through `/soc`'s
 /// ranges.
+/// The HDMI hotplug GPIO from the devicetree (`hpd-gpios` = <&gpio pin
+/// flags>), mapped, if it is on the SoC's own GPIO block. Pi 3B+: GPIO 28,
+/// active low; the HDMI core's HOTPLUG bit stays 0 there (Pi test #327).
+fn hpd_gpio(fdt: &Fdt) -> Option<hdmi::HpdGpio> {
+    let cells = fdt.find_compatible(&["brcm,bcm2835-hdmi"])?.property("hpd-gpios")?.value;
+    let cell = |i: usize| cells.get(4 * i..4 * i + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let (phandle, pin, flags) = (cell(0)?, cell(1)?, cell(2)?);
+    let node = fdt.find_phandle(phandle)?;
+    if !node.compatible().is_some_and(|c| c.all().any(|c| c == "brcm,bcm2835-gpio" || c == "brcm,bcm2711-gpio")) {
+        println!("vc4d: hpd: gpio {pin} is on {}, not read", node.name);
+        return None;
+    }
+    let bus = node.reg()?.next()?.starting_address as usize;
+    let phys = soc_phys(fdt, bus);
+    match unsafe { common::physmap(phys, hdmi::GPIO_SIZE, common::Prot::RO, common::MemoryType::DeviceMemory) } {
+        Ok(gpio) => {
+            println!("vc4d: hpd: gpio {pin} at {phys:#x}, active {}", if flags & 1 != 0 { "low" } else { "high" });
+            Some(hdmi::HpdGpio { gpio: gpio as *mut u32, pin, active_low: flags & 1 != 0 })
+        }
+        Err(err) => {
+            println!("vc4d: hpd: cannot map gpio at {phys:#x} ({err:?})");
+            None
+        }
+    }
+}
+
 fn soc_phys(fdt: &Fdt, bus_addr: usize) -> usize {
     fdt.find_node("/soc")
         .and_then(|soc| soc.ranges())
