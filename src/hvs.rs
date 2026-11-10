@@ -48,11 +48,40 @@ const fn scaler_dispstatx(x: usize) -> usize {
 const fn scaler_dispbkgndx(x: usize) -> usize {
     0x44 + 0x10 * x
 }
+/// The channel's part of the composite output buffer (COB), the FIFO
+/// between the HVS and the pixel valve, in pixels.
+const fn scaler_dispbasex(x: usize) -> usize {
+    0x4c + 0x10 * x
+}
+const SCALER_DISPBASEX_TOP: Field = Field(31, 16);
+const SCALER_DISPBASEX_BASE: Field = Field(15, 0);
+/// The whole COB, in pixels (Linux, vc4_hvs.c: VC4_COB_SIZE).
+pub const COB_SIZE: u32 = 20736;
+/// AXI panic level of each channel: the HVS asks for priority on the bus
+/// when its FIFO holds fewer lines than this.
+const SCALER_DISPCTRL_PANIC: [Field; CHANNELS] = [Field(25, 24), Field(27, 26), Field(29, 28)];
 const SCALER_DISPCTRLX_ENABLE: u32 = 1 << 31;
 const SCALER_DISPCTRLX_WIDTH: Field = Field(23, 12);
 const SCALER_DISPCTRLX_HEIGHT: Field = Field(11, 0);
 const SCALER_DISPSTATX_FRAME_COUNT: Field = Field(17, 12);
 const SCALER_DISPSTATX_MODE: Field = Field(31, 30);
+/// The channel's output FIFO now (live, not latched like SCALER_DISPSTAT,
+/// whose bits the firmware's interrupt handler clears).
+const SCALER_DISPSTATX_FULL: u32 = 1 << 29;
+const SCALER_DISPSTATX_EMPTY: u32 = 1 << 28;
+const SCALER_DISPSTATX_LINE: Field = Field(11, 0);
+/// SCALER_DISPSTATX_MODE while the channel scans out.
+pub const MODE_RUN: u32 = 2;
+
+/// One read of a channel's live state.
+#[derive(Clone, Copy, Debug)]
+pub struct Fifo {
+    pub mode: u32,
+    pub full: bool,
+    pub empty: bool,
+    /// The output line the channel works on.
+    pub line: u32,
+}
 
 const SCALER_DLIST_START: usize = 0x2000;
 /// Words of display list memory.
@@ -366,6 +395,47 @@ impl Hvs {
             return;
         }
         self.set_reg(SCALER_DISPSTAT, scaler_dispstat_errors(index) | SCALER_DISPSTAT_DMA_ERROR);
+    }
+
+    /// The channel's live mode, FIFO state and line.
+    pub fn fifo(&self, index: usize) -> Fifo {
+        let stat = self.reg(scaler_dispstatx(index));
+        Fifo {
+            mode: SCALER_DISPSTATX_MODE.get(stat),
+            full: stat & SCALER_DISPSTATX_FULL != 0,
+            empty: stat & SCALER_DISPSTATX_EMPTY != 0,
+            line: SCALER_DISPSTATX_LINE.get(stat),
+        }
+    }
+
+    /// The channel's part of the COB: first and last pixel.
+    pub fn cob(&self, index: usize) -> (u32, u32) {
+        let reg = self.reg(scaler_dispbasex(index));
+        (SCALER_DISPBASEX_BASE.get(reg), SCALER_DISPBASEX_TOP.get(reg))
+    }
+
+    /// Gives the channel pixels `base..=top` of the COB.
+    pub fn set_cob(&self, index: usize, base: u32, top: u32) {
+        self.set_reg(
+            scaler_dispbasex(index),
+            SCALER_DISPBASEX_TOP.set(top) | SCALER_DISPBASEX_BASE.set(base),
+        );
+    }
+
+    /// Each channel's part of the COB and its AXI panic level, for the log.
+    pub fn describe_cob(&self) -> String {
+        let ctrl = self.reg(SCALER_DISPCTRL);
+        (0..CHANNELS)
+            .map(|i| {
+                let (base, top) = self.cob(i);
+                format!(
+                    "channel {i} cob {base}..={top} ({} pixels) panic {}",
+                    (top + 1).saturating_sub(base),
+                    SCALER_DISPCTRL_PANIC[i].get(ctrl)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     pub fn frame_count(&self, index: usize) -> u32 {

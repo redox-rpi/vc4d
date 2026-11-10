@@ -11,6 +11,7 @@
 // (SCALER_DISPSTAT, SCALER_DISPSTATX, SCALER_DISPLACTX) and the underrun
 // handling of vc4_hvs.c (vc4_hvs_irq_handler()).
 
+use std::fs;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -181,17 +182,80 @@ const SHOT_POLL: Duration = Duration::from_secs(3);
 const ERROR_POLL: Duration = Duration::from_secs(1);
 const ERROR_SUMMARY: Duration = Duration::from_secs(60);
 
+/// Every second the watch thread reads the channel's live FIFO state this
+/// long, as fast as it can (about 2 % of a core).
+const FIFO_SAMPLE: Duration = Duration::from_millis(20);
+
+/// `echo BASE TOP > /tmp/vc4d.cob` gives our channel pixels BASE..=TOP of
+/// the COB, to see whether a larger FIFO stops underruns.
+const COB_REQUEST: &str = "/tmp/vc4d.cob";
+
+/// FIFO reads while the channel ran, and those that found it empty, by
+/// eighth of the screen; the last bucket is lines after the last one.
+#[derive(Default)]
+struct FifoStats {
+    reads: u64,
+    empty: u64,
+    by_part: [u64; 9],
+}
+
+impl FifoStats {
+    /// Reads the FIFO state for FIFO_SAMPLE; returns this sample's numbers.
+    fn sample(&mut self, hvs: &Hvs, index: usize, height: u32) -> FifoStats {
+        let mut now = FifoStats::default();
+        let start = Instant::now();
+        while start.elapsed() < FIFO_SAMPLE {
+            let fifo = hvs.fifo(index);
+            if fifo.mode != hvs::MODE_RUN {
+                continue;
+            }
+            now.reads += 1;
+            if fifo.empty && !fifo.full {
+                now.empty += 1;
+                let part = if fifo.line >= height { 8 } else { (fifo.line * 8 / height.max(1)) as usize };
+                now.by_part[part] += 1;
+            }
+        }
+        self.reads += now.reads;
+        self.empty += now.empty;
+        for (sum, n) in self.by_part.iter_mut().zip(now.by_part) {
+            *sum += n;
+        }
+        now
+    }
+}
+
+/// Applies a COB request if there is one.
+fn serve_cob(hvs: &Hvs, index: usize) {
+    let Ok(text) = fs::read_to_string(COB_REQUEST) else {
+        return;
+    };
+    let _ = fs::remove_file(COB_REQUEST);
+    let numbers: Vec<u32> = text.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+    match numbers[..] {
+        [base, top] if base < top && top < hvs::COB_SIZE => {
+            let old = hvs.cob(index);
+            hvs.set_cob(index, base, top);
+            println!("vc4d: cob: channel {index} {}..={} -> {base}..={top}: {}", old.0, old.1, hvs.describe_cob());
+        }
+        _ => println!("vc4d: cob: want \"BASE TOP\" below {} in {COB_REQUEST}, got {text:?}", hvs::COB_SIZE),
+    }
+}
+
 /// Logs the channel's state a few times over two minutes after the
 /// handover, while fbcond and Orbital draw: the list it points at, whether
 /// frames go on, and new errors. Then it keeps reading the error bits every
 /// second, logging the first underruns of each minute with their time, a
 /// summary every minute, and changes to its display list by others
 /// (Pi test #275: bands on HDMI while Orbital drew, vc4shot clean), and
-/// answers screenshot requests.
+/// answers screenshot requests. Every second it also reads the live FIFO
+/// state for 20 ms: the latched underrun bit (EUFLOW) may never show,
+/// because the firmware still takes the HVS interrupts and clears it.
 pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot::Shown) {
     let index = channel.index;
     let (width, height) = (channel.width as usize, channel.height as usize);
     thread::spawn(move || {
+        println!("vc4d: cob: {}", hvs.describe_cob());
         hvs.clear_errors(index);
         let start = Instant::now();
         let mut frame = hvs.frame_count(index);
@@ -218,9 +282,27 @@ pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot
         let mut was_elsewhere = false;
         // List findings per minute; only the first few are logged.
         let mut list_findings = 0u32;
+        let mut fifo = FifoStats::default();
+        let mut fifo_logged = 0u32;
         loop {
             thread::sleep(ERROR_POLL);
             polls += 1;
+            serve_cob(&hvs, index);
+            if !fake {
+                let now = fifo.sample(&hvs, index, height as u32);
+                if now.empty > 0 {
+                    fifo_logged += 1;
+                    if fifo_logged <= 5 {
+                        println!(
+                            "vc4d: fifo: {} s: empty in {} of {} reads, by eighth {:?}",
+                            start.elapsed().as_secs(),
+                            now.empty,
+                            now.reads,
+                            now.by_part
+                        );
+                    }
+                }
+            }
             // Something else (the firmware) writing the list memory or
             // pointing the channel elsewhere would show garbage planes.
             if let Some((word, written, now)) = hvs.changed_list_word() {
@@ -262,7 +344,17 @@ pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot
                     "vc4d: scanout: {} s: errors in {with_errors} of {polls} reads, {list_findings} list findings in the last minute",
                     start.elapsed().as_secs()
                 );
+                if !fake {
+                    println!(
+                        "vc4d: fifo: {} s: empty in {} of {} reads in the last minute, by eighth {:?}",
+                        start.elapsed().as_secs(),
+                        fifo.empty,
+                        fifo.reads,
+                        fifo.by_part
+                    );
+                }
                 (polls, with_errors, list_findings, summary_at) = (0, 0, 0, Instant::now());
+                (fifo, fifo_logged) = (FifoStats::default(), 0);
             }
         }
     });
