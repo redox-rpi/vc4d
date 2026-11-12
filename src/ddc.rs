@@ -80,11 +80,17 @@ impl Ddc {
         self.write(CLKT, 0x40);
     }
 
-    /// Waits for the transfer to end; reads bytes into `rx` as they come.
-    fn finish(&self, mut rx: Option<&mut [u8]>) -> Result<usize, String> {
+    /// Waits for the transfer to end; feeds `tx` into the FIFO and reads
+    /// bytes into `rx` as they come. The FIFO is written only once the
+    /// transfer runs (QEMU's BSC drops bytes written before the start).
+    fn finish(&self, mut tx: &[u8], mut rx: Option<&mut [u8]>) -> Result<usize, String> {
         let start = Instant::now();
         let mut got = 0;
         loop {
+            while !tx.is_empty() && self.read(S) & S_TXD != 0 {
+                self.write(FIFO, u32::from(tx[0]));
+                tx = &tx[1..];
+            }
             let s = self.read(S);
             if let Some(buf) = rx.as_deref_mut() {
                 while self.read(S) & S_RXD != 0 {
@@ -129,15 +135,12 @@ impl Ddc {
         self.write(A, EDID_ADDR);
         // Write the offset.
         self.write(DLEN, 1);
-        if self.read(S) & S_TXD != 0 {
-            self.write(FIFO, u32::from(offset));
-        }
         self.write(C, C_I2CEN | C_ST);
-        self.finish(None).map_err(|e| format!("offset {offset}: {e}"))?;
+        self.finish(&[offset], None).map_err(|e| format!("offset {offset}: {e}"))?;
         // Read the bytes.
         self.write(DLEN, buf.len() as u32);
         self.write(C, C_I2CEN | C_ST | C_CLEAR | C_READ);
-        let got = self.finish(Some(buf)).map_err(|e| format!("read at {offset}: {e}"))?;
+        let got = self.finish(&[], Some(buf)).map_err(|e| format!("read at {offset}: {e}"))?;
         if got != buf.len() {
             return Err(format!("read at {offset}: {got} of {} bytes", buf.len()));
         }
