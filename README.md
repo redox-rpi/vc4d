@@ -54,7 +54,7 @@ skips the read.
 
 The parser is the crate `vc4-edid` in `edid/`, without dependencies:
 `cargo test` there runs on any host. In QEMU (`raspi3b`, which models the
-BSCs) `-device i2c-ddc,bus=i2c-bus.2` puts a monitor with a 1024x768 EDID
+BSCs) `-device i2c-ddc,bus=i2c-bus.2` puts QEMU's EDID generator (`QEMU Monitor`, 1280x800 at 75 Hz preferred; it ignores `xres`/`yres`)
 on the DDC bus. Blocks after the second (E-DDC segments) are not read yet.
 
 Environment (the bootloader's): `VC4D=off` leaves the display to `vesad` or
