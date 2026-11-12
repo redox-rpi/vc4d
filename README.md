@@ -71,8 +71,18 @@ included) when `/tmp/vc4shot.request` appears and writes
 redox-rpi's experiment `vc4d` builds a pinned commit of this repository
 with the cookbook. It needs large contiguous buffers (redox-rpi kernel
 patches `0049` and `0050`). The driver only builds for Redox
-(`aarch64-unknown-redox`); the tests of the display list encoding in
-`src/hvs.rs` run on any host when that file is built as a library.
+(`aarch64-unknown-redox`).
+
+The logic without Redox dependencies is its own crate, `vc4-hvs` in
+`hvs/`: HVS registers, display list encoding and decoding, register
+fields. It builds and tests on any host with stable Rust:
+
+```
+cd hvs && cargo test
+```
+
+CI runs these tests and clippy (report only) on every push
+(`.github/workflows/host-tests.yml`).
 
 ## License
 
