@@ -8,8 +8,12 @@ Status: stage 1 (display: HVS planes) has code, on branch `stage1-hvs`
 ([#1](https://github.com/redox-rpi/vc4d/pull/1)), and runs on the Pi 3B+:
 the desktop with a hardware cursor plane at 1920x1080 (redox-rpi Pi tests
 220a, 256, 259 and 276). redox-rpi builds a pinned commit of it (experiment
-`vc4d` on its branch `graphics-vc4d`). The firmware still sets up HDMI and
-the mode. Stages 2 and 3 have no code yet. The plan is
+`vc4d`, on its branch `vc4d-fifo-diag` for now). The firmware still sets up
+HDMI and the mode. Stage 2 has started read only: branch `underrun-diag`
+logs the HVS FIFO, pixel valve 2, the HDMI encoder and the hotplug GPIO
+(Pi tests 316 to 328). Host tests: the HVS logic as the crate `vc4-hvs`
+([#2](https://github.com/redox-rpi/vc4d/pull/2)). Stage 3 has no code yet.
+The plan is
 [redox-rpi#188](https://github.com/redox-rpi/redox-rpi/issues/188).
 
 ## Plan
