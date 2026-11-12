@@ -20,6 +20,8 @@
 // everything but the picture. VC4D_LOG=1 logs every new display list (the
 // first ones are always logged). VC4D_CHECK=off skips the check without a
 // screen (check.rs) that runs before the handover and watches after it.
+// VC4D_EDID=off skips reading the monitor's EDID over DDC (ddc.rs), which
+// runs first, also without an HVS (QEMU with an i2c-ddc device).
 
 use std::env;
 use std::thread;
@@ -34,6 +36,7 @@ use crate::hvs::{Hvs, CHANNELS, HVS_BUS_ADDR, HVS_SIZE};
 
 mod adapter;
 mod check;
+mod ddc;
 use vc4_hvs as hvs;
 mod shot;
 
@@ -60,6 +63,9 @@ fn daemon(daemon: daemon::Daemon) -> ! {
 
     let dtb = std::fs::read("/scheme/kernel.dtb").unwrap_or_default();
     let fdt = Fdt::new(&dtb).ok();
+    if !env::var("VC4D_EDID").is_ok_and(|v| v == "off") {
+        ddc::log_edid(fdt.as_ref());
+    }
     let bus_addr = fdt
         .as_ref()
         .and_then(|fdt| fdt.find_compatible(&["brcm,bcm2835-hvs"]))
