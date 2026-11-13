@@ -1,0 +1,8 @@
+[package]
+name = "vc4-edid"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "EDID parsing for vc4d: base block and CEA-861 extension"
+
+[dependencies]
