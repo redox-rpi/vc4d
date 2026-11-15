@@ -17,6 +17,10 @@ pub use vc4_edid::Timing;
 const PV2_FIFO_BYTES: u32 = 64;
 const HVS_FIFO_LATENCY_PIX: u32 = 6;
 
+/// Pixel valve register offsets.
+pub const PV_CONTROL: usize = 0x00;
+pub const PV_V_CONTROL: usize = 0x04;
+
 // PV_CONTROL fields.
 const PV_CONTROL_FORMAT_24: u32 = 0 << 21;
 const PV_CONTROL_FIFO_LEVEL_SHIFT: u32 = 15;
@@ -24,6 +28,8 @@ const PV_CONTROL_CLR_AT_START: u32 = 1 << 14;
 const PV_CONTROL_TRIGGER_UNDERFLOW: u32 = 1 << 13;
 const PV_CONTROL_WAIT_HSTART: u32 = 1 << 12;
 const PV_CONTROL_CLK_SELECT_DPI_SMI_HDMI: u32 = 1 << 2;
+/// Empties the valve's FIFO; reads back as 0.
+pub const PV_CONTROL_FIFO_CLR: u32 = 1 << 1;
 const PV_CONTROL_EN: u32 = 1 << 0;
 
 // PV_V_CONTROL fields.
@@ -146,6 +152,51 @@ pub fn hdmi_timing(t: &Timing) -> Result<HdmiTiming, Error> {
     Ok(HdmiTiming { horza, horzb, verta0: verta, vertb0: vertb, verta1: verta, vertb1: vertb })
 }
 
+/// One step of programming a pixel valve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Write the value to the register at this offset.
+    Write(usize, &'static str, u32),
+    /// Let this many frames pass (the valve finishes the frame it is in).
+    WaitFrames(u32),
+}
+
+/// The steps that program a running pixel valve with `pv`, in the order of
+/// Linux's vc4_crtc.c (vc4_crtc_disable(), vc4_crtc_pixelvalve_reset(),
+/// vc4_crtc_config_pv(), vc4_crtc_atomic_enable()): video off at the end
+/// of the frame, the valve off, its FIFO emptied, the timing, then the
+/// valve and the video on again. The HDMI encoder and the HVS keep
+/// running; the screen is blank for a few frames.
+pub fn pv_program(pv: &Pv) -> Vec<Step> {
+    let off = pv.control & !PV_CONTROL_EN;
+    let mut steps = vec![
+        Step::Write(PV_V_CONTROL, "V_CONTROL", pv.v_control & !PV_VCONTROL_VIDEN),
+        Step::WaitFrames(2),
+        Step::Write(PV_CONTROL, "CONTROL", off),
+        Step::Write(PV_CONTROL, "CONTROL", off | PV_CONTROL_FIFO_CLR),
+    ];
+    for (offset, name, value) in pv.regs() {
+        if offset != PV_CONTROL && offset != PV_V_CONTROL {
+            steps.push(Step::Write(offset, name, value));
+        }
+    }
+    steps.extend([
+        Step::Write(PV_CONTROL, "CONTROL", pv.control),
+        Step::Write(PV_V_CONTROL, "V_CONTROL", pv.v_control),
+        Step::WaitFrames(2),
+    ]);
+    steps
+}
+
+/// What a register reads back after `pv_program`: FIFO_CLR is not kept.
+pub fn readback_mask(offset: usize) -> u32 {
+    if offset == PV_CONTROL {
+        !PV_CONTROL_FIFO_CLR
+    } else {
+        !0
+    }
+}
+
 /// Registers that differ between two sets: (name, ours, theirs).
 pub fn differences(
     ours: &[(usize, &'static str, u32)],
@@ -243,6 +294,54 @@ mod tests {
         t.vfp = 128;
         assert_eq!(hdmi_timing(&t), Err(Error::TooWide("vfp", 128)));
         assert!(!pv_interlaced(pv2(&P1080).unwrap().v_control));
+    }
+
+    /// A pixel valve as registers in memory: FIFO_CLR reads back as 0.
+    fn run(steps: &[Step], regs: &mut std::collections::BTreeMap<usize, u32>) -> Vec<String> {
+        let mut log = Vec::new();
+        for step in steps {
+            match *step {
+                Step::Write(offset, name, value) => {
+                    regs.insert(offset, value & readback_mask(offset));
+                    log.push(format!("{name} {value:#x}"));
+                }
+                Step::WaitFrames(n) => log.push(format!("wait {n}")),
+            }
+        }
+        log
+    }
+
+    #[test]
+    fn program_ends_with_the_firmwares_registers() {
+        let pv = pv2(&P1080).unwrap();
+        let mut regs: std::collections::BTreeMap<usize, u32> =
+            [0x00, 0x04, 0x0c, 0x10, 0x14, 0x18].iter().map(|&o| (o, 0)).collect();
+        run(&pv_program(&pv), &mut regs);
+        for (offset, value) in &regs {
+            assert_eq!(*value, firmware_pv2(*offset), "offset {offset:#x}");
+        }
+    }
+
+    #[test]
+    fn program_order_follows_linux() {
+        let pv = pv2(&P1080).unwrap();
+        let steps = pv_program(&pv);
+        let pos = |want: Step| steps.iter().position(|s| *s == want).unwrap();
+        let video_off = pos(Step::Write(PV_V_CONTROL, "V_CONTROL", PV_VCONTROL_CONTINUOUS));
+        let valve_off = pos(Step::Write(PV_CONTROL, "CONTROL", 0x0017_7004));
+        let fifo_clear = pos(Step::Write(PV_CONTROL, "CONTROL", 0x0017_7006));
+        let timing = pos(Step::Write(0x0c, "HORZA", 0x0094_002c));
+        let valve_on = pos(Step::Write(PV_CONTROL, "CONTROL", 0x0017_7005));
+        let video_on = pos(Step::Write(PV_V_CONTROL, "V_CONTROL", 3));
+        assert_eq!(video_off, 0);
+        assert_eq!(steps[1], Step::WaitFrames(2), "the frame ends before the valve stops");
+        assert!(video_off < valve_off && valve_off < fifo_clear && fifo_clear < timing);
+        assert!(timing < valve_on && valve_on < video_on);
+        assert_eq!(steps.last(), Some(&Step::WaitFrames(2)));
+        // Every timing register once, while the valve is off.
+        let timing_writes: Vec<_> =
+            steps[fifo_clear..valve_on].iter().filter(|s| matches!(s, Step::Write(o, ..) if *o >= 0x0c)).collect();
+        assert_eq!(timing_writes.len(), 4);
     }
 
     /// The test monitor's EDID (Pi test row 387), the same bytes as the

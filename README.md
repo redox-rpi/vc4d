@@ -81,6 +81,32 @@ needs its clocks running, which vc4d does not check yet. Next: write these
 values, then set up PLLH and the HDMI PHY for modes the firmware did not
 pick.
 
+## Stage 3a: vc4d programs pixel valve 2
+
+With `VC4D_MODE=write`, when pixel valve 2's values equal the firmware's,
+vc4d writes them itself, in the order of Linux's `vc4_crtc.c`:
+
+1. video off at the end of the frame;
+2. the valve off, its FIFO emptied;
+3. the four timing registers;
+4. the valve on, the video on.
+
+The mode is the firmware's, so the monitor keeps it; the screen is blank
+for a few frames. vc4d then reads every register back (`vc4d: mode:
+write: PASS`). The usual checks follow: the HVS channel must run on, and
+the check without a screen must pass.
+
+`vc4_mode::pv_program()` gives the steps, and host tests check their order
+and the end state.
+
+Also in this stage, read only: the HDMI core's timing is compared with
+the firmware's. It is read only after `CM_HSMCTL` shows the HSM clock
+running, since reading the block without its clock can hang the bus.
+
+Without `VC4D_MODE=write`, vc4d only compares, as in stage 2c. Next:
+writing the HDMI core's timing, then PLLH and the PHY for a mode the
+firmware did not pick.
+
 Environment (the bootloader's): `VC4D=off` leaves the display to `vesad` or
 `rpi-fbd`. `VC4D_FAKE=WIDTHxHEIGHT` runs against an HVS in normal memory, for
 QEMU, which has none: everything but the picture. `VC4D_LOG=1` logs every
