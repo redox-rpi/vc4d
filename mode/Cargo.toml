@@ -1,0 +1,9 @@
+[package]
+name = "vc4-mode"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "Pixel valve and HDMI register values for a video mode (vc4d)"
+
+[dependencies]
+vc4-edid = { path = "../edid" }

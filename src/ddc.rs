@@ -158,19 +158,20 @@ fn ddc_bus_addr(fdt: &Fdt) -> Option<usize> {
 
 /// Reads the EDID (base block and the first extension, if there is one)
 /// and logs what the monitor says it can show, with the raw bytes.
-pub fn log_edid(fdt: Option<&Fdt>) {
+/// Returns the EDID when it parsed.
+pub fn log_edid(fdt: Option<&Fdt>) -> Option<vc4_edid::Edid> {
     let ddc = match Ddc::open(fdt) {
         Ok(ddc) => ddc,
         Err(err) => {
             println!("vc4d: edid: {err}");
-            return;
+            return None;
         }
     };
     println!("vc4d: edid: DDC controller at {:#x}", ddc.phys);
     let mut data = vec![0u8; vc4_edid::BLOCK];
     if let Err(err) = ddc.read_edid(0, &mut data) {
         println!("vc4d: edid: FAIL: {err}");
-        return;
+        return None;
     }
     if data[126] > 0 {
         let mut ext = vec![0u8; vc4_edid::BLOCK];
@@ -187,7 +188,7 @@ pub fn log_edid(fdt: Option<&Fdt>) {
         Ok(edid) => edid,
         Err(err) => {
             println!("vc4d: edid: FAIL: {err}");
-            return;
+            return None;
         }
     };
     println!("vc4d: edid: PASS: {edid}");
@@ -232,4 +233,5 @@ pub fn log_edid(fdt: Option<&Fdt>) {
             println!("vc4d: edid: CEA detailed {t}");
         }
     }
+    Some(edid)
 }

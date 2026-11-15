@@ -66,6 +66,21 @@ The parser is the crate `vc4-edid` in `edid/`, without dependencies:
 BSCs) `-device i2c-ddc,bus=i2c-bus.2` puts QEMU's EDID generator (`QEMU Monitor`, 1280x800 at 75 Hz preferred; it ignores `xres`/`yres`)
 on the DDC bus. Blocks after the second (E-DDC segments) are not read yet.
 
+## Stage 2c: mode registers, read only
+
+The crate `vc4-mode` (`mode/`, host tests) turns a timing from the EDID
+into the register values for pixel valve 2 and the HDMI core's timing, the
+way Linux's vc4 driver lays them out. The tests check them against what
+Broadcom's firmware programmed at 1080p60 (redox-rpi Pi test 337): for the
+test monitor's own EDID (Pi test 387) every one of them is the same.
+
+On the Pi, after the EDID, vc4d reads pixel valve 2 and logs its values
+next to the firmware's (`vc4d: mode: pv2 ...`), then `vc4d: mode: PASS`
+or `DIFFERENT`. It writes nothing. The HDMI core is not read here: it
+needs its clocks running, which vc4d does not check yet. Next: write these
+values, then set up PLLH and the HDMI PHY for modes the firmware did not
+pick.
+
 Environment (the bootloader's): `VC4D=off` leaves the display to `vesad` or
 `rpi-fbd`. `VC4D_FAKE=WIDTHxHEIGHT` runs against an HVS in normal memory, for
 QEMU, which has none: everything but the picture. `VC4D_LOG=1` logs every

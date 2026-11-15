@@ -37,6 +37,7 @@ use crate::hvs::{Hvs, CHANNELS, HVS_BUS_ADDR, HVS_SIZE};
 mod adapter;
 mod check;
 mod ddc;
+mod mode;
 use vc4_hvs as hvs;
 mod shot;
 
@@ -63,9 +64,11 @@ fn daemon(daemon: daemon::Daemon) -> ! {
 
     let dtb = std::fs::read("/scheme/kernel.dtb").unwrap_or_default();
     let fdt = Fdt::new(&dtb).ok();
-    if !env::var("VC4D_EDID").is_ok_and(|v| v == "off") {
-        ddc::log_edid(fdt.as_ref());
-    }
+    let edid = if env::var("VC4D_EDID").is_ok_and(|v| v == "off") {
+        None
+    } else {
+        ddc::log_edid(fdt.as_ref())
+    };
     let bus_addr = fdt
         .as_ref()
         .and_then(|fdt| fdt.find_compatible(&["brcm,bcm2835-hvs"]))
@@ -99,6 +102,11 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     );
     if !hvs.enabled() {
         give_up(daemon, "the firmware left the HVS off (or this is QEMU, which has none)");
+    }
+    // The firmware's display runs: compare its pixel valve 2 with what
+    // vc4d would write for the EDID's preferred mode (read only).
+    if let (Some(edid), None) = (&edid, fake) {
+        mode::compare(fdt.as_ref(), edid);
     }
 
     // The firmware's channels and lists, for the log: what the Pi tests
