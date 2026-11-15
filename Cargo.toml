@@ -10,6 +10,7 @@ license = "GPL-2.0-only"
 # pins in config/upstream.lock; redox-rpi does not patch them.
 [dependencies]
 vc4-hvs = { path = "hvs" }
+vc4-edid = { path = "edid" }
 common = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "eddcaa21fb2d11b4a6bd64478e0639153266dc04" }
 daemon = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "eddcaa21fb2d11b4a6bd64478e0639153266dc04" }
 driver-graphics = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "eddcaa21fb2d11b4a6bd64478e0639153266dc04" }

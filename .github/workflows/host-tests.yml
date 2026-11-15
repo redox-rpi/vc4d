@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# The logic of vc4d (crate vc4-hvs in hvs/) builds and tests on a Linux
+# The logic of vc4d (crates vc4-hvs in hvs/, vc4-edid in edid/) builds and tests on a Linux
 # host with stable Rust; the driver itself needs the Redox target and is
 # built by redox-rpi (redox-rpi#271).
 name: host tests
@@ -20,5 +20,17 @@ jobs:
       - run: cargo test
       # Report only for now (redox-rpi QMP): warnings show in the log, the
       # job does not fail on them.
+      - run: cargo clippy --all-targets
+        continue-on-error: true
+
+  edid:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: edid
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: cargo test
       - run: cargo clippy --all-targets
         continue-on-error: true

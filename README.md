@@ -12,7 +12,10 @@ the desktop with a hardware cursor plane at 1920x1080 (redox-rpi Pi tests
 HDMI and the mode. Stage 2 has started read only: branch `underrun-diag`
 logs the HVS FIFO, pixel valve 2, the HDMI encoder and the hotplug GPIO
 (Pi tests 316 to 328). Host tests: the HVS logic as the crate `vc4-hvs`
-([#2](https://github.com/redox-rpi/vc4d/pull/2)). Stage 3 has no code yet.
+([#2](https://github.com/redox-rpi/vc4d/pull/2)). Stage 2b reads the monitor's EDID over HDMI DDC
+([#4](https://github.com/redox-rpi/vc4d/pull/4)); on the Pi 3B+ the
+preferred mode is 1080p60, as the firmware set it (redox-rpi Pi test 387).
+Stage 3 has no code yet.
 The plan is
 [redox-rpi#188](https://github.com/redox-rpi/redox-rpi/issues/188).
 
@@ -41,14 +44,33 @@ and leaves one HVS channel running with its own display list. `vc4d`:
 - writes each new display list into a free place above the firmware's
   lists, then points the channel at it.
 
-Not yet: EDID and other modes, vertical blank interrupts, windows as
-planes (needs Orbital changes), the pixel valve and HDMI.
+Not yet: other modes, vertical blank interrupts, windows as planes (needs
+Orbital changes), the pixel valve and HDMI.
+
+## Stage 2b: EDID over DDC
+
+At start, before it touches the HVS, `vc4d` reads the monitor's EDID over
+HDMI DDC: I2C address 0x50 on the BSC the devicetree's hdmi node names in
+`ddc` (BSC2, bus address 0x7e805000, on the BCM2837), base block and the
+first extension. It logs the raw bytes and what they say: maker, name,
+preferred mode with its full timing, the other detailed timings, the range
+limits, the established and standard modes, and the CEA-861 extension
+(HDMI or DVI, audio, video codes, its detailed timings). All lines start
+with `vc4d: edid:`; `PASS` when an EDID was read and parsed, `FAIL` with
+the reason otherwise (no monitor answers with `no acknowledge`). Nothing
+changes on the screen yet: the mode stays the firmware's. `VC4D_EDID=off`
+skips the read.
+
+The parser is the crate `vc4-edid` in `edid/`, without dependencies:
+`cargo test` there runs on any host. In QEMU (`raspi3b`, which models the
+BSCs) `-device i2c-ddc,bus=i2c-bus.2` puts QEMU's EDID generator (`QEMU Monitor`, 1280x800 at 75 Hz preferred; it ignores `xres`/`yres`)
+on the DDC bus. Blocks after the second (E-DDC segments) are not read yet.
 
 Environment (the bootloader's): `VC4D=off` leaves the display to `vesad` or
 `rpi-fbd`. `VC4D_FAKE=WIDTHxHEIGHT` runs against an HVS in normal memory, for
 QEMU, which has none: everything but the picture. `VC4D_LOG=1` logs every
 new display list (the first four always are). `VC4D_CHECK=off` skips the
-check below.
+check below. `VC4D_EDID=off` skips the EDID read.
 
 ## Check without a screen
 
