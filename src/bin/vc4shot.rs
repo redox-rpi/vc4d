@@ -16,8 +16,7 @@ use std::time::{Duration, Instant};
 use fdt::Fdt;
 
 #[allow(dead_code)]
-#[path = "../hvs.rs"]
-mod hvs;
+use vc4_hvs as hvs;
 
 /// As in shot.rs (vc4d answers the request).
 mod shot {

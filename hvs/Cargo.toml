@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[package]
+name = "vc4-hvs"
+description = "VideoCore IV HVS registers and display lists: the logic of vc4d, without Redox dependencies"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+# No dependencies on purpose: this crate builds and tests on any host with
+# stable Rust (cargo test in this directory), see redox-rpi#271.
+[dependencies]

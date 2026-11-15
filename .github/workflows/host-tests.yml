@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The logic of vc4d (crate vc4-hvs in hvs/) builds and tests on a Linux
+# host with stable Rust; the driver itself needs the Redox target and is
+# built by redox-rpi (redox-rpi#271).
+name: host tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  hvs:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hvs
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: cargo test
+      # Report only for now (redox-rpi QMP): warnings show in the log, the
+      # job does not fail on them.
+      - run: cargo clippy --all-targets
+        continue-on-error: true
