@@ -1,0 +1,251 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//
+// Register values for a video mode on the BCM283x display path: pixel
+// valve 2 and the HDMI core (stage 2c of redox-rpi#188). Pure arithmetic,
+// no register access, so it tests on any host (cargo test here).
+//
+// Field layouts from Linux drivers/gpu/drm/vc4/vc4_regs.h and
+// vc4_hdmi_regs.h (BCM2835 table), as used by vc4_crtc.c and vc4_hdmi.c;
+// the code is our own. The tests check the result against what Broadcom's
+// firmware programmed for 1080p60 (redox-rpi Pi test row 337, socdump
+// reference pi3bp-firmware-1080p-display.regs).
+
+pub use vc4_edid::Timing;
+
+/// Bytes in pixel valve 2's FIFO (HDMI) and the HVS latency Linux leaves
+/// free in it, in pixels.
+const PV2_FIFO_BYTES: u32 = 64;
+const HVS_FIFO_LATENCY_PIX: u32 = 6;
+
+// PV_CONTROL fields.
+const PV_CONTROL_FORMAT_24: u32 = 0 << 21;
+const PV_CONTROL_FIFO_LEVEL_SHIFT: u32 = 15;
+const PV_CONTROL_CLR_AT_START: u32 = 1 << 14;
+const PV_CONTROL_TRIGGER_UNDERFLOW: u32 = 1 << 13;
+const PV_CONTROL_WAIT_HSTART: u32 = 1 << 12;
+const PV_CONTROL_CLK_SELECT_DPI_SMI_HDMI: u32 = 1 << 2;
+const PV_CONTROL_EN: u32 = 1 << 0;
+
+// PV_V_CONTROL fields.
+const PV_VCONTROL_VIDEN: u32 = 1 << 0;
+const PV_VCONTROL_CONTINUOUS: u32 = 1 << 1;
+const PV_VCONTROL_INTERLACE: u32 = 1 << 4;
+
+// HDMI_HORZA fields.
+const HDMI_HORZA_VPOS: u32 = 1 << 14;
+const HDMI_HORZA_HPOS: u32 = 1 << 13;
+
+/// Pixel valve registers, at their offsets from the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pv {
+    pub control: u32,   // 0x00
+    pub v_control: u32, // 0x04
+    pub horza: u32,     // 0x0c
+    pub horzb: u32,     // 0x10
+    pub verta: u32,     // 0x14
+    pub vertb: u32,     // 0x18
+}
+
+impl Pv {
+    /// (offset, name, value), in the order they are written.
+    pub fn regs(&self) -> [(usize, &'static str, u32); 6] {
+        [
+            (0x0c, "HORZA", self.horza),
+            (0x10, "HORZB", self.horzb),
+            (0x14, "VERTA", self.verta),
+            (0x18, "VERTB", self.vertb),
+            (0x00, "CONTROL", self.control),
+            (0x04, "V_CONTROL", self.v_control),
+        ]
+    }
+}
+
+/// HDMI core timing registers (BCM2835 offsets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HdmiTiming {
+    pub horza: u32,  // 0x0c4
+    pub horzb: u32,  // 0x0c8
+    pub verta0: u32, // 0x0cc
+    pub vertb0: u32, // 0x0d0
+    pub verta1: u32, // 0x0d4
+    pub vertb1: u32, // 0x0d8
+}
+
+impl HdmiTiming {
+    pub fn regs(&self) -> [(usize, &'static str, u32); 6] {
+        [
+            (0x0c4, "HORZA", self.horza),
+            (0x0c8, "HORZB", self.horzb),
+            (0x0cc, "VERTA0", self.verta0),
+            (0x0d0, "VERTB0", self.vertb0),
+            (0x0d4, "VERTA1", self.verta1),
+            (0x0d8, "VERTB1", self.vertb1),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    /// A field is wider than its register allows.
+    TooWide(&'static str, u32),
+    /// Interlaced modes are not done yet.
+    Interlaced,
+}
+
+fn field(name: &'static str, value: u32, bits: u32) -> Result<u32, Error> {
+    if value >> bits != 0 {
+        Err(Error::TooWide(name, value))
+    } else {
+        Ok(value)
+    }
+}
+
+/// Pixel valve 2 (HDMI) for a progressive mode, as Linux's vc4_crtc sets
+/// it: 24-bit pixels, the FIFO level for HDMI, HDMI clock, enabled, video
+/// on and continuous.
+pub fn pv2(t: &Timing) -> Result<Pv, Error> {
+    if t.interlaced {
+        return Err(Error::Interlaced);
+    }
+    let fifo_level = PV2_FIFO_BYTES - 3 * HVS_FIFO_LATENCY_PIX;
+    let h = |name, v| field(name, v, 16);
+    Ok(Pv {
+        control: PV_CONTROL_FORMAT_24
+            | fifo_level << PV_CONTROL_FIFO_LEVEL_SHIFT
+            | PV_CONTROL_CLR_AT_START
+            | PV_CONTROL_TRIGGER_UNDERFLOW
+            | PV_CONTROL_WAIT_HSTART
+            | PV_CONTROL_CLK_SELECT_DPI_SMI_HDMI
+            | PV_CONTROL_EN,
+        v_control: PV_VCONTROL_VIDEN | PV_VCONTROL_CONTINUOUS,
+        horza: h("hbp", t.hbp)? << 16 | h("hsync", t.hsync)?,
+        horzb: h("hfp", t.hfp)? << 16 | h("hactive", t.hactive)?,
+        verta: h("vbp", t.vbp)? << 16 | h("vsync", t.vsync)?,
+        vertb: h("vfp", t.vfp)? << 16 | h("vactive", t.vactive)?,
+    })
+}
+
+/// The interlace bit of PV_V_CONTROL, for readers that decode it.
+pub const fn pv_interlaced(v_control: u32) -> bool {
+    v_control & PV_VCONTROL_INTERLACE != 0
+}
+
+/// The HDMI core's timing for a progressive mode, as Linux's vc4_hdmi sets
+/// it on the BCM2835: sync polarities, active width, porches and syncs.
+/// Field 1 equals field 0 for progressive modes.
+pub fn hdmi_timing(t: &Timing) -> Result<HdmiTiming, Error> {
+    if t.interlaced {
+        return Err(Error::Interlaced);
+    }
+    let horza = if t.vsync_positive { HDMI_HORZA_VPOS } else { 0 }
+        | if t.hsync_positive { HDMI_HORZA_HPOS } else { 0 }
+        | field("hactive", t.hactive, 13)?;
+    let horzb = field("hbp", t.hbp, 10)? << 20 | field("hsync", t.hsync, 10)? << 10 | field("hfp", t.hfp, 10)?;
+    let verta = field("vsync", t.vsync, 5)? << 20 | field("vfp", t.vfp, 7)? << 13 | field("vactive", t.vactive, 13)?;
+    let vertb = field("vbp", t.vbp, 9)?;
+    Ok(HdmiTiming { horza, horzb, verta0: verta, vertb0: vertb, verta1: verta, vertb1: vertb })
+}
+
+/// Registers that differ between two sets: (name, ours, theirs).
+pub fn differences(
+    ours: &[(usize, &'static str, u32)],
+    theirs: impl Fn(usize) -> u32,
+) -> Vec<(&'static str, u32, u32)> {
+    ours.iter()
+        .filter_map(|&(offset, name, value)| {
+            let other = theirs(offset);
+            (other != value).then_some((name, value, other))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 1080p60 as the test monitor's EDID gives it (Pi test row 387).
+    const P1080: Timing = Timing {
+        pixel_khz: 148_500, hactive: 1920, hfp: 88, hsync: 44, hbp: 148,
+        vactive: 1080, vfp: 4, vsync: 5, vbp: 36,
+        hsync_positive: true, vsync_positive: true, interlaced: false,
+    };
+
+    /// What Broadcom's firmware left in pixel valve 2 and the HDMI core at
+    /// 1080p60 (Pi test row 337).
+    fn firmware_pv2(offset: usize) -> u32 {
+        match offset {
+            0x00 => 0x0017_7005,
+            0x04 => 0x0000_0003,
+            0x0c => 0x0094_002c,
+            0x10 => 0x0058_0780,
+            0x14 => 0x0024_0005,
+            0x18 => 0x0004_0438,
+            _ => unreachable!(),
+        }
+    }
+
+    fn firmware_hdmi(offset: usize) -> u32 {
+        match offset {
+            0x0c4 => 0x0000_6780,
+            0x0c8 => 0x0940_b058,
+            0x0cc | 0x0d4 => 0x0050_8438,
+            0x0d0 | 0x0d8 => 0x0000_0024,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn pv2_matches_the_firmware_at_1080p() {
+        let pv = pv2(&P1080).unwrap();
+        assert_eq!(differences(&pv.regs(), firmware_pv2), vec![]);
+    }
+
+    #[test]
+    fn hdmi_matches_the_firmware_at_1080p() {
+        let h = hdmi_timing(&P1080).unwrap();
+        assert_eq!(differences(&h.regs(), firmware_hdmi), vec![]);
+    }
+
+    #[test]
+    fn the_monitors_own_edid_gives_the_firmwares_registers() {
+        // The EDID vc4d read from the test monitor (row 387), parsed.
+        let edid = vc4_edid::Edid::parse(&NANOKVM).unwrap();
+        let t = edid.preferred().unwrap();
+        assert_eq!(differences(&pv2(t).unwrap().regs(), firmware_pv2), vec![]);
+        assert_eq!(differences(&hdmi_timing(t).unwrap().regs(), firmware_hdmi), vec![]);
+    }
+
+    #[test]
+    fn p720_and_polarity() {
+        let t = Timing {
+            pixel_khz: 74_250, hactive: 1280, hfp: 110, hsync: 40, hbp: 220,
+            vactive: 720, vfp: 5, vsync: 5, vbp: 20,
+            hsync_positive: false, vsync_positive: true, interlaced: false,
+        };
+        let h = hdmi_timing(&t).unwrap();
+        assert_eq!(h.horza, HDMI_HORZA_VPOS | 1280);
+        assert_eq!(h.horzb, 220 << 20 | 40 << 10 | 110);
+        assert_eq!(h.verta0, 5 << 20 | 5 << 13 | 720);
+        assert_eq!(h.vertb0, 20);
+        let pv = pv2(&t).unwrap();
+        assert_eq!((pv.horza, pv.horzb, pv.verta, pv.vertb), (220 << 16 | 40, 110 << 16 | 1280, 20 << 16 | 5, 5 << 16 | 720));
+    }
+
+    #[test]
+    fn limits() {
+        let mut t = P1080;
+        t.interlaced = true;
+        assert_eq!(pv2(&t), Err(Error::Interlaced));
+        let mut t = P1080;
+        t.hfp = 1024;
+        assert_eq!(hdmi_timing(&t), Err(Error::TooWide("hfp", 1024)));
+        let mut t = P1080;
+        t.vfp = 128;
+        assert_eq!(hdmi_timing(&t), Err(Error::TooWide("vfp", 128)));
+        assert!(!pv_interlaced(pv2(&P1080).unwrap().v_control));
+    }
+
+    /// The test monitor's EDID (Pi test row 387), the same bytes as the
+    /// vc4-edid test.
+    const NANOKVM: [u8; 256] = include!("../../edid/tests/nanokvm.in");
+}
