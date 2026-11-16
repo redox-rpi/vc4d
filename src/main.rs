@@ -22,8 +22,9 @@
 // screen (check.rs) that runs before the handover and watches after it.
 // VC4D_EDID=off skips reading the monitor's EDID over DDC (ddc.rs), which
 // runs first, also without an HVS (QEMU with an i2c-ddc device).
-// VC4D_MODE=write lets vc4d program pixel valve 2 itself when its values
-// equal the firmware's (mode.rs, stage 3a); without it vc4d only compares.
+// VC4D_MODE=write lets vc4d program pixel valve 2 and the HDMI timing
+// itself when its values equal the firmware's (mode.rs, stages 3a and 3b);
+// without it vc4d only compares.
 
 use std::env;
 use std::thread;
@@ -111,8 +112,8 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         let same = mode::compare(fdt.as_ref(), edid);
         if env::var("VC4D_MODE").is_ok_and(|v| v == "write") {
             match same {
-                Some((pv, t)) => {
-                    mode::write_pv2(fdt.as_ref(), &pv, &t);
+                Some(same) => {
+                    mode::write_mode(fdt.as_ref(), &same);
                 }
                 None => println!("vc4d: mode: write: skipped, pixel valve 2 differs from the firmware's"),
             }
