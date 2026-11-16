@@ -152,11 +152,13 @@ pub fn hdmi_timing(t: &Timing) -> Result<HdmiTiming, Error> {
     Ok(HdmiTiming { horza, horzb, verta0: verta, vertb0: vertb, verta1: verta, vertb1: vertb })
 }
 
-/// One step of programming a pixel valve.
+/// One step of programming a pixel valve and the HDMI core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// Write the value to the register at this offset.
+    /// Write the value to the pixel valve register at this offset.
     Write(usize, &'static str, u32),
+    /// Write the value to the HDMI core register at this offset.
+    Hdmi(usize, &'static str, u32),
     /// Let this many frames pass (the valve finishes the frame it is in).
     WaitFrames(u32),
 }
@@ -168,6 +170,15 @@ pub enum Step {
 /// valve and the video on again. The HDMI encoder and the HVS keep
 /// running; the screen is blank for a few frames.
 pub fn pv_program(pv: &Pv) -> Vec<Step> {
+    mode_program(pv, None)
+}
+
+/// As `pv_program`, and with `hdmi` the HDMI core's timing too, written
+/// while the valve is off, before the valve's own timing: Linux sets the
+/// encoder's timing in vc4_hdmi_encoder_pre_crtc_configure() (through
+/// vc4_hdmi_set_timings()), which runs before vc4_crtc_config_pv(). The
+/// encoder itself stays on; only its timing registers are written.
+pub fn mode_program(pv: &Pv, hdmi: Option<&HdmiTiming>) -> Vec<Step> {
     let off = pv.control & !PV_CONTROL_EN;
     let mut steps = vec![
         Step::Write(PV_V_CONTROL, "V_CONTROL", pv.v_control & !PV_VCONTROL_VIDEN),
@@ -175,6 +186,9 @@ pub fn pv_program(pv: &Pv) -> Vec<Step> {
         Step::Write(PV_CONTROL, "CONTROL", off),
         Step::Write(PV_CONTROL, "CONTROL", off | PV_CONTROL_FIFO_CLR),
     ];
+    if let Some(hdmi) = hdmi {
+        steps.extend(hdmi.regs().iter().map(|&(offset, name, value)| Step::Hdmi(offset, name, value)));
+    }
     for (offset, name, value) in pv.regs() {
         if offset != PV_CONTROL && offset != PV_V_CONTROL {
             steps.push(Step::Write(offset, name, value));
@@ -305,10 +319,35 @@ mod tests {
                     regs.insert(offset, value & readback_mask(offset));
                     log.push(format!("{name} {value:#x}"));
                 }
+                Step::Hdmi(_, name, value) => log.push(format!("hdmi {name} {value:#x}")),
                 Step::WaitFrames(n) => log.push(format!("wait {n}")),
             }
         }
         log
+    }
+
+    #[test]
+    fn hdmi_timing_while_the_valve_is_off() {
+        let pv = pv2(&P1080).unwrap();
+        let hdmi = hdmi_timing(&P1080).unwrap();
+        let steps = mode_program(&pv, Some(&hdmi));
+        let fifo_clear = steps.iter().position(|s| *s == Step::Write(PV_CONTROL, "CONTROL", 0x0017_7006)).unwrap();
+        let pv_timing = steps.iter().position(|s| *s == Step::Write(0x0c, "HORZA", 0x0094_002c)).unwrap();
+        let hdmi_at: Vec<usize> =
+            steps.iter().enumerate().filter(|(_, s)| matches!(s, Step::Hdmi(..))).map(|(i, _)| i).collect();
+        assert_eq!(hdmi_at.len(), 6);
+        assert!(hdmi_at.iter().all(|&i| fifo_clear < i && i < pv_timing), "{steps:?}");
+        // The written values are the firmware's (Pi test 337 and 444).
+        for step in &steps {
+            if let Step::Hdmi(offset, name, value) = *step {
+                assert_eq!(value, firmware_hdmi(offset), "{name}");
+            }
+        }
+        // Without HDMI, the same as pv_program, and the pixel valve part
+        // is unchanged by it.
+        assert_eq!(mode_program(&pv, None), pv_program(&pv));
+        let pv_only: Vec<Step> = steps.into_iter().filter(|s| !matches!(s, Step::Hdmi(..))).collect();
+        assert_eq!(pv_only, pv_program(&pv));
     }
 
     #[test]

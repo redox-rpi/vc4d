@@ -103,9 +103,29 @@ Also in this stage, read only: the HDMI core's timing is compared with
 the firmware's. It is read only after `CM_HSMCTL` shows the HSM clock
 running, since reading the block without its clock can hang the bus.
 
-Without `VC4D_MODE=write`, vc4d only compares, as in stage 2c. Next:
-writing the HDMI core's timing, then PLLH and the PHY for a mode the
-firmware did not pick.
+Without `VC4D_MODE=write`, vc4d only compares, as in stage 2c.
+
+On the Pi (Pi test 444) every register read back as written. The HVS
+channel ran on, and the check passed.
+
+## Stage 3b: the HDMI core's timing too
+
+When the HDMI timing compares equal too (which needs the HSM clock
+running), `VC4D_MODE=write` also writes the HDMI core's six timing
+registers: `HORZA`, `HORZB`, `VERTA0/1` and `VERTB0/1`. They go in the
+same blank moment, after the valve is off and its FIFO emptied, and
+before the valve's own timing, as in Linux, where
+`vc4_hdmi_set_timings()` runs before `vc4_crtc_config_pv()`.
+
+Only the timing registers are written: the encoder, its scheduler, the
+PHY and the clocks stay as the firmware set them. vc4d reads the HDMI
+registers back with the valve's (`vc4d: mode: write: hdmi ...`, then
+`PASS: pixel valve 2 and the HDMI timing read back as written`).
+`vc4_mode::mode_program()` gives the steps, and a host test checks where
+the HDMI writes go and what they are.
+
+Next: PLLH and the HDMI PHY, so vc4d can set a mode the firmware did not
+pick.
 
 Environment (the bootloader's): `VC4D=off` leaves the display to `vesad` or
 `rpi-fbd`. `VC4D_FAKE=WIDTHxHEIGHT` runs against an HVS in normal memory, for
