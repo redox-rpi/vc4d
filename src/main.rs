@@ -24,7 +24,9 @@
 // runs first, also without an HVS (QEMU with an i2c-ddc device).
 // VC4D_MODE=write lets vc4d program pixel valve 2 and the HDMI timing
 // itself when its values equal the firmware's (mode.rs, stages 3a and 3b);
-// without it vc4d only compares.
+// without it vc4d only compares. VC4D_FLIP=off scans the client's buffer
+// out directly, as before (adapter.rs, Flip): without it the primary
+// plane is double buffered.
 
 use std::env;
 use std::thread;
@@ -155,6 +157,17 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     let watched = hvs.share();
     let shown = shot::Shown::default();
 
+    let flip = if env::var("VC4D_FLIP").is_ok_and(|v| v == "off") {
+        println!("vc4d: flip: off (VC4D_FLIP=off), clients' buffers scanned out directly");
+        None
+    } else {
+        let flip = adapter::Flip::new(channel.width, channel.height);
+        println!(
+            "vc4d: flip: {}",
+            if flip.is_some() { "two scanout buffers, damage copied" } else { "no contiguous memory for two buffers, off" }
+        );
+        flip
+    };
     let adapter = Vc4Adapter {
         firmware_list: hvs.list_start(channel.index),
         hvs,
@@ -167,6 +180,8 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         log_lists: fake.is_some() || env::var("VC4D_LOG").is_ok(),
         lists: 0,
         shown: shown.clone(),
+        flip,
+        fake: fake.is_some(),
     };
     let mut scheme = GraphicsScheme::new(adapter, "display.vc4".to_owned(), false);
 
