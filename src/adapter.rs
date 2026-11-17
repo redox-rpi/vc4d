@@ -13,6 +13,8 @@ use std::alloc::{self, Layout};
 use std::fmt;
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use common::dma::Dma;
 use driver_graphics::kms::connector::{modeinfo_for_size, KmsConnectorDriver, KmsConnectorStatus};
@@ -54,6 +56,80 @@ pub struct Vc4Adapter {
     pub lists: u32,
     /// The planes shown now, for screenshots (shot.rs).
     pub shown: shot::Shown,
+    /// Two scanout buffers for the primary plane (VC4D_FLIP, on unless
+    /// `off`); None: the client's buffer is scanned out directly.
+    pub flip: Option<Flip>,
+    /// An HVS in memory (VC4D_FAKE): no frames to wait for.
+    pub fake: bool,
+}
+
+/// A rectangle of the screen: x, y, width, height.
+type Rect = (u32, u32, u32, u32);
+
+fn union(a: Rect, b: Rect) -> Rect {
+    if a.2 == 0 || a.3 == 0 {
+        return b;
+    }
+    if b.2 == 0 || b.3 == 0 {
+        return a;
+    }
+    let (x, y) = (a.0.min(b.0), a.1.min(b.1));
+    let (right, bottom) = ((a.0 + a.2).max(b.0 + b.2), (a.1 + a.3).max(b.1 + b.3));
+    (x, y, right - x, bottom - y)
+}
+
+fn clip(r: Rect, width: u32, height: u32) -> Rect {
+    let x = r.0.min(width);
+    let y = r.1.min(height);
+    (x, y, r.2.min(width - x), r.3.min(height - y))
+}
+
+/// Double buffering for the primary plane. Clients (fbcond, Orbital) draw
+/// into their own buffer in normal, cached memory and tell vc4d what
+/// changed (dirty framebuffer). vc4d copies that part into the scanout
+/// buffer the HVS is not reading, then points the display list at it; the
+/// HVS takes the new list at the next frame. So the HVS never scans out a
+/// half-copied picture (tearing), and nobody reads uncached memory.
+///
+/// Like the page flip of Linux's vc4 (vc4_crtc_page_flip()), but inside
+/// the driver, because Redox's driver-graphics has no page flip ioctl and
+/// Orbital copies into one buffer.
+#[derive(Debug)]
+pub struct Flip {
+    bufs: [Arc<Vc4Buffer>; 2],
+    /// The buffer in the display list now.
+    front: usize,
+    /// Which client buffer each scanout buffer last copied from (its
+    /// address); a different one needs a full copy.
+    synced: [usize; 2],
+    /// What changed in the client's last frame: the buffer behind the
+    /// front one lacks it.
+    last: Rect,
+    /// The frame count when the display list last changed.
+    flip_frame: u32,
+    /// Copies done and bytes copied, for the log.
+    pub copies: u64,
+    pub bytes: u64,
+}
+
+impl Flip {
+    /// Two buffers of the screen's size in contiguous memory, or None.
+    pub fn new(width: u32, height: u32) -> Option<Flip> {
+        let a = Vc4Buffer::new(width as usize, height as usize);
+        let b = Vc4Buffer::new(width as usize, height as usize);
+        if a.dma.is_none() || b.dma.is_none() {
+            return None;
+        }
+        Some(Flip {
+            bufs: [Arc::new(a), Arc::new(b)],
+            front: 0,
+            synced: [0, 0],
+            last: (0, 0, 0, 0),
+            flip_frame: 0,
+            copies: 0,
+            bytes: 0,
+        })
+    }
 }
 
 /// The first display lists always go to the log.
@@ -107,6 +183,61 @@ impl Vc4Adapter {
         if self.log_lists || self.lists <= LOGGED_LISTS {
             println!("vc4d: list {} at {start}: {planes:?} {list:08x?}", self.lists);
         }
+    }
+
+    /// Copies the client's frame into the scanout buffer behind the shown
+    /// one and returns that buffer as the primary plane.
+    fn flip_primary(&mut self, fb: &KmsFramebuffer<Self>, damage: Option<Damage>) -> Option<Shown> {
+        let (screen_w, screen_h) = (self.channel.width, self.channel.height);
+        let index = self.channel.index;
+        // The buffer behind the front one may still be scanned out until
+        // the HVS took the last list (the next frame start).
+        if !self.fake {
+            let started = Instant::now();
+            let flip_frame = self.flip.as_ref()?.flip_frame;
+            while self.hvs.frame_count(index) == flip_frame && started.elapsed() < Duration::from_millis(40) {
+                thread::sleep(Duration::from_micros(500));
+            }
+        }
+        let flip = self.flip.as_mut()?;
+        let back = 1 - flip.front;
+        let (width, height) = (fb.width.min(screen_w), fb.height.min(screen_h));
+        let full = (0, 0, width, height);
+        let changed = damage.map_or(full, |d| clip((d.x, d.y, d.width, d.height), width, height));
+        let src = fb.buffer.ptr.as_ptr().cast::<u8>();
+        let region = if flip.synced[back] != src as usize { full } else { union(changed, flip.last) };
+        let dst_buf = flip.bufs[back].clone();
+        let dst = dst_buf.ptr.as_ptr().cast::<u8>();
+        let dst_pitch = screen_w as usize * 4;
+        let (x, y, w, h) = clip(region, width, height);
+        for row in y..y + h {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    src.add(row as usize * fb.pitch as usize + x as usize * 4),
+                    dst.add(row as usize * dst_pitch + x as usize * 4),
+                    w as usize * 4,
+                );
+            }
+        }
+        flip.synced[back] = src as usize;
+        flip.last = changed;
+        flip.front = back;
+        flip.copies += 1;
+        flip.bytes += u64::from(w) * u64::from(h) * 4;
+        let mem = dst_buf.dma.as_ref()?;
+        Some(Shown {
+            plane: Plane {
+                bus: (mem.physical() + self.ram_bus_offset) as u32,
+                pitch: dst_pitch as u32,
+                x: 0,
+                y: 0,
+                width,
+                height,
+                alpha: false,
+            },
+            pixels: dst,
+            _buffer: dst_buf,
+        })
     }
 
     /// The part of the framebuffer that is on screen, with the top left
@@ -198,7 +329,8 @@ impl GraphicsAdapter for Vc4Adapter {
     fn dumb_buffer_config(&self) -> Option<DumbBufferConfig> {
         Some(DumbBufferConfig {
             preferred_depth: 24,
-            prefer_shadow: true,
+            // With flip the clients' buffers are normal memory.
+            prefer_shadow: self.flip.is_none(),
         })
     }
 
@@ -220,6 +352,11 @@ impl GraphicsAdapter for Vc4Adapter {
     }
 
     fn create_dumb_buffer(&mut self, width: u32, height: u32) -> (Self::Buffer, u32) {
+        // With flip only the cursor is scanned out from a client's buffer;
+        // the others are copied from, so they live in cached memory.
+        if self.flip.is_some() && (width > CURSOR_SIZE || height > CURSOR_SIZE) {
+            return (Vc4Buffer::normal(width as usize, height as usize), width * 4);
+        }
         (Vc4Buffer::new(width as usize, height as usize), width * 4)
     }
 
@@ -245,14 +382,16 @@ impl GraphicsAdapter for Vc4Adapter {
         Ok(())
     }
 
-    /// Damage needs nothing: the HVS shows the buffer itself. A new buffer,
-    /// a moved cursor or a plane turned off gives a new display list.
+    /// Without flip, damage needs nothing: the HVS shows the buffer
+    /// itself. With flip, damage on the primary plane is copied and shown
+    /// (flip_primary). A new buffer, a moved cursor or a plane turned off
+    /// gives a new display list.
     fn set_plane(
         &mut self,
         _objects: &KmsObjects<Self>,
         plane: &KmsPlane<Self>,
         new_plane_state: KmsPlaneState<Self>,
-        _damage: Option<Damage>,
+        damage: Option<Damage>,
     ) -> syscall::Result<()> {
         let cursor = plane.driver_data.cursor;
         let shown = match (&new_plane_state.fb, new_plane_state.crtc_id) {
@@ -263,6 +402,7 @@ impl GraphicsAdapter for Vc4Adapter {
                 let rect = &new_plane_state.crtc_rect;
                 self.place(fb, rect.x - hot_x, rect.y - hot_y, true)
             }
+            (Some(fb), Some(_)) if self.flip.is_some() => self.flip_primary(fb, damage),
             (Some(fb), Some(_)) => self.place(fb, 0, 0, false),
             _ => None,
         };
@@ -271,6 +411,12 @@ impl GraphicsAdapter for Vc4Adapter {
         *old = shown;
         if changed {
             self.update();
+            if let Some(flip) = &mut self.flip {
+                flip.flip_frame = self.hvs.frame_count(self.channel.index);
+                if self.log_lists && flip.copies % 600 == 1 {
+                    println!("vc4d: flip: {} copies, {} MB", flip.copies, flip.bytes >> 20);
+                }
+            }
         }
         *plane.state.lock().unwrap() = new_plane_state;
         Ok(())
@@ -303,8 +449,7 @@ impl fmt::Debug for Vc4Buffer {
 
 impl Vc4Buffer {
     fn new(width: usize, height: usize) -> Vc4Buffer {
-        let len = width * height;
-        match Dma::<[u32]>::zeroed_slice(len) {
+        match Dma::<[u32]>::zeroed_slice(width * height) {
             Ok(dma) => {
                 let mut dma = unsafe { dma.assume_init() };
                 let ptr = NonNull::from(&mut *dma);
@@ -312,13 +457,19 @@ impl Vc4Buffer {
             }
             Err(err) => {
                 println!("vc4d: dumb buffer {width}x{height} in normal memory: {err}");
-                let layout = Self::layout(len);
-                let ptr = unsafe { alloc::alloc_zeroed(layout) };
-                let ptr = ptr::slice_from_raw_parts_mut(ptr.cast(), len);
-                let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
-                Vc4Buffer { width, height, ptr, dma: None }
+                Self::normal(width, height)
             }
         }
+    }
+
+    /// A buffer in normal (cached) memory, which the HVS cannot show.
+    fn normal(width: usize, height: usize) -> Vc4Buffer {
+        let len = width * height;
+        let layout = Self::layout(len);
+        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        let ptr = ptr::slice_from_raw_parts_mut(ptr.cast(), len);
+        let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        Vc4Buffer { width, height, ptr, dma: None }
     }
 
     fn layout(len: usize) -> Layout {
