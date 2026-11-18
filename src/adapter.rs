@@ -13,8 +13,6 @@ use std::alloc::{self, Layout};
 use std::fmt;
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use common::dma::Dma;
 use driver_graphics::kms::connector::{modeinfo_for_size, KmsConnectorDriver, KmsConnectorStatus};
@@ -84,6 +82,16 @@ fn clip(r: Rect, width: u32, height: u32) -> Rect {
     (x, y, r.2.min(width - x), r.3.min(height - y))
 }
 
+/// A client frame waiting to be copied: its buffer and what changed.
+#[derive(Debug)]
+struct Pending {
+    src: Arc<Vc4Buffer>,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    changed: Rect,
+}
+
 /// Double buffering for the primary plane. Clients (fbcond, Orbital) draw
 /// into their own buffer in normal, cached memory and tell vc4d what
 /// changed (dirty framebuffer). vc4d copies that part into the scanout
@@ -107,6 +115,11 @@ pub struct Flip {
     last: Rect,
     /// The frame count when the display list last changed.
     flip_frame: u32,
+    /// Damage that came while the HVS still showed the list before: it is
+    /// copied once the HVS took that list (flush), together with any newer
+    /// damage. So a client never waits, and a burst of damage (console
+    /// scrolling) becomes one copy per frame.
+    pending: Option<Pending>,
     /// Copies done and bytes copied, for the log.
     pub copies: u64,
     pub bytes: u64,
@@ -126,6 +139,7 @@ impl Flip {
             synced: [0, 0],
             last: (0, 0, 0, 0),
             flip_frame: 0,
+            pending: None,
             copies: 0,
             bytes: 0,
         })
@@ -137,7 +151,7 @@ const LOGGED_LISTS: u32 = 4;
 
 /// A plane in the current display list, with its buffer, which must live
 /// as long as the HVS reads it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Shown {
     plane: Plane,
     /// The first visible pixel in our memory.
@@ -185,42 +199,55 @@ impl Vc4Adapter {
         }
     }
 
-    /// Copies the client's frame into the scanout buffer behind the shown
-    /// one and returns that buffer as the primary plane.
+    /// Takes the client's frame for the primary plane. If the HVS already
+    /// took the last display list, the frame is copied into the scanout
+    /// buffer behind the shown one, which is returned as the new primary
+    /// plane. Otherwise the frame waits in `pending` (flush copies it) and
+    /// the shown plane stays.
     fn flip_primary(&mut self, fb: &KmsFramebuffer<Self>, damage: Option<Damage>) -> Option<Shown> {
         let (screen_w, screen_h) = (self.channel.width, self.channel.height);
-        let index = self.channel.index;
-        // The buffer behind the front one may still be scanned out until
-        // the HVS took the last list (the next frame start).
-        if !self.fake {
-            let started = Instant::now();
-            let flip_frame = self.flip.as_ref()?.flip_frame;
-            while self.hvs.frame_count(index) == flip_frame && started.elapsed() < Duration::from_millis(40) {
-                thread::sleep(Duration::from_micros(500));
-            }
-        }
-        let flip = self.flip.as_mut()?;
-        let back = 1 - flip.front;
         let (width, height) = (fb.width.min(screen_w), fb.height.min(screen_h));
         let full = (0, 0, width, height);
         let changed = damage.map_or(full, |d| clip((d.x, d.y, d.width, d.height), width, height));
-        let src = fb.buffer.ptr.as_ptr().cast::<u8>();
-        let region = if flip.synced[back] != src as usize { full } else { union(changed, flip.last) };
+        let flip = self.flip.as_mut()?;
+        let changed = match &flip.pending {
+            Some(p) if Arc::ptr_eq(&p.src, &fb.buffer) => union(p.changed, changed),
+            Some(_) => full,
+            None => changed,
+        };
+        flip.pending = Some(Pending { src: fb.buffer.clone(), pitch: fb.pitch, width, height, changed });
+        let flip_frame = flip.flip_frame;
+        if !self.fake && self.primary.is_some() && self.hvs.frame_count(self.channel.index) == flip_frame {
+            return self.primary.clone();
+        }
+        self.copy_pending()
+    }
+
+    /// Copies the pending frame into the scanout buffer behind the shown
+    /// one and returns that buffer as the primary plane.
+    fn copy_pending(&mut self) -> Option<Shown> {
+        let screen_w = self.channel.width;
+        let flip = self.flip.as_mut()?;
+        let p = flip.pending.take()?;
+        let back = 1 - flip.front;
+        let full = (0, 0, p.width, p.height);
+        let src = p.src.ptr.as_ptr().cast::<u8>();
+        let region = if flip.synced[back] != src as usize { full } else { union(p.changed, flip.last) };
         let dst_buf = flip.bufs[back].clone();
         let dst = dst_buf.ptr.as_ptr().cast::<u8>();
         let dst_pitch = screen_w as usize * 4;
-        let (x, y, w, h) = clip(region, width, height);
+        let (x, y, w, h) = clip(region, p.width, p.height);
         for row in y..y + h {
             unsafe {
                 ptr::copy_nonoverlapping(
-                    src.add(row as usize * fb.pitch as usize + x as usize * 4),
+                    src.add(row as usize * p.pitch as usize + x as usize * 4),
                     dst.add(row as usize * dst_pitch + x as usize * 4),
                     w as usize * 4,
                 );
             }
         }
         flip.synced[back] = src as usize;
-        flip.last = changed;
+        flip.last = p.changed;
         flip.front = back;
         flip.copies += 1;
         flip.bytes += u64::from(w) * u64::from(h) * 4;
@@ -231,13 +258,43 @@ impl Vc4Adapter {
                 pitch: dst_pitch as u32,
                 x: 0,
                 y: 0,
-                width,
-                height,
+                width: p.width,
+                height: p.height,
                 alpha: false,
             },
             pixels: dst,
             _buffer: dst_buf,
         })
+    }
+
+    /// Whether a frame waits for the HVS to take the last list.
+    pub fn flip_pending(&self) -> bool {
+        self.flip.as_ref().is_some_and(|f| f.pending.is_some())
+    }
+
+    /// Copies and shows a waiting frame once the HVS took the last list;
+    /// called from the event loop's timer while flip_pending().
+    pub fn flush(&mut self) {
+        let Some(flip) = &self.flip else { return };
+        if flip.pending.is_none() || self.hvs.frame_count(self.channel.index) == flip.flip_frame {
+            return;
+        }
+        if let Some(shown) = self.copy_pending() {
+            self.primary = Some(shown);
+            self.flipped();
+        }
+    }
+
+    /// After a new primary plane: the new display list, and the frame it
+    /// was written in.
+    fn flipped(&mut self) {
+        self.update();
+        if let Some(flip) = &mut self.flip {
+            flip.flip_frame = self.hvs.frame_count(self.channel.index);
+            if self.log_lists && flip.copies % 600 == 1 {
+                println!("vc4d: flip: {} copies, {} MB", flip.copies, flip.bytes >> 20);
+            }
+        }
     }
 
     /// The part of the framebuffer that is on screen, with the top left
@@ -410,13 +467,7 @@ impl GraphicsAdapter for Vc4Adapter {
         let changed = old.as_ref().map(|s| s.plane) != shown.as_ref().map(|s| s.plane);
         *old = shown;
         if changed {
-            self.update();
-            if let Some(flip) = &mut self.flip {
-                flip.flip_frame = self.hvs.frame_count(self.channel.index);
-                if self.log_lists && flip.copies % 600 == 1 {
-                    println!("vc4d: flip: {} copies, {} MB", flip.copies, flip.bytes >> 20);
-                }
-            }
+            self.flipped();
         }
         *plane.state.lock().unwrap() = new_plane_state;
         Ok(())
