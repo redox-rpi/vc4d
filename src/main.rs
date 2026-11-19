@@ -30,6 +30,8 @@
 
 use std::env;
 use std::thread;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
 use driver_graphics::GraphicsScheme;
@@ -49,6 +51,22 @@ mod shot;
 /// Bus address minus physical address of RAM when the devicetree has no
 /// dma-ranges: the BCM283x's uncached alias.
 const RAM_BUS_OFFSET: usize = 0xc000_0000;
+
+/// How often a frame waiting for the HVS is looked at (a quarter frame).
+const FLUSH_TICK: Duration = Duration::from_millis(4);
+
+/// Arms the timer `after` from now; false if the clock cannot be read.
+fn arm(time: &mut std::fs::File, after: Duration) -> bool {
+    use std::io::{Read, Write};
+    let mut now = syscall::TimeSpec::default();
+    if time.read(&mut now).is_err() {
+        return false;
+    }
+    let nanos = now.tv_nsec as i64 + after.as_nanos() as i64;
+    now.tv_sec += nanos / 1_000_000_000;
+    now.tv_nsec = (nanos % 1_000_000_000) as i32;
+    time.write(&now).is_ok()
+}
 
 fn main() {
     common::init();
@@ -157,8 +175,10 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     let watched = hvs.share();
     let shown = shot::Shown::default();
 
-    let flip = if env::var("VC4D_FLIP").is_ok_and(|v| v == "off") {
-        println!("vc4d: flip: off (VC4D_FLIP=off), clients' buffers scanned out directly");
+    let flip_off = env::var("VC4D_FLIP").is_ok_and(|v| v == "off")
+        || std::path::Path::new("/etc/vc4d-flip-off").exists();
+    let flip = if flip_off {
+        println!("vc4d: flip: off (VC4D_FLIP=off or /etc/vc4d-flip-off), clients' buffers scanned out directly");
         None
     } else {
         let flip = adapter::Flip::new(channel.width, channel.height);
@@ -188,6 +208,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     user_data! {
         enum Source {
             Scheme,
+            Time,
         }
     }
     let event_queue: EventQueue<Source> =
@@ -195,6 +216,17 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     event_queue
         .subscribe(scheme.event_handle().raw(), Source::Scheme, event::EventFlags::READ)
         .unwrap();
+    // A frame that waits for the HVS (flip) is shown from this timer.
+    let mut time = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(syscall::O_NONBLOCK as i32)
+        .open(format!("/scheme/time/{}", syscall::CLOCK_MONOTONIC))
+        .expect("vc4d: failed to open /scheme/time");
+    event_queue
+        .subscribe(time.as_raw_fd() as usize, Source::Time, event::EventFlags::READ)
+        .unwrap();
+    let mut armed = false;
 
     daemon.ready();
     check::watch(watched, channel, fake.is_some(), checking, shown);
@@ -207,6 +239,13 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     })) {
         match event {
             Source::Scheme => scheme.tick().expect("vc4d: failed to handle scheme events"),
+            Source::Time => {
+                armed = false;
+                scheme.adapter_mut().flush();
+            }
+        }
+        if !armed && scheme.adapter_mut().flip_pending() {
+            armed = arm(&mut time, FLUSH_TICK);
         }
     }
 
