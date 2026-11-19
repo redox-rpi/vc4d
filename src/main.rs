@@ -47,6 +47,7 @@ mod ddc;
 mod mode;
 use vc4_hvs as hvs;
 mod shot;
+mod trace;
 
 /// Bus address minus physical address of RAM when the devicetree has no
 /// dma-ranges: the BCM283x's uncached alias.
@@ -173,6 +174,9 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         println!("vc4d: check: {}", if passed { "PASSED" } else { "FAILED" });
     }
     let watched = hvs.share();
+    if let Some(path) = trace::path() {
+        trace::start(&path, hvs.share(), hvs.share(), channel.index);
+    }
     let shown = shot::Shown::default();
 
     let flip_off = env::var("VC4D_FLIP").is_ok_and(|v| v == "off")
