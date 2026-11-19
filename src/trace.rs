@@ -37,7 +37,8 @@ const FLUSH: Duration = Duration::from_millis(500);
 struct Trace {
     out: Mutex<BufWriter<File>>,
     start: Instant,
-    hvs: Hvs,
+    /// Hvs is Send but not Sync (a raw register pointer).
+    hvs: Mutex<Hvs>,
     index: usize,
 }
 
@@ -64,7 +65,7 @@ pub fn start(path: &str, hvs: Hvs, sampler_hvs: Hvs, index: usize) {
     };
     let mut out = BufWriter::with_capacity(1 << 16, file);
     let _ = writeln!(out, "t_us,event,frame,line,stat,dispstat,x,y,w,h,us");
-    let trace = Trace { out: Mutex::new(out), start: Instant::now(), hvs, index };
+    let trace = Trace { out: Mutex::new(out), start: Instant::now(), hvs: Mutex::new(hvs), index };
     if TRACE.set(trace).is_err() {
         return;
     }
@@ -75,8 +76,10 @@ pub fn start(path: &str, hvs: Hvs, sampler_hvs: Hvs, index: usize) {
 /// Writes one event line; does nothing when tracing is off.
 pub fn event(event: &str, rect: (u32, u32, u32, u32), us: u64) {
     let Some(t) = TRACE.get() else { return };
-    let stat = t.hvs.channel_stat(t.index);
-    let dispstat = t.hvs.dispstat();
+    let (stat, dispstat) = {
+        let hvs = t.hvs.lock().unwrap();
+        (hvs.channel_stat(t.index), hvs.dispstat())
+    };
     line(t, event, stat, dispstat, rect, us);
 }
 
