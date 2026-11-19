@@ -192,6 +192,7 @@ impl Vc4Adapter {
         let start = LIST_SLOTS[self.next_slot];
         self.hvs.write_dlist(start, &list);
         self.hvs.set_list_start(index, start);
+        crate::trace::event("list", (start as u32, list.len() as u32, 0, 0), 0);
         self.next_slot = 1 - self.next_slot;
         self.lists += 1;
         if self.log_lists || self.lists <= LOGGED_LISTS {
@@ -218,6 +219,7 @@ impl Vc4Adapter {
         flip.pending = Some(Pending { src: fb.buffer.clone(), pitch: fb.pitch, width, height, changed });
         let flip_frame = flip.flip_frame;
         if !self.fake && self.primary.is_some() && self.hvs.frame_count(self.channel.index) == flip_frame {
+            crate::trace::event("defer", changed, 0);
             return self.primary.clone();
         }
         self.copy_pending()
@@ -237,6 +239,7 @@ impl Vc4Adapter {
         let dst = dst_buf.ptr.as_ptr().cast::<u8>();
         let dst_pitch = screen_w as usize * 4;
         let (x, y, w, h) = clip(region, p.width, p.height);
+        let copy_start = std::time::Instant::now();
         for row in y..y + h {
             unsafe {
                 ptr::copy_nonoverlapping(
@@ -246,6 +249,7 @@ impl Vc4Adapter {
                 );
             }
         }
+        crate::trace::event("copy", (x, y, w, h), copy_start.elapsed().as_micros() as u64);
         flip.synced[back] = src as usize;
         flip.last = p.changed;
         flip.front = back;
@@ -451,6 +455,14 @@ impl GraphicsAdapter for Vc4Adapter {
         damage: Option<Damage>,
     ) -> syscall::Result<()> {
         let cursor = plane.driver_data.cursor;
+        if cursor {
+            let rect = &new_plane_state.crtc_rect;
+            crate::trace::event("cursor", (rect.x.max(0) as u32, rect.y.max(0) as u32, 0, 0), 0);
+        } else if let Some(d) = damage {
+            crate::trace::event("damage", (d.x, d.y, d.width, d.height), 0);
+        } else {
+            crate::trace::event("damage", (0, 0, 0, 0), 0);
+        }
         let shown = match (&new_plane_state.fb, new_plane_state.crtc_id) {
             (Some(fb), Some(_)) if cursor => {
                 // Orbital gives the pointer's position; the image's top

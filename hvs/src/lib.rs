@@ -367,6 +367,17 @@ impl Hvs {
         self.set_reg(SCALER_DISPSTAT, scaler_dispstat_errors(index) | SCALER_DISPSTAT_DMA_ERROR);
     }
 
+    /// SCALER_DISPSTATX of the channel, raw: mode (31:30), FIFO full and
+    /// empty (29, 28), frame count (17:12), line (11:0).
+    pub fn channel_stat(&self, index: usize) -> u32 {
+        self.reg(scaler_dispstatx(index))
+    }
+
+    /// SCALER_DISPSTAT, raw: the error bits of all channels.
+    pub fn dispstat(&self) -> u32 {
+        self.reg(SCALER_DISPSTAT)
+    }
+
     pub fn frame_count(&self, index: usize) -> u32 {
         SCALER_DISPSTATX_FRAME_COUNT.get(self.reg(scaler_dispstatx(index)))
     }
