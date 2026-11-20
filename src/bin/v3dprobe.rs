@@ -16,7 +16,9 @@
 // - drivers/gpu/drm/v3d/v3d_regs.h, v3d_drv.c: V3D_HUB_IDENT0..3,
 //   V3D_CTL_IDENT0..2 and what v3d_platform_drm_probe() logs.
 //
-// v3dprobe [--csd] [--off] [--no-watchdog]
+// v3dprobe [--csd] [--render] [--off] [--no-watchdog]
+//   --render: step 2 (redox-rpi#596): bin and render control lists, see
+//     v3d/render.rs
 //   --csd: step 1 (redox-rpi#595): MMU page table and one compute job, see
 //     v3d/csd.rs
 //   --off: close the bridges, assert the reset and power V3D off afterwards
@@ -38,6 +40,8 @@ use fdt::Fdt;
 
 #[path = "v3d/csd.rs"]
 mod csd;
+#[path = "v3d/render.rs"]
+mod render;
 
 // The Pi 400's devicetree (bcm2711-rpi-400.dtb): /v3dbus/v3d@7ec04000 with
 // reg-names hub and core0, and /v3dbus ranges 0x7c500000 -> 0xfc500000. The
@@ -114,6 +118,7 @@ fn main() {
     let off = env::args().any(|a| a == "--off");
     let watchdog = !env::args().any(|a| a == "--no-watchdog");
     let run_csd = env::args().any(|a| a == "--csd");
+    let run_render = env::args().any(|a| a == "--render");
 
     let dtb = fs::read("/scheme/kernel.dtb").unwrap_or_default();
     let fdt = Fdt::new(&dtb).ok();
@@ -239,7 +244,7 @@ fn main() {
             say(&format!("watchdog stopped (PM_RSTC {:#x})", pm.read(PM_RSTC)));
         }
     };
-    if !run_csd {
+    if !run_csd && !run_render {
         stop_watchdog();
     }
 
@@ -265,11 +270,14 @@ fn main() {
     // low bytes is logged for comparison.
     let mut ok = ver >= 41 && ncores >= 1;
     say(&format!("{}: V3D {ver} on the BCM2711", if ok { "PASS" } else { "FAIL" }));
-    if run_csd {
-        // The watchdog stays armed through the job: a GPU job that hangs
+    if run_csd || run_render {
+        // The watchdog stays armed through the jobs: a GPU job that hangs
         // the bus resets the SoC.
-        if ok {
+        if ok && run_csd {
             ok = csd::run(&hub, &core);
+        }
+        if ok && run_render {
+            ok = render::run(&hub, &core);
         }
         stop_watchdog();
     }

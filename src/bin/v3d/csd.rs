@@ -98,7 +98,7 @@ const SHADER: [u64; 17] = [
     0x3c003186bb800000, // nop
 ];
 
-fn wait(what: &str, ms: u64, mut done: impl FnMut() -> bool) -> bool {
+pub(crate) fn wait(what: &str, ms: u64, mut done: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while !done() {
         if start.elapsed() > Duration::from_millis(ms) {
@@ -111,7 +111,7 @@ fn wait(what: &str, ms: u64, mut done: impl FnMut() -> bool) -> bool {
 }
 
 /// v3d_mmu_flush_all()
-fn mmu_flush(hub: &Regs) -> bool {
+pub(crate) fn mmu_flush(hub: &Regs) -> bool {
     wait("TLB clear idle before", 100, || hub.read(V3D_MMU_CTL) & V3D_MMU_CTL_TLB_CLEARING == 0);
     hub.write(V3D_MMU_CTL, hub.read(V3D_MMU_CTL) | V3D_MMU_CTL_TLB_CLEAR);
     hub.write(V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_FLUSH | V3D_MMUC_CONTROL_ENABLE);
@@ -119,7 +119,7 @@ fn mmu_flush(hub: &Regs) -> bool {
         && wait("MMUC flush", 100, || hub.read(V3D_MMUC_CONTROL) & V3D_MMUC_CONTROL_FLUSHING == 0)
 }
 
-fn state(hub: &Regs, core: &Regs) {
+pub(crate) fn state(hub: &Regs, core: &Regs) {
     // v3d_irq.c: the faulting address is MMU_VIO_ADDR << (va_width - 32).
     let va_width = 30 + ((hub.read(V3D_MMU_DEBUG_INFO) >> 4) & 0xf);
     let vio = (hub.read(V3D_MMU_VIO_ADDR) as u64) << va_width.saturating_sub(32);
