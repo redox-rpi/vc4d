@@ -133,7 +133,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     if let (Some(edid), None) = (&edid, fake) {
         let same = mode::compare(fdt.as_ref(), edid);
         if env::var("VC4D_MODE").is_ok_and(|v| v == "write") {
-            match same {
+            match &same {
                 Some(same) => {
                     mode::write_mode(fdt.as_ref(), &same);
                 }
