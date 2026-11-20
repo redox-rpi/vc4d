@@ -256,7 +256,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     let mut armed = false;
 
     daemon.ready();
-    check::watch(watched, channel, fake.is_some(), checking, shown);
+    check::watch(watched, channel, screen, fake.is_some(), checking, shown);
 
     let all = [Source::Scheme];
     for event in all.into_iter().chain(event_queue.filter_map(|e| match e {
