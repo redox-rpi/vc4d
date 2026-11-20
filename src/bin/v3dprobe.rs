@@ -131,9 +131,12 @@ fn main() {
     }
     asb.show(ASB_V3D_M_CTRL, "ASB_V3D_M_CTRL");
     asb.show(ASB_V3D_S_CTRL, "ASB_V3D_S_CTRL");
-    // Test 547: the firmware leaves GRAFX off. Linux's bcm2711-rpi.dtsi
-    // gives v3d the firmware's domain (raspberrypi-power,
-    // RPI_POWER_DOMAIN_V3D): SET_DOMAIN_STATE through rpi-firmwared.
+    // Test 547: GRAFX shows no power. Test 550: the firmware's V3D domain
+    // (raspberrypi-power, RPI_POWER_DOMAIN_V3D) switches on, but PM_GRAFX
+    // stays 0x1000. Mainline Linux does not look at PM_GRAFX on the BCM2711
+    // either: bcm2835_power_power_on() returns early there, and
+    // bcm2835_asb_power_on() only releases the reset and opens the
+    // bridges. So: firmware domain on, then the same as Linux.
     let mut powered = false;
     let mut grafx = grafx;
     if grafx & PM_POWOK == 0 {
@@ -143,26 +146,13 @@ fn main() {
             fail(&format!("{V3D_POWER}: {err} (rpi-firmwared without v3d_power?)"));
         }
         powered = true;
-        let start = Instant::now();
-        loop {
-            grafx = pm.show(PM_GRAFX, "PM_GRAFX");
-            if grafx & PM_POWOK != 0 {
-                break;
-            }
-            if start.elapsed() > Duration::from_millis(100) {
-                let _ = fs::write(V3D_POWER, "off");
-                fail("GRAFX still has no power after v3d_power on: V3D power off again");
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        thread::sleep(Duration::from_millis(5));
+        grafx = pm.show(PM_GRAFX, "PM_GRAFX");
         say(&format!(
-            "after v3d_power on ({} ms): v3d_power {}, power ok true, V3D reset {}",
-            start.elapsed().as_millis(),
+            "after v3d_power on: v3d_power {}, PM_GRAFX power ok {} (not checked on the BCM2711, as in Linux)",
             read_v3d_power(),
-            if grafx & PM_V3DRSTN != 0 { "released" } else { "asserted" }
+            grafx & PM_POWOK != 0
         ));
-        asb.show(ASB_V3D_M_CTRL, "ASB_V3D_M_CTRL");
-        asb.show(ASB_V3D_S_CTRL, "ASB_V3D_S_CTRL");
     }
 
     // bcm2835_asb_power_on(): reset released, then the bridges, master first.
@@ -170,6 +160,7 @@ fn main() {
         say("releasing the V3D reset (PM_GRAFX |= V3DRSTN)");
         pm.write(PM_GRAFX, PM_PASSWORD | grafx | PM_V3DRSTN);
         thread::sleep(Duration::from_millis(1));
+        pm.show(PM_GRAFX, "PM_GRAFX");
     }
     for (reg, name) in [(ASB_V3D_M_CTRL, "master"), (ASB_V3D_S_CTRL, "slave")] {
         let v = asb.read(reg);
@@ -178,10 +169,20 @@ fn main() {
         let start = Instant::now();
         while asb.read(reg) & ASB_ACK != 0 {
             if start.elapsed() > Duration::from_millis(10) {
-                fail(&format!("ASB {name} bridge: no ack within 10 ms ({:#x})", asb.read(reg)));
+                let now = asb.read(reg);
+                // Undo, as Linux's error path: bridges closed, reset
+                // asserted, domain off. V3D itself is not read.
+                for r in [ASB_V3D_S_CTRL, ASB_V3D_M_CTRL] {
+                    asb.write(r, PM_PASSWORD | asb.read(r) | ASB_REQ_STOP);
+                }
+                pm.write(PM_GRAFX, PM_PASSWORD | (pm.read(PM_GRAFX) & !PM_V3DRSTN));
+                if powered {
+                    let _ = fs::write(V3D_POWER, "off");
+                }
+                fail(&format!("ASB {name} bridge: no ack within 10 ms ({now:#x}): bridges closed, reset asserted, V3D power off; V3D not read"));
             }
         }
-        say(&format!("  ASB {name}: {:#x}", asb.read(reg)));
+        say(&format!("  ASB {name}: {:#x} after {} us", asb.read(reg), start.elapsed().as_micros()));
     }
 
     let hub = Regs::map(HUB_PHYS, 0x4000, "hub");
