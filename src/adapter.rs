@@ -522,7 +522,15 @@ impl GraphicsAdapter for Vc4Adapter {
             }
             (Some(fb), Some(_)) if overlay.is_some() => {
                 let rect = &new_plane_state.crtc_rect;
-                match self.place(fb, rect.x, rect.y, true) {
+                let shown = self.place(fb, rect.x, rect.y, true);
+                if self.log_lists {
+                    println!(
+                        "vc4d: overlay {}: at {},{} fb {}x{} dma {} -> {}",
+                        overlay.unwrap_or(0), rect.x, rect.y, fb.width, fb.height,
+                        fb.buffer.dma.is_some(), if shown.is_some() { "shown" } else { "refused" }
+                    );
+                }
+                match shown {
                     Some(shown) => Some(shown),
                     // Not in contiguous memory (or off screen): the client
                     // has to draw the window itself.
