@@ -8,8 +8,11 @@
 // - drivers/pmdomain/bcm/bcm2835-power.c: bcm2835_asb_power_on() for
 //   BCM2835_POWER_DOMAIN_GRAFX_V3D. It releases the V3D reset in PM_GRAFX,
 //   then opens the async AXI bridges, master first, at the BCM2711's
-//   "rpivid_asb" registers. The firmware has already powered GRAFX
-//   (Linux skips power_on on the BCM2711).
+//   "rpivid_asb" registers. Linux skips power_on on the BCM2711.
+// - drivers/pmdomain/bcm/raspberrypi-power.c: on the BCM2711 the firmware
+//   powers V3D (RPI_POWER_DOMAIN_V3D, SET_DOMAIN_STATE). The firmware
+//   leaves it off at boot (Test 547), so v3dprobe asks rpi-firmwared
+//   (/scheme/rpi-firmware/v3d_power) when GRAFX has no power.
 // - drivers/gpu/drm/v3d/v3d_regs.h, v3d_drv.c: V3D_HUB_IDENT0..3,
 //   V3D_CTL_IDENT0..2 and what v3d_platform_drm_probe() logs.
 //
@@ -128,8 +131,38 @@ fn main() {
     }
     asb.show(ASB_V3D_M_CTRL, "ASB_V3D_M_CTRL");
     asb.show(ASB_V3D_S_CTRL, "ASB_V3D_S_CTRL");
+    // Test 547: the firmware leaves GRAFX off. Linux's bcm2711-rpi.dtsi
+    // gives v3d the firmware's domain (raspberrypi-power,
+    // RPI_POWER_DOMAIN_V3D): SET_DOMAIN_STATE through rpi-firmwared.
+    let mut powered = false;
+    let mut grafx = grafx;
     if grafx & PM_POWOK == 0 {
-        fail("GRAFX has no power (the firmware did not power it): not touching V3D");
+        say(&format!("v3d_power: {}", read_v3d_power()));
+        say("asking the firmware for V3D power (/scheme/rpi-firmware/v3d_power = on)");
+        if let Err(err) = fs::write(V3D_POWER, "on") {
+            fail(&format!("{V3D_POWER}: {err} (rpi-firmwared without v3d_power?)"));
+        }
+        powered = true;
+        let start = Instant::now();
+        loop {
+            grafx = pm.show(PM_GRAFX, "PM_GRAFX");
+            if grafx & PM_POWOK != 0 {
+                break;
+            }
+            if start.elapsed() > Duration::from_millis(100) {
+                let _ = fs::write(V3D_POWER, "off");
+                fail("GRAFX still has no power after v3d_power on: V3D power off again");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        say(&format!(
+            "after v3d_power on ({} ms): v3d_power {}, power ok true, V3D reset {}",
+            start.elapsed().as_millis(),
+            read_v3d_power(),
+            if grafx & PM_V3DRSTN != 0 { "released" } else { "asserted" }
+        ));
+        asb.show(ASB_V3D_M_CTRL, "ASB_V3D_M_CTRL");
+        asb.show(ASB_V3D_S_CTRL, "ASB_V3D_S_CTRL");
     }
 
     // bcm2835_asb_power_on(): reset released, then the bridges, master first.
@@ -191,8 +224,23 @@ fn main() {
         }
         pm.write(PM_GRAFX, PM_PASSWORD | (pm.read(PM_GRAFX) & !PM_V3DRSTN));
         say("V3D reset asserted again");
+        if powered {
+            match fs::write(V3D_POWER, "off") {
+                Ok(()) => say(&format!("v3d_power off: {}, PM_GRAFX {:#x}", read_v3d_power(), pm.read(PM_GRAFX))),
+                Err(err) => say(&format!("v3d_power off: {err}")),
+            }
+        }
     }
     std::process::exit(if ok { 0 } else { 1 });
+}
+
+const V3D_POWER: &str = "/scheme/rpi-firmware/v3d_power";
+
+fn read_v3d_power() -> String {
+    match fs::read_to_string(V3D_POWER) {
+        Ok(state) => state.trim().to_owned(),
+        Err(err) => format!("({err})"),
+    }
 }
 
 fn say(line: &str) {

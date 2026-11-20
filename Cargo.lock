@@ -572,8 +572,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "vc4-edid"
+version = "0.1.0"
+
+[[package]]
 name = "vc4-hvs"
 version = "0.1.0"
+
+[[package]]
+name = "vc4-mode"
+version = "0.1.0"
+dependencies = [
+ "vc4-edid",
+]
 
 [[package]]
 name = "vc4d"
@@ -586,7 +597,9 @@ dependencies = [
  "fdt",
  "redox_event",
  "redox_syscall",
+ "vc4-edid",
  "vc4-hvs",
+ "vc4-mode",
 ]
 
 [[package]]
