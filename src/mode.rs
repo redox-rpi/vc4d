@@ -180,3 +180,64 @@ pub fn write_mode(fdt: Option<&Fdt>, same: &Same) -> bool {
     }
     ok
 }
+
+
+/// CPRMAN: the PLLH channel divider for the pixel clock (Linux
+/// clk-bcm2835.c, pllh_pix) and its load bit.
+const CPRMAN_SIZE: usize = 0x2000;
+const A2W_PLLH_PIX: usize = 0x1560;
+const CM_PLLH: usize = 0x110;
+const CM_PLLH_LOADPIX: u32 = 1 << 0;
+const CM_PASSWORD: u32 = 0x5a00_0000;
+
+/// Switches from the firmware's mode (`from`, equal to vc4d's values) to
+/// `target`, whose pixel clock is the running one divided by `divisor`: the
+/// valve off, the PLLH_PIX divider multiplied, the HDMI and valve timing,
+/// the valve on. The monitor sees a mode change.
+pub fn switch(fdt: Option<&Fdt>, from: &Same, target: &vc4_edid::Timing, divisor: u32) -> bool {
+    let name = format!("{}x{}@{}", target.hactive, target.vactive, target.refresh_mhz() / 1000);
+    let (Ok(pv), Ok(hdmi)) = (vc4_mode::pv2(target), vc4_mode::hdmi_timing(target)) else {
+        println!("vc4d: mode: switch: {name} not supported");
+        return false;
+    };
+    if from.hdmi.is_none() {
+        println!("vc4d: mode: switch: HDMI timing not known equal to the firmware's, not switching");
+        return false;
+    }
+    let Some(cm) = map(fdt, CM_BUS_ADDR, CPRMAN_SIZE, common::Prot::RW, "the clock manager") else { return false };
+    let Some(regs) = map(fdt, PV2_BUS_ADDR, PV_SIZE, common::Prot::RW, "pixel valve 2") else { return false };
+    let Some(hregs) = map(fdt, HDMI_BUS_ADDR, HDMI_SIZE, common::Prot::RW, "the HDMI core") else { return false };
+    let cm_read = |offset: usize| unsafe { cm.add(offset / 4).read_volatile() };
+    let cm_write = |offset: usize, value: u32| unsafe { cm.add(offset / 4).write_volatile(CM_PASSWORD | value) };
+    let div = cm_read(A2W_PLLH_PIX) & 0xff;
+    let new_div = div * divisor;
+    if div == 0 || new_div > 255 {
+        println!("vc4d: mode: switch: PLLH_PIX divider {div} cannot be multiplied by {divisor}");
+        return false;
+    }
+    println!("vc4d: mode: switch: to {name}, PLLH_PIX divider {div} -> {new_div} (screen blank, monitor resyncs)");
+    let frame_ms = 1_000_000 / u64::from(from.timing.refresh_mhz().max(1000)) + 1;
+    for (i, step) in vc4_mode::mode_program(&pv, Some(&hdmi)).into_iter().enumerate() {
+        match step {
+            Step::Write(offset, _, value) => unsafe { regs.add(offset / 4).write_volatile(value) },
+            Step::Hdmi(offset, _, value) => unsafe { hregs.add(offset / 4).write_volatile(value) },
+            Step::WaitFrames(n) => thread::sleep(Duration::from_millis(frame_ms * u64::from(n))),
+        }
+        // Steps 0-3 stop the valve and empty its FIFO: change the clock
+        // while it is off, as Linux sets the pixel clock before the valve.
+        if i == 3 {
+            cm_write(A2W_PLLH_PIX, new_div);
+            let pllh = cm_read(CM_PLLH) & 0x00ff_ffff;
+            cm_write(CM_PLLH, pllh | CM_PLLH_LOADPIX);
+            cm_write(CM_PLLH, pllh & !CM_PLLH_LOADPIX);
+        }
+    }
+    let got = cm_read(A2W_PLLH_PIX) & 0xff;
+    let read = |offset: usize| unsafe { regs.add(offset / 4).read_volatile() };
+    let mut ok = got == new_div;
+    for (offset, name, value) in pv.regs() {
+        ok &= read(offset) == value & vc4_mode::readback_mask(offset);
+    }
+    println!("vc4d: mode: switch: {} (divider reads {got})", if ok { "PASS" } else { "FAIL: registers read back different" });
+    ok
+}

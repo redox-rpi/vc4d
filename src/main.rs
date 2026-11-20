@@ -129,6 +129,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     }
     // The firmware's display runs: compare its pixel valve 2 with what
     // vc4d would write for the EDID's preferred mode (read only).
+    let mut firmware_mode = None;
     if let (Some(edid), None) = (&edid, fake) {
         let same = mode::compare(fdt.as_ref(), edid);
         if env::var("VC4D_MODE").is_ok_and(|v| v == "write") {
@@ -139,6 +140,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
                 None => println!("vc4d: mode: write: skipped, pixel valve 2 differs from the firmware's"),
             }
         }
+        firmware_mode = same;
     }
 
     // The firmware's channels and lists, for the log: what the Pi tests
@@ -153,9 +155,38 @@ fn daemon(daemon: daemon::Daemon) -> ! {
             found.get_or_insert(channel);
         }
     }
-    let Some(channel) = found else {
+    let Some(mut channel) = found else {
         give_up(daemon, "no HVS channel enabled");
     };
+    // /etc/vc4d-mode names a mode of the monitor that the pixel clock
+    // divider reaches from the firmware's (720p60 from 1080p60): switch to
+    // it for real. Other sizes are scaled (below).
+    let wanted = std::fs::read_to_string("/etc/vc4d-mode").ok().and_then(|s| {
+        let s = s.trim();
+        if s.ends_with(" scale") {
+            return None;
+        }
+        let (w, h) = s.split_once('x')?;
+        Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+    });
+    if let (Some((w, h)), Some(from), Some(edid)) = (wanted, &firmware_mode, &edid) {
+        let mut timings = edid.timings.clone();
+        if let Some(cea) = &edid.cea {
+            timings.extend(cea.timings.iter().copied());
+        }
+        if (w, h) != (channel.width, channel.height) {
+            match vc4_mode::reachable_mode(&timings, w, h, &from.timing) {
+                Some((target, divisor)) => {
+                    if mode::switch(fdt.as_ref(), from, &target, divisor) {
+                        hvs.set_channel_size(channel.index, w, h);
+                        channel.width = w;
+                        channel.height = h;
+                    }
+                }
+                None => println!("vc4d: mode: {w}x{h} not reachable by the pixel divider, scaled instead"),
+            }
+        }
+    }
     // A channel the firmware set up but does not scan out would show
     // nothing; its frame count moves only when it runs.
     let before = hvs.frame_count(channel.index);
@@ -185,7 +216,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     let screen = std::fs::read_to_string("/etc/vc4d-mode")
         .ok()
         .and_then(|s| {
-            let (w, h) = s.trim().split_once('x')?;
+            let (w, h) = s.trim().trim_end_matches(" scale").split_once('x')?;
             Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
         })
         .filter(|&(w, h)| (64..=channel.width).contains(&w) && (64..=channel.height).contains(&h))

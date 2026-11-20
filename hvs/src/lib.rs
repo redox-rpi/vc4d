@@ -556,6 +556,15 @@ impl Hvs {
         self.reg(SCALER_DLIST_START + word * 4)
     }
 
+    /// Set a channel's size (after a mode change).
+    pub fn set_channel_size(&self, index: usize, width: u32, height: u32) {
+        let ctrl = self.reg(scaler_dispctrlx(index));
+        let ctrl = ctrl & !(SCALER_DISPCTRLX_WIDTH.mask() | SCALER_DISPCTRLX_HEIGHT.mask())
+            | SCALER_DISPCTRLX_WIDTH.set(width)
+            | SCALER_DISPCTRLX_HEIGHT.set(height);
+        self.set_reg(scaler_dispctrlx(index), ctrl);
+    }
+
     /// Put the PPF filter kernel at KERNEL_START, for scaled planes.
     pub fn upload_kernel(&self) {
         self.write_dlist(KERNEL_START, &ppf_kernel());
@@ -736,5 +745,14 @@ mod tests {
             assert_eq!(k[i], k[10 - i]);
         }
         assert_eq!(k[5] & 0x1ff, 227);
+    }
+
+    #[test]
+    fn channel_size_changes() {
+        let hvs = Hvs::fake(1920, 1080);
+        hvs.set_channel_size(1, 1280, 720);
+        let c = hvs.channel(1).unwrap();
+        assert_eq!((c.width, c.height), (1280, 720));
+        assert!(hvs.enabled());
     }
 }

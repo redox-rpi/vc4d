@@ -202,6 +202,27 @@ pub fn mode_program(pv: &Pv, hdmi: Option<&HdmiTiming>) -> Vec<Step> {
     steps
 }
 
+/// The divisor that turns the running pixel clock into `target_khz` by the
+/// PLLH_PIX channel divider alone (the PLL stays): an integer 1..=8 within
+/// 0.1 %.
+pub fn pixel_divisor(current_khz: u32, target_khz: u32) -> Option<u32> {
+    (1..=8u32).find(|&n| {
+        let want = u64::from(target_khz) * u64::from(n);
+        want.abs_diff(u64::from(current_khz)) * 1000 <= u64::from(current_khz)
+    })
+}
+
+/// A progressive mode of size `width` x `height` from `timings` that the
+/// divider can reach from `current`, the one nearest to 60 Hz, with its
+/// divisor.
+pub fn reachable_mode(timings: &[Timing], width: u32, height: u32, current: &Timing) -> Option<(Timing, u32)> {
+    timings
+        .iter()
+        .filter(|t| t.hactive == width && t.vactive == height && !t.interlaced)
+        .filter_map(|t| Some((*t, pixel_divisor(current.pixel_khz, t.pixel_khz)?)))
+        .min_by_key(|(t, _)| t.refresh_mhz().abs_diff(60_000))
+}
+
 /// What a register reads back after `pv_program`: FIFO_CLR is not kept.
 pub fn readback_mask(offset: usize) -> u32 {
     if offset == PV_CONTROL {
@@ -386,4 +407,26 @@ mod tests {
     /// The test monitor's EDID (Pi test row 387), the same bytes as the
     /// vc4-edid test.
     const NANOKVM: [u8; 256] = include!("../../edid/tests/nanokvm.in");
+
+    const P720: Timing = Timing {
+        pixel_khz: 74_250, hactive: 1280, hfp: 110, hsync: 40, hbp: 220,
+        vactive: 720, vfp: 5, vsync: 5, vbp: 20,
+        hsync_positive: true, vsync_positive: true, interlaced: false,
+    };
+
+    #[test]
+    fn divisor_for_720p_from_1080p() {
+        assert_eq!(pixel_divisor(148_500, 74_250), Some(2));
+        assert_eq!(pixel_divisor(148_500, 148_500), Some(1));
+        assert_eq!(pixel_divisor(148_500, 65_000), None);
+    }
+
+    #[test]
+    fn reachable_720p() {
+        let xga = Timing { pixel_khz: 65_000, hactive: 1024, vactive: 768, ..P720 };
+        let timings = [P1080, P720, xga];
+        assert_eq!(reachable_mode(&timings, 1280, 720, &P1080), Some((P720, 2)));
+        assert_eq!(reachable_mode(&timings, 1024, 768, &P1080), None);
+        assert!(pv2(&P720).is_ok() && hdmi_timing(&P720).is_ok());
+    }
 }
