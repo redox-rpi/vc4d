@@ -98,7 +98,10 @@ fn main() {
             node.compatible().map(|c| c.first()).unwrap_or("?"),
             node.property("status").and_then(|p| p.as_str()).unwrap_or("okay")
         )),
-        None => fail("no brcm,2711-v3d in the devicetree: not a BCM2711"),
+        None if fdt.as_ref().is_some_and(|f| f.root().compatible().all().any(|c| c == "brcm,bcm2711")) => {
+            say("devicetree: no v3d node (an upstream devicetree), but brcm,bcm2711: going on with the Pi 400 addresses")
+        }
+        None => fail("not a BCM2711 (no brcm,2711-v3d, no brcm,bcm2711 in the devicetree)"),
     }
     // The firmware's clocks (rpi-firmwared): V3D should run.
     match fs::read_to_string("/scheme/rpi-firmware/clocks") {
