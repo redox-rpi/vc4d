@@ -9,8 +9,9 @@
 //   and the format table (pixel format and order for XRGB/ARGB8888)
 // - vc4_hvs.c: HVS_BOOTLOADER_DLIST_END, the end word after the last plane
 //
-// Only what an unscaled, linear 32-bit plane needs: no scaling, no YUV, no
-// tiling, no HVS5 (BCM2711).
+// Linear 32-bit RGB planes, unscaled or scaled; no YUV, no tiling. Both
+// the HVS of the BCM2835/6/7 and the HVS5 of the BCM2711 (`Gen`), whose
+// registers and lists differ in a few fields (vc4->is_vc5 in Linux).
 //
 // A crate of its own with no dependencies, so its tests run on any host
 // (redox-rpi#271); the driver in ../src uses it as `hvs`.
@@ -19,8 +20,48 @@ use std::fmt;
 
 /// Bus address of the HVS on all BCM283x, if the devicetree has none.
 pub const HVS_BUS_ADDR: usize = 0x7e40_0000;
-/// Registers and display list memory.
+/// Registers and display list memory (BCM283x; `Gen::size` for both).
 pub const HVS_SIZE: usize = 0x6000;
+
+/// Which HVS: the BCM2835/6/7's or the BCM2711's HVS5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gen {
+    Vc4,
+    Vc5,
+}
+
+impl Gen {
+    /// Bytes of registers and display list memory to map.
+    pub fn size(self) -> usize {
+        match self {
+            Gen::Vc4 => 0x6000,
+            Gen::Vc5 => 0x8000,
+        }
+    }
+
+    fn dlist_start(self) -> usize {
+        match self {
+            Gen::Vc4 => SCALER_DLIST_START,
+            Gen::Vc5 => SCALER5_DLIST_START,
+        }
+    }
+
+    fn dispctrlx_size(self) -> (Field, Field) {
+        match self {
+            Gen::Vc4 => (SCALER_DISPCTRLX_WIDTH, SCALER_DISPCTRLX_HEIGHT),
+            Gen::Vc5 => (SCALER5_DISPCTRLX_WIDTH, SCALER5_DISPCTRLX_HEIGHT),
+        }
+    }
+
+    /// LBM words of a scaled plane are rounded to this and allocated at
+    /// this alignment (vc4_lbm_size(), vc4_plane_allocate_lbm()).
+    pub fn lbm_align(self) -> u32 {
+        match self {
+            Gen::Vc4 => 32,
+            Gen::Vc5 => 64,
+        }
+    }
+}
 
 const SCALER_DISPCTRL: usize = 0x00;
 const SCALER_DISPCTRL_ENABLE: u32 = 1 << 31;
@@ -53,10 +94,17 @@ const fn scaler_dispbkgndx(x: usize) -> usize {
 const SCALER_DISPCTRLX_ENABLE: u32 = 1 << 31;
 const SCALER_DISPCTRLX_WIDTH: Field = Field(23, 12);
 const SCALER_DISPCTRLX_HEIGHT: Field = Field(11, 0);
-const SCALER_DISPSTATX_FRAME_COUNT: Field = Field(17, 12);
+const SCALER5_DISPCTRLX_WIDTH: Field = Field(28, 16);
+const SCALER5_DISPCTRLX_HEIGHT: Field = Field(12, 0);
+/// Frame counts: channel 0 and 1 in SCALER_DISPSTAT1, channel 2 in
+/// SCALER_DISPSTAT2 (vc4_hvs_get_fifo_frame_count()).
+const SCALER_DISPSTAT1_FRCNT0: Field = Field(23, 18);
+const SCALER_DISPSTAT1_FRCNT1: Field = Field(17, 12);
+const SCALER_DISPSTAT2_FRCNT2: Field = Field(17, 12);
 const SCALER_DISPSTATX_MODE: Field = Field(31, 30);
 
 const SCALER_DLIST_START: usize = 0x2000;
+const SCALER5_DLIST_START: usize = 0x4000;
 /// Words of display list memory.
 pub const SCALER_DLIST_WORDS: usize = 0x4000 / 4;
 /// The firmware's lists are below this word (Linux leaves them alone too).
@@ -82,6 +130,22 @@ const SCALER_POS2_HEIGHT: Field = Field(27, 16);
 const SCALER_POS2_WIDTH: Field = Field(11, 0);
 
 const SCALER_SRC_PITCH: Field = Field(15, 0);
+
+// HVS5 (vc4_plane_mode_set(), the is_vc5 branch): unity and the expand
+// bits move in control word 0, the alpha moves from position words 0 and 2
+// to control word 2 after position word 0, and the sizes get 13 bits.
+const SCALER5_CTL0_UNITY: u32 = 1 << 15;
+const SCALER5_CTL0_ALPHA_EXPAND: u32 = 1 << 12;
+const SCALER5_CTL0_RGB_EXPAND: u32 = 1 << 11;
+const SCALER5_CTL0_PIXEL_FORMAT: Field = Field(4, 0);
+const SCALER5_POS0_START_Y: Field = Field(27, 16);
+const SCALER5_POS0_START_X: Field = Field(13, 0);
+const SCALER5_CTL2_ALPHA_MODE: Field = Field(31, 30);
+const SCALER5_CTL2_ALPHA: Field = Field(15, 4);
+const SCALER5_POS1_SCL_HEIGHT: Field = Field(28, 16);
+const SCALER5_POS1_SCL_WIDTH: Field = Field(12, 0);
+const SCALER5_POS2_HEIGHT: Field = Field(28, 16);
+const SCALER5_POS2_WIDTH: Field = Field(12, 0);
 
 const SCALER_CTL0_SCL1: Field = Field(10, 8);
 const SCALER_CTL0_SCL0: Field = Field(7, 5);
@@ -157,14 +221,17 @@ fn scl_field(x: Scaling, y: Scaling) -> u32 {
 
 /// Line buffer memory a scaled plane needs, in LBM words (vc4_lbm_size()):
 /// none without vertical scaling.
-pub fn lbm_words(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> u32 {
+pub fn lbm_words(generation: Gen, src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> u32 {
     let y = scaling(src_h, dst_h);
     if y == Scaling::None {
         return 0;
     }
     let pix_per_line = if scaling(src_w, dst_w) == Scaling::Tpz { dst_w } else { src_w };
     let bytes = pix_per_line * if y == Scaling::Tpz { 8 } else { 16 };
-    bytes.next_multiple_of(64) / 2
+    match generation {
+        Gen::Vc4 => bytes.next_multiple_of(64) / 2,
+        Gen::Vc5 => bytes.next_multiple_of(128) / 4,
+    }
 }
 
 /// A plane shown at another size than its source: the size on the screen
@@ -178,6 +245,8 @@ pub struct Scale {
 
 const HVS_PIXEL_FORMAT_RGBA8888: u32 = 7;
 const HVS_PIXEL_ORDER_ABGR: u32 = 3;
+/// XRGB/ARGB8888 on the HVS5 (pixel_order_hvs5).
+const HVS_PIXEL_ORDER_ARGB: u32 = 2;
 
 /// Written where the HVS keeps its own state while it scans a plane out.
 pub const CONTEXT: u32 = 0xc0c0_c0c0;
@@ -220,11 +289,49 @@ pub struct Plane {
 impl Plane {
     /// The plane's words of a display list, as vc4_plane_mode_set() writes
     /// them for an unscaled linear RGB plane.
-    pub fn words(&self) -> Vec<u32> {
-        match self.scale {
-            Some(scale) if (scale.width, scale.height) != (self.width, self.height) => self.scaled_words(scale),
-            _ => self.unity_words().to_vec(),
+    pub fn words(&self, generation: Gen) -> Vec<u32> {
+        let scale = self.scale.filter(|s| (s.width, s.height) != (self.width, self.height));
+        match (generation, scale) {
+            (Gen::Vc4, Some(scale)) => self.scaled_words(scale),
+            (Gen::Vc4, None) => self.unity_words().to_vec(),
+            (Gen::Vc5, scale) => self.words5(scale),
         }
+    }
+
+    /// The HVS5's words for a linear RGB plane, unscaled or scaled.
+    fn words5(&self, scale: Option<Scale>) -> Vec<u32> {
+        let mut w = vec![
+            0, // control word 0, below, once the size is known
+            SCALER5_POS0_START_X.set(self.x) | SCALER5_POS0_START_Y.set(self.y),
+            // Control word 2: the plane's alpha (opaque) and the alpha mode.
+            SCALER5_CTL2_ALPHA.set(0xfff) | SCALER5_CTL2_ALPHA_MODE.set(self.alpha_mode()),
+        ];
+        if let Some(scale) = scale {
+            // Position word 1: the size on the screen.
+            w.push(SCALER5_POS1_SCL_WIDTH.set(scale.width) | SCALER5_POS1_SCL_HEIGHT.set(scale.height));
+        }
+        w.extend_from_slice(&[
+            // Position word 2: the source size.
+            SCALER5_POS2_WIDTH.set(self.width) | SCALER5_POS2_HEIGHT.set(self.height),
+            CONTEXT,
+            self.bus,
+            CONTEXT,
+            SCALER_SRC_PITCH.set(self.pitch),
+        ]);
+        let mut ctl0 = SCALER_CTL0_VALID
+            | SCALER_CTL0_ORDER.set(HVS_PIXEL_ORDER_ARGB)
+            | SCALER5_CTL0_PIXEL_FORMAT.set(HVS_PIXEL_FORMAT_RGBA8888)
+            | SCALER5_CTL0_ALPHA_EXPAND
+            | SCALER5_CTL0_RGB_EXPAND;
+        match scale {
+            None => ctl0 |= SCALER5_CTL0_UNITY,
+            Some(scale) => {
+                let scl = self.push_scaling(&mut w, scale);
+                ctl0 |= SCALER_CTL0_SCL0.set(scl) | SCALER_CTL0_SCL1.set(scl);
+            }
+        }
+        w[0] = ctl0 | SCALER_CTL0_SIZE.set(w.len() as u32);
+        w
     }
 
     fn alpha_mode(&self) -> u32 {
@@ -233,9 +340,6 @@ impl Plane {
 
     /// The words vc4_plane_mode_set() writes for a scaled linear RGB plane.
     fn scaled_words(&self, scale: Scale) -> Vec<u32> {
-        let x = scaling(self.width, scale.width);
-        let y = scaling(self.height, scale.height);
-        let scl = scl_field(x, y);
         let mut w = vec![
             0, // control word 0, below, once the size is known
             SCALER_POS0_FIXED_ALPHA.set(0xff)
@@ -252,6 +356,22 @@ impl Plane {
             CONTEXT,
             SCALER_SRC_PITCH.set(self.pitch),
         ];
+        let scl = self.push_scaling(&mut w, scale);
+        w[0] = SCALER_CTL0_VALID
+            | SCALER_CTL0_ORDER.set(HVS_PIXEL_ORDER_ABGR)
+            | SCALER_CTL0_PIXEL_FORMAT.set(HVS_PIXEL_FORMAT_RGBA8888)
+            | SCALER_CTL0_SCL0.set(scl)
+            | SCALER_CTL0_SCL1.set(scl)
+            | SCALER_CTL0_SIZE.set(w.len() as u32);
+        w
+    }
+
+    /// The words after the pitch word of a scaled plane (LBM address, PPF
+    /// or TPZ parameters, kernel pointers), the same on both HVS; returns
+    /// the SCL field.
+    fn push_scaling(&self, w: &mut Vec<u32>, scale: Scale) -> u32 {
+        let x = scaling(self.width, scale.width);
+        let y = scaling(self.height, scale.height);
         if y != Scaling::None {
             // LBM base address.
             w.push(scale.lbm);
@@ -280,13 +400,7 @@ impl Plane {
             let kernel = SCALER_PPF_KERNEL_OFFSET.set(KERNEL_START as u32);
             w.extend_from_slice(&[kernel; 4]);
         }
-        w[0] = SCALER_CTL0_VALID
-            | SCALER_CTL0_ORDER.set(HVS_PIXEL_ORDER_ABGR)
-            | SCALER_CTL0_PIXEL_FORMAT.set(HVS_PIXEL_FORMAT_RGBA8888)
-            | SCALER_CTL0_SCL0.set(scl)
-            | SCALER_CTL0_SCL1.set(scl)
-            | SCALER_CTL0_SIZE.set(w.len() as u32);
-        w
+        scl_field(x, y)
     }
 
     fn unity_words(&self) -> [u32; 7] {
@@ -320,10 +434,10 @@ impl Plane {
 }
 
 /// A whole display list: the planes from bottom to top, then the end word.
-pub fn display_list(planes: &[Plane]) -> Vec<u32> {
+pub fn display_list(generation: Gen, planes: &[Plane]) -> Vec<u32> {
     let mut list = Vec::new();
     for plane in planes {
-        list.extend_from_slice(&plane.words());
+        list.extend_from_slice(&plane.words(generation));
     }
     list.push(SCALER_CTL0_END);
     list
@@ -350,7 +464,10 @@ pub struct ListPlane {
 /// unscaled plane's words are those `Plane::words` writes; a scaled
 /// plane (the firmware's) has position word 1 (its size on the screen)
 /// after position word 0, then the source size.
-pub fn decode_list(words: &[u32]) -> Vec<ListPlane> {
+pub fn decode_list(generation: Gen, words: &[u32]) -> Vec<ListPlane> {
+    if generation == Gen::Vc5 {
+        return decode_list5(words);
+    }
     let mut planes = Vec::new();
     let mut i = 0;
     while i < words.len() && words[i] & SCALER_CTL0_END == 0 {
@@ -383,9 +500,48 @@ pub fn decode_list(words: &[u32]) -> Vec<ListPlane> {
     planes
 }
 
+/// The HVS5 list's planes: control word 0, position word 0, control word
+/// 2, position word 1 if scaled, position word 2, context, pointer.
+fn decode_list5(words: &[u32]) -> Vec<ListPlane> {
+    let mut planes = Vec::new();
+    let mut i = 0;
+    while i < words.len() && words[i] & SCALER_CTL0_END == 0 {
+        let ctl0 = words[i];
+        let size = (SCALER_CTL0_SIZE.get(ctl0) as usize).max(1);
+        let w = &words[i..(i + size).min(words.len())];
+        let unity = ctl0 & SCALER5_CTL0_UNITY != 0;
+        let pos2 = if unity { 3 } else { 4 };
+        if w.len() >= pos2 + 5 {
+            // Position word 2 (unity) or 1 (scaled): the size on the screen.
+            let size_word = w[3];
+            let (width, height) = if unity {
+                (SCALER5_POS2_WIDTH.get(size_word), SCALER5_POS2_HEIGHT.get(size_word))
+            } else {
+                (SCALER5_POS1_SCL_WIDTH.get(size_word), SCALER5_POS1_SCL_HEIGHT.get(size_word))
+            };
+            planes.push(ListPlane {
+                unity,
+                format: SCALER5_CTL0_PIXEL_FORMAT.get(ctl0),
+                x: SCALER5_POS0_START_X.get(w[1]),
+                y: SCALER5_POS0_START_Y.get(w[1]),
+                width,
+                height,
+                bus: w[pos2 + 2],
+                pitch: SCALER_SRC_PITCH.get(w[pos2 + 4]),
+                alpha: SCALER5_CTL2_ALPHA_MODE.get(w[2]) == SCALER_POS2_ALPHA_MODE_PIPELINE,
+            });
+        }
+        i += size;
+    }
+    planes
+}
+
 /// The start (x, y) in a plane's position word 0 (its second word).
-pub fn plane_start(pos0: u32) -> (u32, u32) {
-    (SCALER_POS0_START_X.get(pos0), SCALER_POS0_START_Y.get(pos0))
+pub fn plane_start(generation: Gen, pos0: u32) -> (u32, u32) {
+    match generation {
+        Gen::Vc4 => (SCALER_POS0_START_X.get(pos0), SCALER_POS0_START_Y.get(pos0)),
+        Gen::Vc5 => (SCALER5_POS0_START_X.get(pos0), SCALER5_POS0_START_Y.get(pos0)),
+    }
 }
 
 /// An enabled output channel of the HVS.
@@ -399,6 +555,7 @@ pub struct Channel {
 /// The mapped HVS.
 pub struct Hvs {
     regs: *mut u32,
+    generation: Gen,
     /// Normal memory, not an HVS (VC4D_FAKE): nothing clears on write.
     fake: bool,
 }
@@ -417,23 +574,23 @@ impl Hvs {
     /// # Safety
     /// `regs` maps `HVS_SIZE` bytes of the HVS as device memory, for as long
     /// as this value lives.
-    pub unsafe fn new(regs: *mut u32) -> Self {
-        Hvs { regs, fake: false }
+    pub unsafe fn new(regs: *mut u32, generation: Gen) -> Self {
+        Hvs { regs, generation, fake: false }
+    }
+
+    pub fn generation(&self) -> Gen {
+        self.generation
     }
 
     /// An HVS in normal memory with channel 1 enabled at this size, for
     /// testing everything but the picture where there is no HVS (QEMU).
-    pub fn fake(width: u32, height: u32) -> Self {
-        let regs = Box::leak(vec![0u32; HVS_SIZE / 4].into_boxed_slice()).as_mut_ptr();
-        let hvs = Hvs { regs, fake: true };
+    pub fn fake(width: u32, height: u32, generation: Gen) -> Self {
+        let regs = Box::leak(vec![0u32; generation.size() / 4].into_boxed_slice()).as_mut_ptr();
+        let hvs = Hvs { regs, generation, fake: true };
+        let (w, h) = generation.dispctrlx_size();
         hvs.set_reg(SCALER_DISPCTRL, SCALER_DISPCTRL_ENABLE);
-        hvs.set_reg(
-            scaler_dispctrlx(1),
-            SCALER_DISPCTRLX_ENABLE
-                | SCALER_DISPCTRLX_WIDTH.set(width)
-                | SCALER_DISPCTRLX_HEIGHT.set(height),
-        );
-        hvs.set_reg(SCALER_DLIST_START, SCALER_CTL0_END);
+        hvs.set_reg(scaler_dispctrlx(1), SCALER_DISPCTRLX_ENABLE | w.set(width) | h.set(height));
+        hvs.set_reg(generation.dlist_start(), SCALER_CTL0_END);
         hvs
     }
 
@@ -447,7 +604,7 @@ impl Hvs {
 
     /// A second handle on the same registers, for the watch thread.
     pub fn share(&self) -> Hvs {
-        Hvs { regs: self.regs, fake: self.fake }
+        Hvs { regs: self.regs, generation: self.generation, fake: self.fake }
     }
 
     /// Whether the firmware left the HVS running.
@@ -462,10 +619,8 @@ impl Hvs {
     /// The channel's size if it is enabled.
     pub fn channel(&self, index: usize) -> Option<Channel> {
         let ctrl = self.reg(scaler_dispctrlx(index));
-        let (width, height) = (
-            SCALER_DISPCTRLX_WIDTH.get(ctrl),
-            SCALER_DISPCTRLX_HEIGHT.get(ctrl),
-        );
+        let (w, h) = self.generation.dispctrlx_size();
+        let (width, height) = (w.get(ctrl), h.get(ctrl));
         (ctrl & SCALER_DISPCTRLX_ENABLE != 0 && width > 0 && height > 0)
             .then_some(Channel { index, width, height })
     }
@@ -481,7 +636,7 @@ impl Hvs {
             self.active(index),
             stat,
             SCALER_DISPSTATX_MODE.get(stat),
-            SCALER_DISPSTATX_FRAME_COUNT.get(stat)
+            self.frame_count(index)
         )
     }
 
@@ -539,7 +694,16 @@ impl Hvs {
     }
 
     pub fn frame_count(&self, index: usize) -> u32 {
-        SCALER_DISPSTATX_FRAME_COUNT.get(self.reg(scaler_dispstatx(index)))
+        match index {
+            0 => SCALER_DISPSTAT1_FRCNT0.get(self.reg(scaler_dispstatx(1))),
+            1 => SCALER_DISPSTAT1_FRCNT1.get(self.reg(scaler_dispstatx(1))),
+            _ => SCALER_DISPSTAT2_FRCNT2.get(self.reg(scaler_dispstatx(2))),
+        }
+    }
+
+    /// The display list of `planes` for this HVS.
+    pub fn list(&self, planes: &[Plane]) -> Vec<u32> {
+        display_list(self.generation, planes)
     }
 
     /// Where the channel's display list starts, in words.
@@ -553,7 +717,7 @@ impl Hvs {
     }
 
     pub fn dlist_word(&self, word: usize) -> u32 {
-        self.reg(SCALER_DLIST_START + word * 4)
+        self.reg(self.generation.dlist_start() + word * 4)
     }
 
     /// Put the PPF filter kernel at KERNEL_START, for scaled planes.
@@ -564,7 +728,7 @@ impl Hvs {
     pub fn write_dlist(&self, start: usize, words: &[u32]) {
         assert!(start >= HVS_BOOTLOADER_DLIST_END && start + words.len() <= SCALER_DLIST_WORDS);
         for (i, &word) in words.iter().enumerate() {
-            self.set_reg(SCALER_DLIST_START + (start + i) * 4, word);
+            self.set_reg(self.generation.dlist_start() + (start + i) * 4, word);
         }
     }
 
@@ -618,7 +782,7 @@ mod tests {
             alpha: false,
             scale: None,
         };
-        let list = display_list(&[plane]);
+        let list = display_list(Gen::Vc4, &[plane]);
         assert_eq!(
             list,
             [
@@ -648,7 +812,7 @@ mod tests {
             alpha: true,
             scale: None,
         };
-        let words = plane.words();
+        let words = plane.words(Gen::Vc4);
         assert_eq!(words[1], 0xff00_0000 | 50 << 12 | 100);
         assert_eq!(words[2], 64 << 16 | 64);
     }
@@ -656,9 +820,9 @@ mod tests {
     #[test]
     fn read_list_past_alpha() {
         // Position word 0 has the alpha 0xff in its top byte, bit 31.
-        let hvs = Hvs::fake(640, 480);
+        let hvs = Hvs::fake(640, 480, Gen::Vc4);
         let plane = Plane { bus: 0xc000_0000, pitch: 2560, x: 0, y: 0, width: 640, height: 480, alpha: false, scale: None };
-        let list = display_list(&[plane, plane]);
+        let list = display_list(Gen::Vc4, &[plane, plane]);
         hvs.write_dlist(0x800, &list);
         assert_eq!(hvs.read_list(0x800, 32), list);
         assert_eq!(hvs.read_list(0x800, 3), list[..3]);
@@ -668,7 +832,7 @@ mod tests {
     fn decode_own_list() {
         let cursor = Plane { bus: 0xc100_0000, pitch: 256, x: 5, y: 7, width: 64, height: 64, alpha: true, scale: None };
         let screen = Plane { bus: 0xc000_0000, pitch: 7680, x: 0, y: 0, width: 1920, height: 1080, alpha: false, scale: None };
-        let planes = decode_list(&display_list(&[screen, cursor]));
+        let planes = decode_list(Gen::Vc4, &display_list(Gen::Vc4, &[screen, cursor]));
         assert_eq!(planes.len(), 2);
         let c = planes[1];
         assert!(c.unity && c.alpha);
@@ -684,7 +848,7 @@ mod tests {
             0x00001c80, 0x00008300, 0x40f33261, 0x40f36260, 0x00017d36, 0x00000ff4, 0x00000ff4,
             0x80000000,
         ];
-        let planes = decode_list(&words);
+        let planes = decode_list(Gen::Vc4, &words);
         assert_eq!(planes.len(), 1);
         let p = planes[0];
         assert!(!p.unity);
@@ -704,7 +868,7 @@ mod tests {
             alpha: false,
             scale: Some(Scale { width: 1920, height: 1080, lbm: 0 }),
         };
-        let w = plane.words();
+        let w = plane.words(Gen::Vc4);
         assert_eq!(w.len(), 16);
         assert_eq!(w[0] & 0x3f00_0000, 16 << 24);
         assert_eq!(w[0] & SCALER_CTL0_UNITY, 0);
@@ -716,7 +880,7 @@ mod tests {
         assert_eq!(w[10], SCALER_PPF_AGC | SCALER_PPF_SCALE.set(43690));
         assert_eq!(w[11], CONTEXT);
         assert_eq!(&w[12..], &[KERNEL_START as u32; 4]);
-        assert_eq!(lbm_words(1280, 720, 1920, 1080), 1280 * 8);
+        assert_eq!(lbm_words(Gen::Vc4, 1280, 720, 1920, 1080), 1280 * 8);
     }
 
     #[test]
@@ -725,8 +889,8 @@ mod tests {
             bus: 0, pitch: 256, x: 0, y: 0, width: 64, height: 64, alpha: true,
             scale: Some(Scale { width: 64, height: 64, lbm: 0 }),
         };
-        assert_eq!(plane.words().len(), 7);
-        assert_ne!(plane.words()[0] & SCALER_CTL0_UNITY, 0);
+        assert_eq!(plane.words(Gen::Vc4).len(), 7);
+        assert_ne!(plane.words(Gen::Vc4)[0] & SCALER_CTL0_UNITY, 0);
     }
 
     #[test]
@@ -736,5 +900,79 @@ mod tests {
             assert_eq!(k[i], k[10 - i]);
         }
         assert_eq!(k[5] & 0x1ff, 227);
+    }
+
+    fn screen(width: u32, height: u32) -> Plane {
+        Plane { bus: 0xc010_0000, pitch: width * 4, x: 0, y: 0, width, height, alpha: false, scale: None }
+    }
+
+    #[test]
+    fn hvs5_opaque_plane() {
+        // vc4_plane_mode_set() with is_vc5 for an XRGB8888 plane at 1920x1080.
+        let list = display_list(Gen::Vc5, &[screen(1920, 1080)]);
+        assert_eq!(
+            list,
+            [
+                // valid, size 8, order ARGB (2), unity (15), alpha and RGB expand, RGBA8888
+                0x4800_0000 | 2 << 13 | 1 << 15 | 1 << 12 | 1 << 11 | 7,
+                0,
+                // control word 2: alpha 0xfff, fixed alpha mode
+                0x4000_fff0,
+                1080 << 16 | 1920,
+                CONTEXT,
+                0xc010_0000,
+                CONTEXT,
+                1920 * 4,
+                SCALER_CTL0_END,
+            ]
+        );
+    }
+
+    #[test]
+    fn hvs5_cursor_position_and_alpha() {
+        let cursor = Plane { x: 3000, y: 2000, width: 64, height: 64, alpha: true, ..screen(64, 64) };
+        let w = cursor.words(Gen::Vc5);
+        assert_eq!(w.len(), 8);
+        assert_eq!(plane_start(Gen::Vc5, w[1]), (3000, 2000));
+        assert_eq!(w[2] >> 30, SCALER_POS2_ALPHA_MODE_PIPELINE);
+    }
+
+    #[test]
+    fn hvs5_decode_own_list() {
+        let cursor = Plane { x: 100, y: 200, width: 64, height: 64, alpha: true, ..screen(64, 64) };
+        let planes = decode_list(Gen::Vc5, &display_list(Gen::Vc5, &[screen(1920, 1080), cursor]));
+        assert_eq!(planes.len(), 2);
+        assert!(planes[0].unity && !planes[0].alpha);
+        assert_eq!((planes[0].width, planes[0].height, planes[0].pitch), (1920, 1080, 1920 * 4));
+        assert_eq!((planes[1].x, planes[1].y, planes[1].bus), (100, 200, 0xc010_0000));
+        assert!(planes[1].alpha);
+    }
+
+    #[test]
+    fn hvs5_scaled_plane() {
+        let plane = Plane { scale: Some(Scale { width: 1920, height: 1080, lbm: 0x40 }), ..screen(1280, 720) };
+        let w = plane.words(Gen::Vc5);
+        // ctl0, pos0, ctl2, pos1, pos2, context, ptr, ptr context, pitch, LBM,
+        // H PPF, V PPF and context, 4 kernel pointers.
+        assert_eq!(w.len(), 17);
+        assert_eq!(w[0] & SCALER5_CTL0_UNITY, 0);
+        assert_eq!(SCALER_CTL0_SIZE.get(w[0]), 17);
+        assert_eq!(w[3], 1080 << 16 | 1920);
+        assert_eq!(w[4], 720 << 16 | 1280);
+        assert_eq!(w[9], 0x40);
+        let planes = decode_list(Gen::Vc5, &w);
+        assert_eq!((planes[0].width, planes[0].height, planes[0].bus), (1920, 1080, 0xc010_0000));
+        assert_eq!(lbm_words(Gen::Vc5, 1280, 720, 1920, 1080), 1280 * 16 / 4);
+    }
+
+    #[test]
+    fn hvs5_channel_and_dlist() {
+        let hvs = Hvs::fake(1920, 1080, Gen::Vc5);
+        let c = hvs.channel(1).unwrap();
+        assert_eq!((c.width, c.height), (1920, 1080));
+        hvs.write_dlist(0x800, &hvs.list(&[screen(1920, 1080)]));
+        assert_eq!(hvs.read_list(0x800, 64).len(), 9);
+        // The list memory starts at 0x4000 on the HVS5.
+        assert_eq!(hvs.reg(0x4000 + 0x800 * 4), hvs.dlist_word(0x800));
     }
 }

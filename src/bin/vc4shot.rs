@@ -24,7 +24,7 @@ mod shot {
     pub const PICTURE: &str = "/tmp/vc4shot.ppm";
 }
 
-use hvs::{Hvs, CHANNELS, HVS_BUS_ADDR, HVS_SIZE};
+use hvs::{Gen, Hvs, CHANNELS, HVS_BUS_ADDR};
 
 
 fn main() {
@@ -35,19 +35,24 @@ fn main() {
 
     let dtb = fs::read("/scheme/kernel.dtb").unwrap_or_default();
     let fdt = Fdt::new(&dtb).ok();
+    let bcm2711 = |fdt: &Fdt| {
+        fdt.find_compatible(&["brcm,bcm2711-hvs"]).is_some()
+            || fdt.root().compatible().all().any(|c| c == "brcm,bcm2711")
+    };
+    let generation = if fdt.as_ref().is_some_and(bcm2711) { Gen::Vc5 } else { Gen::Vc4 };
     let bus_addr = fdt
         .as_ref()
-        .and_then(|fdt| fdt.find_compatible(&["brcm,bcm2835-hvs"]))
+        .and_then(|fdt| fdt.find_compatible(&["brcm,bcm2711-hvs", "brcm,bcm2835-hvs"]))
         .and_then(|node| node.reg())
         .and_then(|mut reg| reg.next())
         .map(|reg| reg.starting_address as usize)
         .unwrap_or(HVS_BUS_ADDR);
     let phys = fdt.as_ref().map_or(bus_addr, |fdt| soc_phys(fdt, bus_addr));
 
-    let regs = unsafe { common::physmap(phys, HVS_SIZE, common::Prot::RO, common::MemoryType::DeviceMemory) }
+    let regs = unsafe { common::physmap(phys, generation.size(), common::Prot::RO, common::MemoryType::DeviceMemory) }
         .unwrap_or_else(|err| fail(&format!("cannot map the HVS at {phys:#x}: {err:?}")));
     // Only read from: the mapping is read-only.
-    let hvs = unsafe { Hvs::new(regs as *mut u32) };
+    let hvs = unsafe { Hvs::new(regs as *mut u32, generation) };
     // The list is only for the log: without an HVS (VC4D_FAKE in QEMU)
     // vc4d still writes the picture.
     let channel = (0..CHANNELS)
@@ -58,7 +63,7 @@ fn main() {
         None => println!("vc4shot: no enabled HVS channel, asking vc4d anyway"),
         Some(channel) => {
             let start = hvs.list_start(channel.index);
-            let planes = hvs::decode_list(&hvs.read_list(start, 256));
+            let planes = hvs::decode_list(generation, &hvs.read_list(start, 256));
             println!(
                 "vc4shot: channel {} {}x{}, list at {start}, {} planes, {}",
                 channel.index,

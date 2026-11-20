@@ -222,7 +222,7 @@ impl Vc4Adapter {
                 .collect()
         };
         let planes = self.to_output(planes);
-        let list = hvs::display_list(&planes);
+        let list = self.hvs.list(&planes);
         let start = LIST_SLOTS[self.next_slot];
         self.hvs.write_dlist(start, &list);
         self.hvs.set_list_start(index, start);
@@ -243,6 +243,7 @@ impl Vc4Adapter {
             return planes;
         }
         let mut lbm = 0;
+        let generation = self.hvs.generation();
         planes
             .into_iter()
             .map(|mut p| {
@@ -252,7 +253,8 @@ impl Vc4Adapter {
                 let width = (sx(p.x + p.width) - x).max(1);
                 let height = (sy(p.y + p.height) - y).max(1);
                 p.scale = Some(hvs::Scale { width, height, lbm });
-                lbm += hvs::lbm_words(p.width, p.height, width, height).next_multiple_of(32);
+                lbm += hvs::lbm_words(generation, p.width, p.height, width, height)
+                    .next_multiple_of(generation.lbm_align());
                 p.x = x;
                 p.y = y;
                 p
