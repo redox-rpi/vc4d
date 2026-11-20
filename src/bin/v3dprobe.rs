@@ -2,7 +2,7 @@
 //
 // v3dprobe: step 0 of V3D on the Pi 4 and 400 (BCM2711, V3D 4.2). It powers
 // the 3D block up as Linux does and reads its identification registers.
-// Nothing is rendered yet.
+// With --csd and --render it runs the step 1 and step 2 jobs.
 //
 // Translated from Linux v6.12:
 // - drivers/pmdomain/bcm/bcm2835-power.c: bcm2835_asb_power_on() for
@@ -16,10 +16,13 @@
 // - drivers/gpu/drm/v3d/v3d_regs.h, v3d_drv.c: V3D_HUB_IDENT0..3,
 //   V3D_CTL_IDENT0..2 and what v3d_platform_drm_probe() logs.
 //
-// v3dprobe [--csd] [--render [--show SECONDS]] [--off] [--no-watchdog]
+// v3dprobe [--csd] [--render [--triangle | --triangle-math] [--show SECONDS]]
+//          [--off] [--no-watchdog]
 //   --show: the rendered picture in an Orbital window for SECONDS (step 2c)
 //   --render: step 2 (redox-rpi#596): bin and render control lists, see
-//     v3d/render.rs
+//     v3d/render.rs; clear only, or with --triangle a red triangle whose
+//     coordinates the CPU precomputes, with --triangle-math one whose
+//     shaders compute the screen coordinates
 //   --csd: step 1 (redox-rpi#595): MMU page table and one compute job, see
 //     v3d/csd.rs
 //   --off: close the bridges, assert the reset and power V3D off afterwards
@@ -120,6 +123,13 @@ fn main() {
     let watchdog = !env::args().any(|a| a == "--no-watchdog");
     let run_csd = env::args().any(|a| a == "--csd");
     let run_render = env::args().any(|a| a == "--render");
+    let draw = if env::args().any(|a| a == "--triangle-math") {
+        render::Draw::MathShaders
+    } else if env::args().any(|a| a == "--triangle") {
+        render::Draw::CopyShaders
+    } else {
+        render::Draw::Clear
+    };
     let args: Vec<String> = env::args().collect();
     let show_secs: Option<u64> =
         args.iter().position(|a| a == "--show").map(|i| args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(30));
@@ -282,7 +292,7 @@ fn main() {
             ok = csd::run(&hub, &core);
         }
         if ok && run_render {
-            (ok, picture) = render::run(&hub, &core);
+            (ok, picture) = render::run(&hub, &core, draw);
         }
         stop_watchdog();
     }

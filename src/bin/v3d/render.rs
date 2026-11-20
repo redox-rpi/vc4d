@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// V3D step 2a (redox-rpi#596): a bin job and a render job from hand-built
-// control lists. The binner gets no primitives; the render control list
-// clears every tile to one colour and stores it to a raster buffer, which
-// the CPU checks. No shaders yet.
+// V3D step 2 (redox-rpi#596): a bin job and a render job from hand-built
+// control lists. Step 2a: the binner gets no primitives; the render control
+// list clears every tile to one colour and stores it to a raster buffer,
+// which the CPU checks. Step 2b: one red triangle on that background, with
+// hand-encoded coordinate, vertex and fragment shaders (QPU code), checked
+// pixel by pixel.
 //
 // The control lists follow what Mesa's v3d driver emits for V3D 4.2
 // (src/gallium/drivers/v3d/v3dx_draw.c v3d_start_binning(), v3dx_rcl.c
@@ -78,7 +80,21 @@ const TILE_ALLOC_SIZE: usize = ((TILES_X * TILES_Y * 64) as usize).next_multiple
 const OVERFLOW: usize = TILE_ALLOC + TILE_ALLOC_SIZE;
 const OVERFLOW_SIZE: usize = 256 * 1024;
 const SCRATCH: usize = OVERFLOW + OVERFLOW_SIZE;
-const _: () = assert!(SCRATCH + PAGE <= ARENA);
+// Step 2b: shader record, attributes, uniforms and QPU code, one page.
+const GEOM: usize = SCRATCH + PAGE;
+const SHADER_REC: usize = GEOM; // 32-byte aligned, attribute records at +36
+const DEFAULT_ATTRS: usize = GEOM + 0x100; // 16 x vec4, 16-byte aligned
+const VERTS0: usize = GEOM + 0x200;
+const VERTS1: usize = GEOM + 0x240;
+const CS_UNIFS: usize = GEOM + 0x300;
+const VS_UNIFS: usize = GEOM + 0x320;
+const FS_UNIFS: usize = GEOM + 0x340;
+const CS_CODE: usize = GEOM + 0x400;
+const VS_CODE: usize = GEOM + 0x500;
+const FS_CODE: usize = GEOM + 0x600;
+const _: () = assert!(GEOM + PAGE <= ARENA);
+/// The triangle's colour: opaque red (bytes R, G, B, A in memory).
+pub const TRIANGLE_COLOR: u32 = 0xff_00_00_ff;
 
 fn va(offset: usize) -> u32 {
     ARENA_VA + offset as u32
@@ -132,6 +148,26 @@ const TILE_COORDINATES: u8 = 124;
 const TILE_COORDINATES_IMPLICIT: u8 = 125;
 const TILE_LIST_INITIAL_BLOCK_SIZE: u8 = 126;
 
+// Step 2b: state and draw packets.
+const VERTEX_ARRAY_PRIMS: u8 = 36;
+const GL_SHADER_STATE: u8 = 64;
+const VCM_CACHE_SIZE: u8 = 71;
+const TRANSFORM_FEEDBACK_SPECS: u8 = 74;
+const COLOR_WRITE_MASKS: u8 = 87;
+const ZERO_ALL_CENTROID_FLAGS: u8 = 88;
+const SAMPLE_STATE: u8 = 91;
+const CFG_BITS: u8 = 96;
+const ZERO_ALL_FLAT_SHADE_FLAGS: u8 = 97;
+const ZERO_ALL_NON_PERSPECTIVE_FLAGS: u8 = 99;
+const POINT_SIZE: u8 = 104;
+const LINE_WIDTH: u8 = 105;
+const CLIP_WINDOW: u8 = 107;
+const VIEWPORT_OFFSET: u8 = 108;
+const CLIPPER_Z_MIN_MAX_CLIPPING_PLANES: u8 = 109;
+const CLIPPER_XY_SCALING: u8 = 110;
+const CLIPPER_Z_SCALE_AND_OFFSET: u8 = 111;
+const PRIMITIVE_TRIANGLES: u64 = 4;
+
 const BUFFER_NONE: u64 = 8;
 const OUTPUT_RGBA8: u64 = 27;
 const INTERNAL_TYPE_8: u64 = 2;
@@ -146,9 +182,203 @@ fn clear_tile_buffers(cl: &mut Cl) {
     cl.emit(CLEAR_TILE_BUFFERS, 2, f(1, 0, 1) | f(1, 1, 1));
 }
 
-/// v3d_start_binning() and the epilogue's FLUSH; prims are added between
-/// START_TILE_BINNING and FLUSH later (step 2b).
-fn bcl() -> Cl {
+/// How the triangle's shaders get the screen coordinates (step 2b).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Draw {
+    /// Step 2a: no primitives, clear only.
+    Clear,
+    /// The CPU precomputes clip and screen coordinates; the coordinate and
+    /// vertex shaders only copy VPM rows (two attributes, one of them int).
+    CopyShaders,
+    /// One float attribute (clip coordinates); the shaders compute the
+    /// screen coordinates with fmul/ffloor/ftoiz, as Mesa's do.
+    MathShaders,
+}
+
+// QPU code (V3D 4.2), encoded by hand and checked against Mesa's
+// qpu_disasm test vectors; see the step 2 notes for the field layout.
+const NOP: u64 = 0x3c00_3186_bb80_0000;
+const THRSW: u64 = 0x3c20_3186_bb80_0000;
+const VPMWT: u64 = 0x3c00_3186_bb81_6000;
+/// ldvpmv_in rfN, N (N < 6).
+const fn ldvpmv_in(n: u64) -> u64 {
+    0x3de0_2180_bc80_7000 | n << 32 | n
+}
+/// stvpmv N, rfN (N < 6): row index as small immediate, value from raddr_a.
+const fn stvpmv_rf(n: u64) -> u64 {
+    0x3de0_2180_f883_7000 | n << 6 | n
+}
+/// Variant A: copy VPM rows 0..5 (CS: Xc Yc Zc Wc Xs Ys).
+const CS_COPY: [u64; 16] = [
+    ldvpmv_in(0), ldvpmv_in(1), ldvpmv_in(2), ldvpmv_in(3), ldvpmv_in(4), ldvpmv_in(5),
+    stvpmv_rf(0), stvpmv_rf(1), stvpmv_rf(2), stvpmv_rf(3), stvpmv_rf(4), stvpmv_rf(5),
+    VPMWT, THRSW, NOP, NOP,
+];
+/// Variant A: copy VPM rows 0..3 (VS: Xs Ys Zs 1/Wc).
+const VS_COPY: [u64; 12] = [
+    ldvpmv_in(0), ldvpmv_in(1), ldvpmv_in(2), ldvpmv_in(3),
+    stvpmv_rf(0), stvpmv_rf(1), stvpmv_rf(2), stvpmv_rf(3),
+    VPMWT, THRSW, NOP, NOP,
+];
+/// Variant B, rows 4..11 of the coordinate shader: r0, r1 = Xs, Ys from
+/// rf0, rf1 and the uniforms x_scale, y_scale.
+const SCREEN_XY: [u64; 8] = [
+    0x3c40_3186_bb80_0000, // ldunif (r5 = x_scale)
+    0x5400_3006_bbb8_0000, // fmul r0, rf0, r5
+    0x3c40_3186_bb80_0000, // ldunif (r5 = y_scale)
+    0x5400_3046_bbb8_0040, // fmul r1, rf1, r5
+    0x3c00_3180_f680_0000, // ffloor r0, r0
+    0x3c00_3181_f680_1000, // ffloor r1, r1
+    0x3c00_3180_f583_8000, // ftoiz r0, r0
+    0x3c00_3181_f583_9000, // ftoiz r1, r1
+];
+const CS_MATH: [u64; 22] = [
+    ldvpmv_in(0), ldvpmv_in(1), ldvpmv_in(2), ldvpmv_in(3),
+    SCREEN_XY[0], SCREEN_XY[1], SCREEN_XY[2], SCREEN_XY[3],
+    SCREEN_XY[4], SCREEN_XY[5], SCREEN_XY[6], SCREEN_XY[7],
+    stvpmv_rf(0), stvpmv_rf(1), stvpmv_rf(2), stvpmv_rf(3),
+    0x3de0_2180_f880_7004, // stvpmv 4, r0
+    0x3de0_2180_f880_f005, // stvpmv 5, r1
+    VPMWT, THRSW, NOP, NOP,
+];
+const VS_MATH: [u64; 22] = [
+    ldvpmv_in(0), ldvpmv_in(1), ldvpmv_in(2),
+    SCREEN_XY[0], SCREEN_XY[1], SCREEN_XY[2], SCREEN_XY[3],
+    SCREEN_XY[4], SCREEN_XY[5], SCREEN_XY[6], SCREEN_XY[7],
+    0x55e0_3086_bbf8_00a7, // fmul r2, rf2, 0.5 (z scale)
+    0x3de0_3182_0583_a027, // fadd r2, r2, 0.5 (z offset)
+    0x3de0_30c6_bbfc_0028, // mov r3, 1.0 (1/Wc, Wc = 1)
+    0x3de0_2180_f880_7000, // stvpmv 0, r0
+    0x3de0_2180_f880_f001, // stvpmv 1, r1
+    0x3de0_2180_f881_7002, // stvpmv 2, r2
+    0x3de0_2180_f881_f003, // stvpmv 3, r3
+    VPMWT, THRSW, NOP, NOP,
+];
+/// Fragment shader: opaque red into render target 0 (default TLB config).
+const FS_RED: [u64; 11] = [
+    THRSW, THRSW, NOP, NOP,
+    0x3de0_3006_bbfc_0028, // mov r0, 1.0
+    0x3de0_3046_bbfc_0000, // mov r1, 0
+    0x3c00_3187_3580_8000, // vfpack tlb, r0, r1 (R, G)
+    0x3c00_3187_3580_1000, // vfpack tlb, r1, r0 (B, A)
+    THRSW, NOP, NOP,
+];
+
+// The triangle in pixels: (64,64), (192,64), (128,192), z = 0.
+const TRIANGLE: [(f32, f32); 3] = [(64.0, 64.0), (192.0, 64.0), (128.0, 192.0)];
+
+/// Writes shader record, attribute records, vertices, uniforms and code for
+/// `draw` into the arena; returns the GL_SHADER_STATE word (record | count).
+fn geometry(bytes: &mut [u8], draw: Draw) -> u32 {
+    let put = |bytes: &mut [u8], at: usize, words: &[u32]| {
+        for (i, w) in words.iter().enumerate() {
+            bytes[at + 4 * i..at + 4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+    };
+    let code = |bytes: &mut [u8], at: usize, insts: &[u64]| {
+        for (i, w) in insts.iter().enumerate() {
+            bytes[at + 8 * i..at + 8 * i + 8].copy_from_slice(&w.to_le_bytes());
+        }
+    };
+    let one = 1.0f32.to_bits();
+    for i in 0..16 {
+        put(bytes, DEFAULT_ATTRS + 16 * i, &[0, 0, 0, one]);
+    }
+    let (cw, ch) = (WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0);
+    // Clip coordinates, and screen coordinates relative to the viewport
+    // centre in 1/256 pixel.
+    let clip = |(x, y): (f32, f32)| ((x - cw) / cw, (y - ch) / ch);
+    let screen = |(x, y): (f32, f32)| (((x - cw) * 256.0) as i32, ((y - ch) * 256.0) as i32);
+    for (i, &v) in TRIANGLE.iter().enumerate() {
+        let (xc, yc) = clip(v);
+        put(bytes, VERTS0 + 16 * i, &[xc.to_bits(), yc.to_bits(), 0, one]);
+        let (xs, ys) = screen(v);
+        put(bytes, VERTS1 + 16 * i, &[xs as u32, ys as u32, 0.5f32.to_bits(), one]);
+    }
+    // Uniforms: x_scale, y_scale (variant B) and a spare word; the FS gets
+    // zero words (the hardware prefetches one).
+    let scale = [(cw * 256.0).to_bits(), (ch * 256.0).to_bits(), 0, 0];
+    put(bytes, CS_UNIFS, &scale);
+    put(bytes, VS_UNIFS, &scale);
+    put(bytes, FS_UNIFS, &[0, 0, 0, 0]);
+    let (cs, vs): (&[u64], &[u64]) = match draw {
+        Draw::MathShaders => (&CS_MATH, &VS_MATH),
+        _ => (&CS_COPY, &VS_COPY),
+    };
+    code(bytes, CS_CODE, cs);
+    code(bytes, VS_CODE, vs);
+    code(bytes, FS_CODE, &FS_RED);
+
+    // GL Shader State Record (v42): clipping on, implicit point/line
+    // varyings off, 1-sector VPM segments, shared input/output.
+    let mut rec = [0u8; 36];
+    rec[..8].copy_from_slice(&[0x02, 0x00, 0x04, 0x00, 0x01, 0x01, 0x01, 0x01]);
+    let words = [
+        va(DEFAULT_ATTRS),
+        va(FS_CODE) | 0b101, // 4-way, NaNs, not single segment
+        va(FS_UNIFS),
+        va(VS_CODE) | 0b111, // 4-way, start in final section, NaNs
+        va(VS_UNIFS),
+        va(CS_CODE) | 0b111,
+        va(CS_UNIFS),
+    ];
+    for (i, w) in words.iter().enumerate() {
+        rec[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
+    }
+    bytes[SHADER_REC..SHADER_REC + 36].copy_from_slice(&rec);
+    // Attribute records: address, vec size/type, read counts, stride, max index.
+    let attr = |bytes: &mut [u8], n: usize, addr: u32, ty: u8, reads: u8| {
+        let at = SHADER_REC + 36 + 16 * n;
+        bytes[at..at + 4].copy_from_slice(&addr.to_le_bytes());
+        bytes[at + 4] = ty;
+        bytes[at + 5] = reads;
+        bytes[at + 6..at + 8].fill(0);
+        bytes[at + 8..at + 12].copy_from_slice(&16u32.to_le_bytes());
+        bytes[at + 12..at + 16].copy_from_slice(&0xff_ffffu32.to_le_bytes());
+    };
+    match draw {
+        Draw::MathShaders => {
+            // vec4 float: CS reads 4, VS reads 3.
+            attr(bytes, 0, va(VERTS0), 0x08, 0x34);
+            va(SHADER_REC) | 1
+        }
+        _ => {
+            // vec4 float, CS reads 4, VS none; vec4 signed int read as int,
+            // CS reads 2 (Xs, Ys), VS reads 4.
+            attr(bytes, 0, va(VERTS0), 0x08, 0x04);
+            attr(bytes, 1, va(VERTS1), 0xb8, 0x42);
+            va(SHADER_REC) | 2
+        }
+    }
+}
+
+/// The state and draw packets for one triangle (v3dX(emit_state)(),
+/// v3d_emit_gl_shader_state(), v3d_draw_vbo() for a first draw).
+fn draw_packets(cl: &mut Cl, shader_state: u32) {
+    let fl = |x: f32| x.to_bits() as u64;
+    cl.emit(CLIP_WINDOW, 9, f(0, 0, 16) | f(0, 16, 16) | f(WIDTH as u64, 32, 16) | f(HEIGHT as u64, 48, 16));
+    // Both faces, depth func always.
+    cl.emit(CFG_BITS, 4, f(1, 0, 1) | f(1, 1, 1) | f(7, 12, 3));
+    cl.emit(POINT_SIZE, 5, f(fl(1.0), 0, 32));
+    cl.emit(LINE_WIDTH, 5, f(fl(1.0), 0, 32));
+    let (hw, hh) = (WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0);
+    cl.emit(CLIPPER_XY_SCALING, 9, f(fl(hw * 256.0), 0, 32) | f(fl(hh * 256.0), 32, 32));
+    cl.emit(CLIPPER_Z_SCALE_AND_OFFSET, 9, f(fl(0.5), 0, 32) | f(fl(0.5), 32, 32));
+    cl.emit(CLIPPER_Z_MIN_MAX_CLIPPING_PLANES, 9, f(fl(0.0), 0, 32) | f(fl(1.0), 32, 32));
+    cl.emit(VIEWPORT_OFFSET, 9, f((hw * 256.0) as u64, 0, 22) | f((hh * 256.0) as u64, 32, 22));
+    cl.emit(COLOR_WRITE_MASKS, 5, 0);
+    cl.op(ZERO_ALL_FLAT_SHADE_FLAGS);
+    cl.op(ZERO_ALL_NON_PERSPECTIVE_FLAGS);
+    cl.op(ZERO_ALL_CENTROID_FLAGS);
+    cl.emit(TRANSFORM_FEEDBACK_SPECS, 2, 0);
+    cl.emit(SAMPLE_STATE, 5, f(0xf, 0, 4) | f(0x3f80, 16, 16));
+    cl.emit(VCM_CACHE_SIZE, 2, f(4, 0, 4) | f(4, 4, 4));
+    cl.emit(GL_SHADER_STATE, 5, f(shader_state as u64, 0, 32));
+    cl.emit(VERTEX_ARRAY_PRIMS, 10, f(PRIMITIVE_TRIANGLES, 0, 8) | f(3, 8, 32) | f(0, 40, 32));
+}
+
+/// v3d_start_binning(), the draw (if any) and the epilogue's FLUSH.
+fn binning_cl(shader_state: Option<u32>) -> Cl {
     let mut cl = Cl::default();
     cl.emit(
         TILE_BINNING_MODE_CFG,
@@ -158,6 +388,9 @@ fn bcl() -> Cl {
     cl.op(FLUSH_VCD_CACHE);
     cl.emit(OCCLUSION_QUERY_COUNTER, 5, 0);
     cl.op(START_TILE_BINNING);
+    if let Some(state) = shader_state {
+        draw_packets(&mut cl, state);
+    }
     cl.op(FLUSH);
     cl
 }
@@ -262,9 +495,73 @@ pub fn show(pixels: &[u32], seconds: u64) {
     std::thread::sleep(std::time::Duration::from_secs(seconds));
 }
 
-/// Runs the clear-only frame; true when every pixel has CLEAR_COLOR. The
-/// picture is returned too.
-pub fn run(hub: &Regs, core: &Regs) -> (bool, Vec<u32>) {
+/// Is pixel centre (x + 0.5, y + 0.5) inside the triangle (either Y
+/// direction is accepted by the caller via `flip`)?
+fn inside(x: u32, y: u32, flip: bool) -> bool {
+    let p = (x as f32 + 0.5, y as f32 + 0.5);
+    let v: Vec<(f32, f32)> =
+        TRIANGLE.iter().map(|&(vx, vy)| if flip { (vx, HEIGHT as f32 - vy) } else { (vx, vy) }).collect();
+    let edge = |a: (f32, f32), b: (f32, f32)| (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
+    let (e0, e1, e2) = (edge(v[0], v[1]), edge(v[1], v[2]), edge(v[2], v[0]));
+    (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0) || (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0)
+}
+
+/// Checks the triangle frame: red inside, the clear colour outside; pixels
+/// on the edges may go either way.
+fn check_triangle(pixels: &[u32]) -> bool {
+    let red = pixels.iter().filter(|&&p| p == TRIANGLE_COLOR).count();
+    let clear = pixels.iter().filter(|&&p| p == CLEAR_COLOR).count();
+    let other = pixels.len() - red - clear;
+    // A coarse picture, 32x16 characters: '#' red, '.' clear, '?' other.
+    for row in 0..16u32 {
+        let line: String = (0..32u32)
+            .map(|col| match pixels[((row * 16 + 8) * WIDTH + col * 8 + 4) as usize] {
+                TRIANGLE_COLOR => '#',
+                CLEAR_COLOR => '.',
+                _ => '?',
+            })
+            .collect();
+        say(&format!("render: |{line}|"));
+    }
+    let at = |x: u32, y: u32| pixels[(y * WIDTH + x) as usize];
+    // Base at row 64 or (flipped) at row 192.
+    let flip = at(70, 70) != TRIANGLE_COLOR && at(70, HEIGHT - 71) == TRIANGLE_COLOR;
+    let mut wrong = 0usize;
+    let mut first_wrong = None;
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            // Skip pixels near an edge: in for one rule, out for a neighbour.
+            let near = [(0i32, 0i32), (1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dy)| {
+                let (nx, ny) = ((x as i32 + dx).clamp(0, WIDTH as i32 - 1), (y as i32 + dy).clamp(0, HEIGHT as i32 - 1));
+                inside(nx as u32, ny as u32, flip) != inside(x, y, flip)
+            });
+            if near {
+                continue;
+            }
+            let want = if inside(x, y, flip) { TRIANGLE_COLOR } else { CLEAR_COLOR };
+            if at(x, y) != want {
+                wrong += 1;
+                first_wrong.get_or_insert((x, y, at(x, y)));
+            }
+        }
+    }
+    say(&format!(
+        "render: triangle: {red} red, {clear} clear, {other} other pixels (area 8192 expected red); base at row {}; centre {:#x}; {wrong} wrong away from the edges, first {first_wrong:x?}",
+        if flip { HEIGHT - 64 } else { 64 },
+        at(WIDTH / 2, HEIGHT / 2)
+    ));
+    let ok = wrong == 0 && other == 0 && (7900..=8500).contains(&red);
+    if ok {
+        say(&format!("render: PASS: a red triangle on {CLEAR_COLOR:#010x}, drawn by the QPUs through bin and render control lists"));
+    } else {
+        say("render: FAIL: the triangle is not right");
+    }
+    ok
+}
+
+/// Runs one frame: clear only, or a red triangle on the clear colour; true
+/// when the pixels are right. The picture is returned too.
+pub fn run(hub: &Regs, core: &Regs, draw: Draw) -> (bool, Vec<u32>) {
     let mut pt = match Dma::<[u32]>::zeroed_slice(PT_ENTRIES) {
         Ok(dma) => unsafe { dma.assume_init() },
         Err(err) => {
@@ -286,12 +583,18 @@ pub fn run(hub: &Regs, core: &Regs) -> (bool, Vec<u32>) {
         pt[ARENA_VA as usize / PAGE + page] = V3D_PTE_WRITEABLE | V3D_PTE_VALID | ((arena_phys / PAGE + page) as u32);
     }
 
-    let bcl = bcl();
+    say(&format!("render: draw {draw:?}"));
+    let bcl;
     let gtl = generic_tile_list();
     let rcl = rcl(va(GTL), va(GTL) + gtl.len() as u32);
     {
         let bytes: &mut [u8] =
             unsafe { core::slice::from_raw_parts_mut(arena.as_mut_ptr() as *mut u8, ARENA) };
+        let shader_state = (draw != Draw::Clear).then(|| geometry(bytes, draw));
+        bcl = binning_cl(shader_state);
+        if shader_state.is_some() {
+            say(&format!("render: shader record + attributes {:02x?}", &bytes[SHADER_REC..SHADER_REC + 68]));
+        }
         bytes[BCL..BCL + bcl.len()].copy_from_slice(&bcl.0);
         bytes[RCL..RCL + rcl.len()].copy_from_slice(&rcl.0);
         bytes[GTL..GTL + gtl.len()].copy_from_slice(&gtl.0);
@@ -374,6 +677,10 @@ pub fn run(hub: &Regs, core: &Regs) -> (bool, Vec<u32>) {
     // The first row of tiles, one word per tile, for a quick look at partial results.
     let row: Vec<u32> = (0..TILES_X).map(|t| pixels[(t * TILE) as usize]).collect();
     say(&format!("render: first pixel of each tile in row 0: {row:#x?}"));
+    if draw != Draw::Clear {
+        let ok = check_triangle(pixels);
+        return (ok, pixels.to_vec());
+    }
     let ok = right == pixels.len();
     if ok {
         say(&format!("render: PASS: {WIDTH}x{HEIGHT} cleared to {CLEAR_COLOR:#010x} by bin and render control lists"));
