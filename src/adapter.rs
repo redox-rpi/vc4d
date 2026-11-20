@@ -539,8 +539,13 @@ impl GraphicsAdapter for Vc4Adapter {
             None => &mut self.primary,
         };
         let changed = old.as_ref().map(|s| s.plane) != shown.as_ref().map(|s| s.plane);
+        let hidden = shown.is_none();
         *old = shown;
-        if changed {
+        // A compositor hides an overlay after drawing its window into the
+        // primary plane; with that primary frame still waiting, the overlay
+        // goes with the frame's list, else the window would vanish for a
+        // frame.
+        if changed && !(overlay.is_some() && hidden && self.flip_pending()) {
             self.flipped();
         }
         *plane.state.lock().unwrap() = new_plane_state;
