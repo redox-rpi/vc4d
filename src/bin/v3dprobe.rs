@@ -16,7 +16,15 @@
 // - drivers/gpu/drm/v3d/v3d_regs.h, v3d_drv.c: V3D_HUB_IDENT0..3,
 //   V3D_CTL_IDENT0..2 and what v3d_platform_drm_probe() logs.
 //
-// v3dprobe [--off]   --off: close the bridges and assert the reset afterwards
+// v3dprobe [--off] [--no-watchdog]
+//   --off: close the bridges, assert the reset and power V3D off afterwards
+//   --no-watchdog: do not arm the SoC watchdog around the V3D accesses
+//
+// The first V3D accesses can hang the bus (a block without power or clock).
+// The Pi 400 in the lab has no remote power switch, so v3dprobe arms the
+// PM watchdog (Linux's bcm2835_wdt) for WATCHDOG_SECS before it releases
+// the reset and stops it after the identification: a hang resets the SoC
+// instead of needing a person.
 
 use std::env;
 use std::fs;
@@ -40,6 +48,15 @@ const PM_V3DRSTN: u32 = 1 << 6;
 const PM_POWOK: u32 = 1 << 1;
 const PM_POWUP: u32 = 1 << 0;
 const PM_PASSWORD: u32 = 0x5a00_0000;
+// drivers/watchdog/bcm2835_wdt.c
+const PM_RSTC: usize = 0x1c;
+const PM_RSTS: usize = 0x20;
+const PM_WDOG: usize = 0x24;
+const PM_WDOG_TIME_SET: u32 = 0x000f_ffff;
+const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf;
+const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x0000_0020;
+const PM_RSTC_RESET: u32 = 0x0000_0102;
+const WATCHDOG_SECS: u32 = 10;
 
 const ASB_V3D_S_CTRL: usize = 0x08;
 const ASB_V3D_M_CTRL: usize = 0x0c;
@@ -90,6 +107,7 @@ impl Regs {
 fn main() {
     common::init();
     let off = env::args().any(|a| a == "--off");
+    let watchdog = !env::args().any(|a| a == "--no-watchdog");
 
     let dtb = fs::read("/scheme/kernel.dtb").unwrap_or_default();
     let fdt = Fdt::new(&dtb).ok();
@@ -118,6 +136,8 @@ fn main() {
 
     let pm = Regs::map(PM_PHYS, 0x1000, "pm");
     let asb = Regs::map(RPIVID_ASB_PHYS, 0x1000, "rpivid_asb");
+    pm.show(PM_RSTS, "PM_RSTS");
+    pm.show(PM_RSTC, "PM_RSTC");
     let grafx = pm.show(PM_GRAFX, "PM_GRAFX");
     say(&format!(
         "PM_GRAFX: power up {}, power ok {}, V3D reset {}",
@@ -155,6 +175,14 @@ fn main() {
         ));
     }
 
+    if watchdog {
+        // bcm2835_wdt_start()
+        pm.write(PM_WDOG, PM_PASSWORD | ((WATCHDOG_SECS << 16) & PM_WDOG_TIME_SET));
+        let cur = pm.read(PM_RSTC);
+        pm.write(PM_RSTC, PM_PASSWORD | (cur & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET);
+        say(&format!("watchdog armed: {WATCHDOG_SECS} s, then a full SoC reset if v3dprobe hangs"));
+    }
+
     // bcm2835_asb_power_on(): reset released, then the bridges, master first.
     if grafx & PM_V3DRSTN == 0 {
         say("releasing the V3D reset (PM_GRAFX |= V3DRSTN)");
@@ -179,6 +207,10 @@ fn main() {
                 if powered {
                     let _ = fs::write(V3D_POWER, "off");
                 }
+                if watchdog {
+                    pm.write(PM_RSTC, PM_PASSWORD | PM_RSTC_RESET);
+                    say("watchdog stopped");
+                }
                 fail(&format!("ASB {name} bridge: no ack within 10 ms ({now:#x}): bridges closed, reset asserted, V3D power off; V3D not read"));
             }
         }
@@ -194,6 +226,11 @@ fn main() {
     let c0 = core.show(V3D_CTL_IDENT0, "V3D_CTL_IDENT0");
     let c1 = core.show(V3D_CTL_IDENT1, "V3D_CTL_IDENT1");
     let c2 = core.show(V3D_CTL_IDENT2, "V3D_CTL_IDENT2");
+    if watchdog {
+        // bcm2835_wdt_stop()
+        pm.write(PM_RSTC, PM_PASSWORD | PM_RSTC_RESET);
+        say(&format!("watchdog stopped (PM_RSTC {:#x})", pm.read(PM_RSTC)));
+    }
 
     // As v3d_platform_drm_probe() and v3d_debugfs_ident() decode them.
     let tver = h1 & 0xf;
