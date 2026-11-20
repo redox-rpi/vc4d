@@ -66,10 +66,16 @@ impl Gen {
 const SCALER_DISPCTRL: usize = 0x00;
 const SCALER_DISPCTRL_ENABLE: u32 = 1 << 31;
 const SCALER_DISPSTAT: usize = 0x04;
-/// The channel's error bits in SCALER_DISPSTAT (write 1 to clear): COBLOW,
-/// EOLN, ESFRAME, ESLINE, EUFLOW (underrun). EOF (bit 8) is not an error.
-const fn scaler_dispstat_errors(x: usize) -> u32 {
-    0x3e << (8 + x * 8)
+/// The channel's error bits in SCALER_DISPSTAT (write 1 to clear): ESFRAME,
+/// ESLINE, EUFLOW (underrun). The other bits of the channel are events, not
+/// errors (vc4_regs.h): EOF (8), EOLN (12, the DISPEOLN line is done) and
+/// COBLOW (13, the output buffer is low; on the HVS5 nearly every frame).
+pub const fn dispstat_errors(x: usize) -> u32 {
+    0x0e << (8 + x * 8) | SCALER_DISPSTAT_DMA_ERROR
+}
+/// The channel's event bits that vc4d clears with the errors: EOLN, COBLOW.
+const fn dispstat_events(x: usize) -> u32 {
+    0x30 << (8 + x * 8)
 }
 const SCALER_DISPSTAT_DMA_ERROR: u32 = 1 << 7;
 const SCALER_DISPSTAT_RESP: Field = Field(15, 14);
@@ -660,7 +666,7 @@ impl Hvs {
         let stat = self.reg(SCALER_DISPSTAT);
         let mut errors = Vec::new();
         let channel = stat >> (8 + index * 8);
-        for (bit, name) in [(5, "COBLOW"), (4, "EOLN"), (3, "ESFRAME"), (2, "ESLINE"), (1, "EUFLOW")] {
+        for (bit, name) in [(3, "ESFRAME"), (2, "ESLINE"), (1, "EUFLOW")] {
             if channel & (1 << bit) != 0 {
                 errors.push(name);
             }
@@ -679,7 +685,7 @@ impl Hvs {
         if self.fake {
             return;
         }
-        self.set_reg(SCALER_DISPSTAT, scaler_dispstat_errors(index) | SCALER_DISPSTAT_DMA_ERROR);
+        self.set_reg(SCALER_DISPSTAT, dispstat_errors(index) | dispstat_events(index));
     }
 
     /// SCALER_DISPSTATX of the channel, raw: mode (31:30), FIFO full and
@@ -974,5 +980,16 @@ mod tests {
         assert_eq!(hvs.read_list(0x800, 64).len(), 9);
         // The list memory starts at 0x4000 on the HVS5.
         assert_eq!(hvs.reg(0x4000 + 0x800 * 4), hvs.dlist_word(0x800));
+    }
+
+    #[test]
+    fn eoln_and_coblow_are_not_errors() {
+        let hvs = Hvs::fake(640, 480, Gen::Vc5);
+        // Test 544: dispstat 0x00200000 (COBLOW 1), 0x00100004 (EOLN 1).
+        hvs.set_reg(SCALER_DISPSTAT, 0x0030_0004);
+        assert!(hvs.errors(1).is_empty());
+        hvs.set_reg(SCALER_DISPSTAT, 1 << 17);
+        assert_eq!(hvs.errors(1), ["EUFLOW"]);
+        assert_eq!(dispstat_errors(1), 0x0e00 << 8 | 0x80);
     }
 }

@@ -102,7 +102,7 @@ fn line(t: &Trace, event: &str, stat: u32, dispstat: u32, rect: (u32, u32, u32, 
 /// `errors` line when error bits appeared; flushes the file twice a second.
 fn sampler(hvs: Hvs, index: usize) {
     let Some(t) = TRACE.get() else { return };
-    let error_bits = (0x3e << (8 + index * 8)) | (1 << 7);
+    let error_bits = crate::hvs::dispstat_errors(index);
     let mut frame = hvs.frame_count(index);
     let mut errors = hvs.dispstat() & error_bits;
     let mut changed = Instant::now();
@@ -111,7 +111,7 @@ fn sampler(hvs: Hvs, index: usize) {
         thread::sleep(SAMPLE);
         let stat = hvs.channel_stat(index);
         let dispstat = hvs.dispstat();
-        let now_frame = (stat >> 12) & 0x3f;
+        let now_frame = hvs.frame_count(index);
         if now_frame != frame {
             let us = changed.elapsed().as_micros() as u64;
             changed = Instant::now();
