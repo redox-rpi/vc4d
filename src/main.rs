@@ -198,6 +198,8 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         channel,
         ram_bus_offset,
         next_slot: 0,
+        list_frame: None,
+        list_pending: false,
         primary: None,
         cursor: None,
         blanked: false,

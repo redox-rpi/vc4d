@@ -29,7 +29,13 @@ use crate::shot::{self, ShotPlane};
 /// Two places for our display lists, far above the firmware's. A new list
 /// goes into the one the HVS is not using, then the channel is pointed at
 /// it, so the HVS never reads a half-written list.
-const LIST_SLOTS: [usize; 2] = [0x800, 0x840];
+/// Display list slots, used in turn. The HVS keeps reading a list (and
+/// writes context words into it) until the frame after it was replaced, so
+/// a slot is written again only two lists later, and at most one list is
+/// written per frame (update): with two slots and several lists per frame,
+/// vc4d overwrote the list the HVS was reading, and the rest of that frame
+/// showed garbage (stripes on cursor moves, redox-rpi#563).
+const LIST_SLOTS: [usize; 3] = [0x800, 0x840, 0x880];
 
 /// Orbital draws its pointer into a 64x64 ARGB buffer.
 const CURSOR_SIZE: u32 = 64;
@@ -44,6 +50,11 @@ pub struct Vc4Adapter {
     /// while no client has a picture on the primary plane.
     pub firmware_list: usize,
     pub next_slot: usize,
+    /// The frame count when the last list was written (None: none yet).
+    pub list_frame: Option<u32>,
+    /// The planes changed in a frame that already got a list: flush writes
+    /// it in the next frame.
+    pub list_pending: bool,
     pub primary: Option<Shown>,
     pub cursor: Option<Shown>,
     /// A client set no mode: the screen shows only the background.
@@ -164,6 +175,16 @@ impl Vc4Adapter {
     /// channel at it.
     fn update(&mut self) {
         let index = self.channel.index;
+        let frame = self.hvs.frame_count(index);
+        if !self.fake && self.list_frame == Some(frame) {
+            self.list_pending = true;
+            return;
+        }
+        self.list_pending = false;
+        self.list_frame = Some(frame);
+        if let Some(flip) = &mut self.flip {
+            flip.flip_frame = frame;
+        }
         let Some(primary) = &self.primary else {
             println!("vc4d: no primary plane, firmware list again");
             self.hvs.set_list_start(index, self.firmware_list);
@@ -193,7 +214,7 @@ impl Vc4Adapter {
         self.hvs.write_dlist(start, &list);
         self.hvs.set_list_start(index, start);
         crate::trace::event("list", (start as u32, list.len() as u32, 0, 0), 0);
-        self.next_slot = 1 - self.next_slot;
+        self.next_slot = (self.next_slot + 1) % LIST_SLOTS.len();
         self.lists += 1;
         if self.log_lists || self.lists <= LOGGED_LISTS {
             println!("vc4d: list {} at {start}: {planes:?} {list:08x?}", self.lists);
@@ -218,7 +239,10 @@ impl Vc4Adapter {
         };
         flip.pending = Some(Pending { src: fb.buffer.clone(), pitch: fb.pitch, width, height, changed });
         let flip_frame = flip.flip_frame;
-        if !self.fake && self.primary.is_some() && self.hvs.frame_count(self.channel.index) == flip_frame {
+        if !self.fake
+            && self.primary.is_some()
+            && (self.list_pending || self.hvs.frame_count(self.channel.index) == flip_frame)
+        {
             crate::trace::event("defer", changed, 0);
             return self.primary.clone();
         }
@@ -271,14 +295,21 @@ impl Vc4Adapter {
         })
     }
 
-    /// Whether a frame waits for the HVS to take the last list.
+    /// Whether a frame or a display list waits for the next frame.
     pub fn flip_pending(&self) -> bool {
-        self.flip.as_ref().is_some_and(|f| f.pending.is_some())
+        self.list_pending || self.flip.as_ref().is_some_and(|f| f.pending.is_some())
     }
 
     /// Copies and shows a waiting frame once the HVS took the last list;
     /// called from the event loop's timer while flip_pending().
     pub fn flush(&mut self) {
+        if self.list_pending {
+            if self.list_frame == Some(self.hvs.frame_count(self.channel.index)) {
+                return;
+            }
+            self.update();
+            return;
+        }
         let Some(flip) = &self.flip else { return };
         if flip.pending.is_none() || self.hvs.frame_count(self.channel.index) == flip.flip_frame {
             return;
@@ -294,7 +325,6 @@ impl Vc4Adapter {
     fn flipped(&mut self) {
         self.update();
         if let Some(flip) = &mut self.flip {
-            flip.flip_frame = self.hvs.frame_count(self.channel.index);
             if self.log_lists && flip.copies % 600 == 1 {
                 println!("vc4d: flip: {} copies, {} MB", flip.copies, flip.bytes >> 20);
             }
