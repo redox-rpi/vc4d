@@ -16,7 +16,9 @@
 // - drivers/gpu/drm/v3d/v3d_regs.h, v3d_drv.c: V3D_HUB_IDENT0..3,
 //   V3D_CTL_IDENT0..2 and what v3d_platform_drm_probe() logs.
 //
-// v3dprobe [--off] [--no-watchdog]
+// v3dprobe [--csd] [--off] [--no-watchdog]
+//   --csd: step 1 (redox-rpi#595): MMU page table and one compute job, see
+//     v3d/csd.rs
 //   --off: close the bridges, assert the reset and power V3D off afterwards
 //   --no-watchdog: do not arm the SoC watchdog around the V3D accesses
 //
@@ -33,6 +35,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fdt::Fdt;
+
+#[path = "v3d/csd.rs"]
+mod csd;
 
 // The Pi 400's devicetree (bcm2711-rpi-400.dtb): /v3dbus/v3d@7ec04000 with
 // reg-names hub and core0, and /v3dbus ranges 0x7c500000 -> 0xfc500000. The
@@ -108,6 +113,7 @@ fn main() {
     common::init();
     let off = env::args().any(|a| a == "--off");
     let watchdog = !env::args().any(|a| a == "--no-watchdog");
+    let run_csd = env::args().any(|a| a == "--csd");
 
     let dtb = fs::read("/scheme/kernel.dtb").unwrap_or_default();
     let fdt = Fdt::new(&dtb).ok();
@@ -226,10 +232,15 @@ fn main() {
     let c0 = core.show(V3D_CTL_IDENT0, "V3D_CTL_IDENT0");
     let c1 = core.show(V3D_CTL_IDENT1, "V3D_CTL_IDENT1");
     let c2 = core.show(V3D_CTL_IDENT2, "V3D_CTL_IDENT2");
-    if watchdog {
-        // bcm2835_wdt_stop()
-        pm.write(PM_RSTC, PM_PASSWORD | PM_RSTC_RESET);
-        say(&format!("watchdog stopped (PM_RSTC {:#x})", pm.read(PM_RSTC)));
+    let stop_watchdog = || {
+        if watchdog {
+            // bcm2835_wdt_stop()
+            pm.write(PM_RSTC, PM_PASSWORD | PM_RSTC_RESET);
+            say(&format!("watchdog stopped (PM_RSTC {:#x})", pm.read(PM_RSTC)));
+        }
+    };
+    if !run_csd {
+        stop_watchdog();
     }
 
     // As v3d_platform_drm_probe() and v3d_debugfs_ident() decode them.
@@ -252,8 +263,16 @@ fn main() {
     let _ = c2;
     // Linux checks only the version and the cores; the "V3D" in ident0's
     // low bytes is logged for comparison.
-    let ok = ver >= 41 && ncores >= 1;
+    let mut ok = ver >= 41 && ncores >= 1;
     say(&format!("{}: V3D {ver} on the BCM2711", if ok { "PASS" } else { "FAIL" }));
+    if run_csd {
+        // The watchdog stays armed through the job: a GPU job that hangs
+        // the bus resets the SoC.
+        if ok {
+            ok = csd::run(&hub, &core);
+        }
+        stop_watchdog();
+    }
 
     if off {
         for (reg, name) in [(ASB_V3D_S_CTRL, "slave"), (ASB_V3D_M_CTRL, "master")] {
