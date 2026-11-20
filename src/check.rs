@@ -150,11 +150,11 @@ pub fn self_check(hvs: &Hvs, channel: Channel, ram_bus_offset: usize, fake: bool
 
     hvs.clear_errors(index);
     for (n, &(x, y)) in moves.iter().enumerate() {
-        let list = hvs::display_list(&[primary, at(x, y)]);
+        let list = hvs.list(&[primary, at(x, y)]);
         let slot = CHECK_SLOTS[n % 2];
         show(hvs, channel, slot, &list, fake, &mut r);
         // Position word 0 of the cursor plane, the second plane's second word.
-        let start = hvs::plane_start(hvs.dlist_word(slot + 8));
+        let start = hvs::plane_start(hvs.generation(), hvs.dlist_word(slot + primary.words(hvs.generation()).len() + 1));
         r.report(start == (x, y), &format!("cursor at {start:?} in the HVS, wanted ({x}, {y})"));
     }
     if !fake {

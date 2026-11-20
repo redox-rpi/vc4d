@@ -39,7 +39,7 @@ use event::{user_data, EventQueue};
 use fdt::Fdt;
 
 use crate::adapter::Vc4Adapter;
-use crate::hvs::{Hvs, CHANNELS, HVS_BUS_ADDR, HVS_SIZE};
+use crate::hvs::{Gen, Hvs, CHANNELS, HVS_BUS_ADDR};
 
 mod adapter;
 mod check;
@@ -88,14 +88,18 @@ fn daemon(daemon: daemon::Daemon) -> ! {
 
     let dtb = std::fs::read("/scheme/kernel.dtb").unwrap_or_default();
     let fdt = Fdt::new(&dtb).ok();
-    let edid = if env::var("VC4D_EDID").is_ok_and(|v| v == "off") {
+    let generation = fdt.as_ref().map_or(Gen::Vc4, hvs_generation);
+    if generation == Gen::Vc5 {
+        println!("vc4d: BCM2711, HVS5: the firmware's mode, no EDID and no mode registers (HDMI is not the BCM2835's)");
+    }
+    let edid = if env::var("VC4D_EDID").is_ok_and(|v| v == "off") || generation == Gen::Vc5 {
         None
     } else {
         ddc::log_edid(fdt.as_ref())
     };
     let bus_addr = fdt
         .as_ref()
-        .and_then(|fdt| fdt.find_compatible(&["brcm,bcm2835-hvs"]))
+        .and_then(|fdt| fdt.find_compatible(&["brcm,bcm2711-hvs", "brcm,bcm2835-hvs"]))
         .and_then(|node| node.reg())
         .and_then(|mut reg| reg.next())
         .map(|reg| reg.starting_address as usize)
@@ -107,16 +111,16 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     let hvs = match fake {
         Some((width, height)) => {
             println!("vc4d: VC4D_FAKE: an HVS in memory at {width}x{height}, nothing on the screen");
-            Hvs::fake(width, height)
+            Hvs::fake(width, height, generation)
         }
         None => {
             let regs = match unsafe {
-                common::physmap(phys, HVS_SIZE, common::Prot::RW, common::MemoryType::DeviceMemory)
+                common::physmap(phys, generation.size(), common::Prot::RW, common::MemoryType::DeviceMemory)
             } {
                 Ok(regs) => regs as *mut u32,
                 Err(err) => give_up(daemon, &format!("failed to map the HVS at {phys:#x}: {err:?}")),
             };
-            unsafe { Hvs::new(regs) }
+            unsafe { Hvs::new(regs, generation) }
         }
     };
     println!(
@@ -277,6 +281,13 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     }
 
     panic!();
+}
+
+/// The HVS5 on the BCM2711 (Pi 4, Pi 400), else the BCM283x's HVS.
+pub fn hvs_generation(fdt: &Fdt) -> Gen {
+    let bcm2711 = fdt.find_compatible(&["brcm,bcm2711-hvs"]).is_some()
+        || fdt.root().compatible().all().any(|c| c == "brcm,bcm2711");
+    if bcm2711 { Gen::Vc5 } else { Gen::Vc4 }
 }
 
 fn parse_size(value: &str) -> Option<(u32, u32)> {
