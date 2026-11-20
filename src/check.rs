@@ -134,6 +134,7 @@ pub fn self_check(hvs: &Hvs, channel: Channel, ram_bus_offset: usize, fake: bool
         width: width as u32,
         height: height as u32,
         alpha: false,
+        scale: None,
     };
     let at = |x: u32, y: u32| Plane {
         bus: (cursor.physical() + ram_bus_offset) as u32,
@@ -143,6 +144,7 @@ pub fn self_check(hvs: &Hvs, channel: Channel, ram_bus_offset: usize, fake: bool
         width: 64.min(channel.width - x),
         height: 64.min(channel.height - y),
         alpha: true,
+        scale: None,
     };
     let moves = [(16, 16), (channel.width / 2, channel.height / 2)];
 
@@ -180,9 +182,10 @@ const SHOT_POLL: Duration = Duration::from_secs(3);
 /// handover, while fbcond and Orbital draw: the list it points at, whether
 /// frames go on, and new errors. Then (and in between) it answers
 /// screenshot requests.
-pub fn watch(hvs: Hvs, channel: Channel, fake: bool, checking: bool, shown: shot::Shown) {
+pub fn watch(hvs: Hvs, channel: Channel, screen: (u32, u32), fake: bool, checking: bool, shown: shot::Shown) {
     let index = channel.index;
-    let (width, height) = (channel.width as usize, channel.height as usize);
+    // Screenshots in the clients' mode (/etc/vc4d-mode), as they drew it.
+    let (width, height) = (screen.0 as usize, screen.1 as usize);
     thread::spawn(move || {
         hvs.clear_errors(index);
         let start = Instant::now();

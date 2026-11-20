@@ -35,7 +35,8 @@ use crate::shot::{self, ShotPlane};
 /// written per frame (update): with two slots and several lists per frame,
 /// vc4d overwrote the list the HVS was reading, and the rest of that frame
 /// showed garbage (stripes on cursor moves, redox-rpi#563).
-const LIST_SLOTS: [usize; 3] = [0x800, 0x840, 0x880];
+// 128 words each: five scaled planes take 16 words each.
+const LIST_SLOTS: [usize; 3] = [0x800, 0x880, 0x900];
 
 /// Orbital draws its pointer into a 64x64 ARGB buffer.
 const CURSOR_SIZE: u32 = 64;
@@ -48,6 +49,9 @@ pub const OVERLAYS: usize = 3;
 pub struct Vc4Adapter {
     pub hvs: Hvs,
     pub channel: Channel,
+    /// The mode clients see (/etc/vc4d-mode); the HVS scales it to the
+    /// channel's size. Equal to the channel's size without scaling.
+    pub screen: (u32, u32),
     /// Bus address minus physical address of RAM.
     pub ram_bus_offset: usize,
     /// The firmware's list (its framebuffer, which vesad draws into): shown
@@ -217,6 +221,7 @@ impl Vc4Adapter {
                 .map(|s| ShotPlane { plane: s.plane, pixels: s.pixels, _buffer: s._buffer.clone() })
                 .collect()
         };
+        let planes = self.to_output(planes);
         let list = hvs::display_list(&planes);
         let start = LIST_SLOTS[self.next_slot];
         self.hvs.write_dlist(start, &list);
@@ -229,13 +234,39 @@ impl Vc4Adapter {
         }
     }
 
+    /// Planes in the clients' mode, scaled to the channel's size, each
+    /// with its own line buffer.
+    fn to_output(&self, planes: Vec<Plane>) -> Vec<Plane> {
+        let (sw, sh) = self.screen;
+        let (cw, ch) = (self.channel.width, self.channel.height);
+        if (sw, sh) == (cw, ch) {
+            return planes;
+        }
+        let mut lbm = 0;
+        planes
+            .into_iter()
+            .map(|mut p| {
+                let sx = |v: u32| (u64::from(v) * u64::from(cw) / u64::from(sw)) as u32;
+                let sy = |v: u32| (u64::from(v) * u64::from(ch) / u64::from(sh)) as u32;
+                let (x, y) = (sx(p.x), sy(p.y));
+                let width = (sx(p.x + p.width) - x).max(1);
+                let height = (sy(p.y + p.height) - y).max(1);
+                p.scale = Some(hvs::Scale { width, height, lbm });
+                lbm += hvs::lbm_words(p.width, p.height, width, height).next_multiple_of(32);
+                p.x = x;
+                p.y = y;
+                p
+            })
+            .collect()
+    }
+
     /// Takes the client's frame for the primary plane. If the HVS already
     /// took the last display list, the frame is copied into the scanout
     /// buffer behind the shown one, which is returned as the new primary
     /// plane. Otherwise the frame waits in `pending` (flush copies it) and
     /// the shown plane stays.
     fn flip_primary(&mut self, fb: &KmsFramebuffer<Self>, damage: Option<Damage>) -> Option<Shown> {
-        let (screen_w, screen_h) = (self.channel.width, self.channel.height);
+        let (screen_w, screen_h) = self.screen;
         let (width, height) = (fb.width.min(screen_w), fb.height.min(screen_h));
         let full = (0, 0, width, height);
         let changed = damage.map_or(full, |d| clip((d.x, d.y, d.width, d.height), width, height));
@@ -260,7 +291,7 @@ impl Vc4Adapter {
     /// Copies the pending frame into the scanout buffer behind the shown
     /// one and returns that buffer as the primary plane.
     fn copy_pending(&mut self) -> Option<Shown> {
-        let screen_w = self.channel.width;
+        let screen_w = self.screen.0;
         let flip = self.flip.as_mut()?;
         let p = flip.pending.take()?;
         let back = 1 - flip.front;
@@ -297,6 +328,7 @@ impl Vc4Adapter {
                 width: p.width,
                 height: p.height,
                 alpha: false,
+                scale: None,
             },
             pixels: dst,
             _buffer: dst_buf,
@@ -346,7 +378,7 @@ impl Vc4Adapter {
             println!("vc4d: buffer {}x{} not in contiguous memory, not shown", fb.width, fb.height);
             return None;
         };
-        let (screen_w, screen_h) = (self.channel.width as i32, self.channel.height as i32);
+        let (screen_w, screen_h) = (self.screen.0 as i32, self.screen.1 as i32);
         // Columns and rows cut off at the left and top.
         let (skip_x, skip_y) = ((-x).max(0), (-y).max(0));
         let width = (fb.width as i32 - skip_x).min(screen_w - x.max(0));
@@ -364,6 +396,7 @@ impl Vc4Adapter {
                 width: width as u32,
                 height: height as u32,
                 alpha,
+                scale: None,
             },
             pixels: unsafe { fb.buffer.ptr.as_ptr().cast::<u8>().add(offset) },
             _buffer: fb.buffer.clone(),
@@ -452,7 +485,7 @@ impl GraphicsAdapter for Vc4Adapter {
         let mut connector = objects.get_connector(id)?.lock().unwrap();
         connector.connection = KmsConnectorStatus::Connected;
         connector.connector_type = drm_sys::DRM_MODE_CONNECTOR_HDMIA;
-        connector.modes = vec![modeinfo_for_size(self.channel.width, self.channel.height)];
+        connector.modes = vec![modeinfo_for_size(self.screen.0, self.screen.1)];
         Ok(())
     }
 
@@ -460,7 +493,7 @@ impl GraphicsAdapter for Vc4Adapter {
         // With flip a screen-sized buffer (the console's, Orbital's
         // framebuffer) is copied from, so it lives in cached memory; smaller
         // ones (the cursor, overlay windows) are scanned out directly.
-        if self.flip.is_some() && width >= self.channel.width && height >= self.channel.height {
+        if self.flip.is_some() && width >= self.screen.0 && height >= self.screen.1 {
             return (Vc4Buffer::normal(width as usize, height as usize), width * 4);
         }
         (Vc4Buffer::new(width as usize, height as usize), width * 4)
