@@ -9,6 +9,7 @@ license = "GPL-2.0-only"
 # The Redox driver crates come from upstream base at the commit redox-rpi
 # pins in config/upstream.lock; redox-rpi does not patch them.
 [dependencies]
+orbclient = { version = "0.4.6", default-features = false, features = ["std"] }
 vc4-hvs = { path = "hvs" }
 vc4-edid = { path = "edid" }
 vc4-mode = { path = "mode" }

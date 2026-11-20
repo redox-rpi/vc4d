@@ -595,6 +595,7 @@ dependencies = [
  "driver-graphics",
  "drm-sys",
  "fdt",
+ "orbclient",
  "redox_event",
  "redox_syscall",
  "vc4-edid",

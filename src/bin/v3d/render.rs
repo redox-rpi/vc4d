@@ -246,20 +246,37 @@ fn cle_state(core: &Regs) {
     ));
 }
 
-/// Runs the clear-only frame; true when every pixel has CLEAR_COLOR.
-pub fn run(hub: &Regs, core: &Regs) -> bool {
+/// Shows the picture (RGBA8 words, R in the low byte) in an Orbital window
+/// for `seconds`, so vc4shot can take it from the screen (step 2c).
+pub fn show(pixels: &[u32], seconds: u64) {
+    use orbclient::{Color, Renderer, Window};
+    let Some(mut window) = Window::new(64, 64, WIDTH, HEIGHT, "v3d") else {
+        say("show: cannot open an Orbital window (is Orbital running?)");
+        return;
+    };
+    for (dst, &p) in window.data_mut().iter_mut().zip(pixels) {
+        *dst = Color::rgba(p as u8, (p >> 8) as u8, (p >> 16) as u8, (p >> 24) as u8);
+    }
+    window.sync();
+    say(&format!("show: the picture is in an Orbital window ({WIDTH}x{HEIGHT} at 64,64) for {seconds} s"));
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+}
+
+/// Runs the clear-only frame; true when every pixel has CLEAR_COLOR. The
+/// picture is returned too.
+pub fn run(hub: &Regs, core: &Regs) -> (bool, Vec<u32>) {
     let mut pt = match Dma::<[u32]>::zeroed_slice(PT_ENTRIES) {
         Ok(dma) => unsafe { dma.assume_init() },
         Err(err) => {
             say(&format!("render: FAIL: no 4 MiB for the page table: {err:?}"));
-            return false;
+            return (false, Vec::new());
         }
     };
     let mut arena = match Dma::<[u32]>::zeroed_slice(ARENA / 4) {
         Ok(dma) => unsafe { dma.assume_init() },
         Err(err) => {
             say(&format!("render: FAIL: no {} KiB of contiguous memory: {err:?}", ARENA / 1024));
-            return false;
+            return (false, Vec::new());
         }
     };
     let pt_phys = pt.physical();
@@ -296,7 +313,7 @@ pub fn run(hub: &Regs, core: &Regs) -> bool {
     hub.write(V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_ENABLE);
     if !mmu_flush(hub) {
         say("render: FAIL: MMU flush");
-        return false;
+        return (false, Vec::new());
     }
     let invalidate = || {
         core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS);
@@ -320,7 +337,7 @@ pub fn run(hub: &Regs, core: &Regs) -> bool {
     state(hub, core);
     if !binned {
         say("render: FAIL: the bin job did not finish");
-        return false;
+        return (false, Vec::new());
     }
 
     // Render job (v3d_render_job_run()).
@@ -335,7 +352,7 @@ pub fn run(hub: &Regs, core: &Regs) -> bool {
     state(hub, core);
     if !rendered {
         say("render: FAIL: the render job did not finish");
-        return false;
+        return (false, Vec::new());
     }
     core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_TMUWCF);
     wait("TMU write combiner flush", 100, || core.read(V3D_CTL_L2TCACTL) & V3D_L2TCACTL_TMUWCF == 0);
@@ -357,11 +374,11 @@ pub fn run(hub: &Regs, core: &Regs) -> bool {
     // The first row of tiles, one word per tile, for a quick look at partial results.
     let row: Vec<u32> = (0..TILES_X).map(|t| pixels[(t * TILE) as usize]).collect();
     say(&format!("render: first pixel of each tile in row 0: {row:#x?}"));
-    if right == pixels.len() {
+    let ok = right == pixels.len();
+    if ok {
         say(&format!("render: PASS: {WIDTH}x{HEIGHT} cleared to {CLEAR_COLOR:#010x} by bin and render control lists"));
-        true
     } else {
         say("render: FAIL: not every pixel has the clear colour");
-        false
     }
+    (ok, pixels.to_vec())
 }
