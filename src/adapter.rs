@@ -19,7 +19,7 @@ use driver_graphics::kms::connector::{modeinfo_for_size, KmsConnectorDriver, Kms
 use driver_graphics::kms::crtc::{KmsCrtc, KmsCrtcState};
 use driver_graphics::kms::framebuffer::KmsFramebuffer;
 use driver_graphics::kms::objects::{KmsObjectId, KmsObjects};
-use driver_graphics::kms::plane::{KmsPlane, KmsPlaneDriver, KmsPlaneState};
+use driver_graphics::kms::plane::{KmsPlane, KmsPlaneDriver, KmsPlaneState, KmsPlaneType};
 use driver_graphics::{Buffer, Damage, DumbBufferConfig, GraphicsAdapter};
 use syscall::PAGE_SIZE;
 
@@ -39,6 +39,10 @@ const LIST_SLOTS: [usize; 3] = [0x800, 0x840, 0x880];
 
 /// Orbital draws its pointer into a 64x64 ARGB buffer.
 const CURSOR_SIZE: u32 = 64;
+/// Overlay planes between the primary plane and the cursor, for windows
+/// that a compositor shows by themselves (Orbital: the window being
+/// dragged), so a move only changes the display list.
+pub const OVERLAYS: usize = 3;
 
 #[derive(Debug)]
 pub struct Vc4Adapter {
@@ -57,6 +61,8 @@ pub struct Vc4Adapter {
     pub list_pending: bool,
     pub primary: Option<Shown>,
     pub cursor: Option<Shown>,
+    /// The overlay planes, bottom to top.
+    pub overlays: Vec<Option<Shown>>,
     /// A client set no mode: the screen shows only the background.
     pub blanked: bool,
     /// Log every new display list, not only the first few.
@@ -194,8 +200,9 @@ impl Vc4Adapter {
         let planes: Vec<Plane> = if self.blanked {
             Vec::new()
         } else {
-            [Some(primary), self.cursor.as_ref()]
-                .into_iter()
+            std::iter::once(Some(primary))
+                .chain(self.overlays.iter().map(Option::as_ref))
+                .chain(std::iter::once(self.cursor.as_ref()))
                 .flatten()
                 .map(|shown| shown.plane)
                 .collect()
@@ -203,8 +210,9 @@ impl Vc4Adapter {
         *self.shown.lock().unwrap() = if self.blanked {
             Vec::new()
         } else {
-            [Some(primary), self.cursor.as_ref()]
-                .into_iter()
+            std::iter::once(Some(primary))
+                .chain(self.overlays.iter().map(Option::as_ref))
+                .chain(std::iter::once(self.cursor.as_ref()))
                 .flatten()
                 .map(|s| ShotPlane { plane: s.plane, pixels: s.pixels, _buffer: s._buffer.clone() })
                 .collect()
@@ -373,6 +381,8 @@ impl KmsConnectorDriver for Connector {
 #[derive(Debug)]
 pub struct Vc4Plane {
     cursor: bool,
+    /// The overlay plane's index, None for the primary and cursor planes.
+    overlay: Option<usize>,
 }
 
 impl KmsPlaneDriver for Vc4Plane {
@@ -399,10 +409,14 @@ impl GraphicsAdapter for Vc4Adapter {
         let (crtc, _primary_plane_id) = objects.add_crtc(
             (),
             (),
-            Vc4Plane { cursor: false },
+            Vc4Plane { cursor: false, overlay: None },
             (),
-            Some((Vc4Plane { cursor: true }, ())),
+            Some((Vc4Plane { cursor: true, overlay: None }, ())),
         );
+        for index in 0..OVERLAYS {
+            objects.add_plane(&[crtc], KmsPlaneType::Overlay, false, Vc4Plane { cursor: false, overlay: Some(index) }, ());
+        }
+        self.overlays = vec![None; OVERLAYS];
         objects.add_connector(Connector, (), &[crtc]);
     }
 
@@ -443,9 +457,10 @@ impl GraphicsAdapter for Vc4Adapter {
     }
 
     fn create_dumb_buffer(&mut self, width: u32, height: u32) -> (Self::Buffer, u32) {
-        // With flip only the cursor is scanned out from a client's buffer;
-        // the others are copied from, so they live in cached memory.
-        if self.flip.is_some() && (width > CURSOR_SIZE || height > CURSOR_SIZE) {
+        // With flip a screen-sized buffer (the console's, Orbital's
+        // framebuffer) is copied from, so it lives in cached memory; smaller
+        // ones (the cursor, overlay windows) are scanned out directly.
+        if self.flip.is_some() && width >= self.channel.width && height >= self.channel.height {
             return (Vc4Buffer::normal(width as usize, height as usize), width * 4);
         }
         (Vc4Buffer::new(width as usize, height as usize), width * 4)
@@ -485,7 +500,11 @@ impl GraphicsAdapter for Vc4Adapter {
         damage: Option<Damage>,
     ) -> syscall::Result<()> {
         let cursor = plane.driver_data.cursor;
-        if cursor {
+        let overlay = plane.driver_data.overlay;
+        if let Some(index) = overlay {
+            let rect = &new_plane_state.crtc_rect;
+            crate::trace::event("overlay", (rect.x.max(0) as u32, rect.y.max(0) as u32, index as u32, new_plane_state.fb.is_some() as u32), 0);
+        } else if cursor {
             let rect = &new_plane_state.crtc_rect;
             crate::trace::event("cursor", (rect.x.max(0) as u32, rect.y.max(0) as u32, 0, 0), 0);
         } else if let Some(d) = damage {
@@ -501,14 +520,40 @@ impl GraphicsAdapter for Vc4Adapter {
                 let rect = &new_plane_state.crtc_rect;
                 self.place(fb, rect.x - hot_x, rect.y - hot_y, true)
             }
+            (Some(fb), Some(_)) if overlay.is_some() => {
+                let rect = &new_plane_state.crtc_rect;
+                let shown = self.place(fb, rect.x, rect.y, true);
+                if self.log_lists {
+                    println!(
+                        "vc4d: overlay {}: at {},{} fb {}x{} dma {} -> {}",
+                        overlay.unwrap_or(0), rect.x, rect.y, fb.width, fb.height,
+                        fb.buffer.dma.is_some(), if shown.is_some() { "shown" } else { "refused" }
+                    );
+                }
+                match shown {
+                    Some(shown) => Some(shown),
+                    // Not in contiguous memory (or off screen): the client
+                    // has to draw the window itself.
+                    None => return Err(syscall::Error::new(syscall::EINVAL)),
+                }
+            }
             (Some(fb), Some(_)) if self.flip.is_some() => self.flip_primary(fb, damage),
             (Some(fb), Some(_)) => self.place(fb, 0, 0, false),
             _ => None,
         };
-        let old = if cursor { &mut self.cursor } else { &mut self.primary };
+        let old = match overlay {
+            Some(index) => &mut self.overlays[index],
+            None if cursor => &mut self.cursor,
+            None => &mut self.primary,
+        };
         let changed = old.as_ref().map(|s| s.plane) != shown.as_ref().map(|s| s.plane);
+        let hidden = shown.is_none();
         *old = shown;
-        if changed {
+        // A compositor hides an overlay after drawing its window into the
+        // primary plane; with that primary frame still waiting, the overlay
+        // goes with the frame's list, else the window would vanish for a
+        // frame.
+        if changed && !(overlay.is_some() && hidden && self.flip_pending()) {
             self.flipped();
         }
         *plane.state.lock().unwrap() = new_plane_state;

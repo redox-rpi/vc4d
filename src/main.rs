@@ -202,6 +202,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         list_pending: false,
         primary: None,
         cursor: None,
+        overlays: Vec::new(),
         blanked: false,
         log_lists: fake.is_some() || env::var("VC4D_LOG").is_ok(),
         lists: 0,
