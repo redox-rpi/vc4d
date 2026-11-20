@@ -83,6 +83,99 @@ const SCALER_POS2_WIDTH: Field = Field(11, 0);
 
 const SCALER_SRC_PITCH: Field = Field(15, 0);
 
+const SCALER_CTL0_SCL1: Field = Field(10, 8);
+const SCALER_CTL0_SCL0: Field = Field(7, 5);
+const SCALER_POS1_SCL_HEIGHT: Field = Field(27, 16);
+const SCALER_POS1_SCL_WIDTH: Field = Field(11, 0);
+const SCALER_PPF_AGC: u32 = 1 << 30;
+const SCALER_PPF_SCALE: Field = Field(24, 8);
+const SCALER_TPZ0_SCALE: Field = Field(28, 8);
+const SCALER_TPZ1_RECIP: Field = Field(15, 0);
+const SCALER_PPF_KERNEL_OFFSET: Field = Field(13, 0);
+
+/// Where vc4d puts the PPF filter kernel in display list memory (words),
+/// above its list slots.
+pub const KERNEL_START: usize = 0xa00;
+
+/// The Mitchell/Netravali (B = C = 1/3) filter kernel for the PPF scaler,
+/// as vc4_hvs_upload_linear_kernel() writes it: the first six words, then
+/// the first five again in reverse order.
+pub fn ppf_kernel() -> [u32; 11] {
+    const fn word(c0: i32, c1: i32, c2: i32) -> u32 {
+        ((c0 as u32) & 0x1ff) | (((c1 as u32) & 0x1ff) << 9) | (((c2 as u32) & 0x1ff) << 18)
+    }
+    let half = [
+        word(0, -2, -6),
+        word(-8, -10, -8),
+        word(-3, 2, 18),
+        word(50, 82, 119),
+        word(155, 187, 213),
+        word(227, 227, 0),
+    ];
+    let mut k = [0; 11];
+    for i in 0..11 {
+        k[i] = if i < 6 { half[i] } else { half[10 - i] };
+    }
+    k
+}
+
+/// How one axis of a plane is scaled (vc4_get_scaling_mode()).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Scaling {
+    None,
+    /// Polyphase filter: up, or down to two thirds.
+    Ppf,
+    /// Trapezoidal: further down.
+    Tpz,
+}
+
+fn scaling(src: u32, dst: u32) -> Scaling {
+    if src == dst {
+        Scaling::None
+    } else if 3 * dst >= 2 * src {
+        Scaling::Ppf
+    } else {
+        Scaling::Tpz
+    }
+}
+
+/// The SCL0/SCL1 field for an RGB plane (vc4_get_scl_field()).
+fn scl_field(x: Scaling, y: Scaling) -> u32 {
+    use Scaling::*;
+    match (x, y) {
+        (Ppf, Ppf) => 0,
+        (Tpz, Ppf) => 1,
+        (Ppf, Tpz) => 2,
+        (Tpz, Tpz) => 3,
+        (Ppf, None) => 4,
+        (None, Ppf) => 5,
+        (None, Tpz) => 6,
+        (Tpz, None) => 7,
+        (None, None) => 0,
+    }
+}
+
+/// Line buffer memory a scaled plane needs, in LBM words (vc4_lbm_size()):
+/// none without vertical scaling.
+pub fn lbm_words(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> u32 {
+    let y = scaling(src_h, dst_h);
+    if y == Scaling::None {
+        return 0;
+    }
+    let pix_per_line = if scaling(src_w, dst_w) == Scaling::Tpz { dst_w } else { src_w };
+    let bytes = pix_per_line * if y == Scaling::Tpz { 8 } else { 16 };
+    bytes.next_multiple_of(64) / 2
+}
+
+/// A plane shown at another size than its source: the size on the screen
+/// and where its line buffer starts in the HVS's LBM.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scale {
+    pub width: u32,
+    pub height: u32,
+    pub lbm: u32,
+}
+
 const HVS_PIXEL_FORMAT_RGBA8888: u32 = 7;
 const HVS_PIXEL_ORDER_ABGR: u32 = 3;
 
@@ -120,18 +213,85 @@ pub struct Plane {
     pub height: u32,
     /// ARGB with per-pixel alpha (not premultiplied); else XRGB, opaque.
     pub alpha: bool,
+    /// Shown scaled to another size; None: at its own size.
+    pub scale: Option<Scale>,
 }
 
 impl Plane {
     /// The plane's words of a display list, as vc4_plane_mode_set() writes
     /// them for an unscaled linear RGB plane.
-    pub fn words(&self) -> [u32; 7] {
-        let alpha_mode = if self.alpha {
-            // DRM_MODE_BLEND_COVERAGE: per-pixel alpha, not premultiplied.
-            SCALER_POS2_ALPHA_MODE_PIPELINE
-        } else {
-            SCALER_POS2_ALPHA_MODE_FIXED
-        };
+    pub fn words(&self) -> Vec<u32> {
+        match self.scale {
+            Some(scale) if (scale.width, scale.height) != (self.width, self.height) => self.scaled_words(scale),
+            _ => self.unity_words().to_vec(),
+        }
+    }
+
+    fn alpha_mode(&self) -> u32 {
+        if self.alpha { SCALER_POS2_ALPHA_MODE_PIPELINE } else { SCALER_POS2_ALPHA_MODE_FIXED }
+    }
+
+    /// The words vc4_plane_mode_set() writes for a scaled linear RGB plane.
+    fn scaled_words(&self, scale: Scale) -> Vec<u32> {
+        let x = scaling(self.width, scale.width);
+        let y = scaling(self.height, scale.height);
+        let scl = scl_field(x, y);
+        let mut w = vec![
+            0, // control word 0, below, once the size is known
+            SCALER_POS0_FIXED_ALPHA.set(0xff)
+                | SCALER_POS0_START_X.set(self.x)
+                | SCALER_POS0_START_Y.set(self.y),
+            // Position word 1: the size on the screen.
+            SCALER_POS1_SCL_WIDTH.set(scale.width) | SCALER_POS1_SCL_HEIGHT.set(scale.height),
+            // Position word 2: the source size.
+            SCALER_POS2_ALPHA_MODE.set(self.alpha_mode())
+                | SCALER_POS2_WIDTH.set(self.width)
+                | SCALER_POS2_HEIGHT.set(self.height),
+            CONTEXT,
+            self.bus,
+            CONTEXT,
+            SCALER_SRC_PITCH.set(self.pitch),
+        ];
+        if y != Scaling::None {
+            // LBM base address.
+            w.push(scale.lbm);
+        }
+        let factor = |src: u32, dst: u32| ((1u64 << 16) * u64::from(src) / u64::from(dst)) as u32;
+        if x == Scaling::Ppf {
+            w.push(SCALER_PPF_AGC | SCALER_PPF_SCALE.set(factor(self.width, scale.width)));
+        }
+        if y == Scaling::Ppf {
+            w.push(SCALER_PPF_AGC | SCALER_PPF_SCALE.set(factor(self.height, scale.height)));
+            w.push(CONTEXT);
+        }
+        if x == Scaling::Tpz {
+            let f = factor(self.width, scale.width);
+            w.push(SCALER_TPZ0_SCALE.set(f));
+            w.push(SCALER_TPZ1_RECIP.set(u32::MAX / f));
+        }
+        if y == Scaling::Tpz {
+            let f = factor(self.height, scale.height);
+            w.push(SCALER_TPZ0_SCALE.set(f));
+            w.push(SCALER_TPZ1_RECIP.set(u32::MAX / f));
+            w.push(CONTEXT);
+        }
+        if x == Scaling::Ppf || y == Scaling::Ppf {
+            // Kernel pointers: H and V PPF of planes 0 and 1.
+            let kernel = SCALER_PPF_KERNEL_OFFSET.set(KERNEL_START as u32);
+            w.extend_from_slice(&[kernel; 4]);
+        }
+        w[0] = SCALER_CTL0_VALID
+            | SCALER_CTL0_ORDER.set(HVS_PIXEL_ORDER_ABGR)
+            | SCALER_CTL0_PIXEL_FORMAT.set(HVS_PIXEL_FORMAT_RGBA8888)
+            | SCALER_CTL0_SCL0.set(scl)
+            | SCALER_CTL0_SCL1.set(scl)
+            | SCALER_CTL0_SIZE.set(w.len() as u32);
+        w
+    }
+
+    fn unity_words(&self) -> [u32; 7] {
+        // DRM_MODE_BLEND_COVERAGE (per-pixel alpha, not premultiplied), or fixed.
+        let alpha_mode = self.alpha_mode();
         [
             // Control word 0: an unscaled RGBA8888 plane of 7 words.
             SCALER_CTL0_VALID
@@ -396,6 +556,11 @@ impl Hvs {
         self.reg(SCALER_DLIST_START + word * 4)
     }
 
+    /// Put the PPF filter kernel at KERNEL_START, for scaled planes.
+    pub fn upload_kernel(&self) {
+        self.write_dlist(KERNEL_START, &ppf_kernel());
+    }
+
     pub fn write_dlist(&self, start: usize, words: &[u32]) {
         assert!(start >= HVS_BOOTLOADER_DLIST_END && start + words.len() <= SCALER_DLIST_WORDS);
         for (i, &word) in words.iter().enumerate() {
@@ -451,6 +616,7 @@ mod tests {
             width: 1824,
             height: 984,
             alpha: false,
+            scale: None,
         };
         let list = display_list(&[plane]);
         assert_eq!(
@@ -480,6 +646,7 @@ mod tests {
             width: 64,
             height: 64,
             alpha: true,
+            scale: None,
         };
         let words = plane.words();
         assert_eq!(words[1], 0xff00_0000 | 50 << 12 | 100);
@@ -490,7 +657,7 @@ mod tests {
     fn read_list_past_alpha() {
         // Position word 0 has the alpha 0xff in its top byte, bit 31.
         let hvs = Hvs::fake(640, 480);
-        let plane = Plane { bus: 0xc000_0000, pitch: 2560, x: 0, y: 0, width: 640, height: 480, alpha: false };
+        let plane = Plane { bus: 0xc000_0000, pitch: 2560, x: 0, y: 0, width: 640, height: 480, alpha: false, scale: None };
         let list = display_list(&[plane, plane]);
         hvs.write_dlist(0x800, &list);
         assert_eq!(hvs.read_list(0x800, 32), list);
@@ -499,8 +666,8 @@ mod tests {
 
     #[test]
     fn decode_own_list() {
-        let cursor = Plane { bus: 0xc100_0000, pitch: 256, x: 5, y: 7, width: 64, height: 64, alpha: true };
-        let screen = Plane { bus: 0xc000_0000, pitch: 7680, x: 0, y: 0, width: 1920, height: 1080, alpha: false };
+        let cursor = Plane { bus: 0xc100_0000, pitch: 256, x: 5, y: 7, width: 64, height: 64, alpha: true, scale: None };
+        let screen = Plane { bus: 0xc000_0000, pitch: 7680, x: 0, y: 0, width: 1920, height: 1080, alpha: false, scale: None };
         let planes = decode_list(&display_list(&[screen, cursor]));
         assert_eq!(planes.len(), 2);
         let c = planes[1];
@@ -522,5 +689,52 @@ mod tests {
         let p = planes[0];
         assert!(!p.unity);
         assert_eq!((p.x, p.y, p.width, p.height), (0, 22, 1920, 1035));
+    }
+
+    #[test]
+    fn scaled_up_plane() {
+        // 1280x720 shown at 1920x1080: PPF on both axes.
+        let plane = Plane {
+            bus: 0xc000_0000,
+            pitch: 1280 * 4,
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+            alpha: false,
+            scale: Some(Scale { width: 1920, height: 1080, lbm: 0 }),
+        };
+        let w = plane.words();
+        assert_eq!(w.len(), 16);
+        assert_eq!(w[0] & 0x3f00_0000, 16 << 24);
+        assert_eq!(w[0] & SCALER_CTL0_UNITY, 0);
+        assert_eq!(SCALER_CTL0_SCL0.get(w[0]), 0);
+        assert_eq!(w[2], 1080 << 16 | 1920);
+        assert_eq!(w[3], 0x4000_0000 | 720 << 16 | 1280);
+        assert_eq!(w[8], 0); // LBM
+        assert_eq!(w[9], SCALER_PPF_AGC | SCALER_PPF_SCALE.set(43690)); // 2/3
+        assert_eq!(w[10], SCALER_PPF_AGC | SCALER_PPF_SCALE.set(43690));
+        assert_eq!(w[11], CONTEXT);
+        assert_eq!(&w[12..], &[KERNEL_START as u32; 4]);
+        assert_eq!(lbm_words(1280, 720, 1920, 1080), 1280 * 8);
+    }
+
+    #[test]
+    fn same_size_scale_is_unity() {
+        let plane = Plane {
+            bus: 0, pitch: 256, x: 0, y: 0, width: 64, height: 64, alpha: true,
+            scale: Some(Scale { width: 64, height: 64, lbm: 0 }),
+        };
+        assert_eq!(plane.words().len(), 7);
+        assert_ne!(plane.words()[0] & SCALER_CTL0_UNITY, 0);
+    }
+
+    #[test]
+    fn kernel_is_symmetric() {
+        let k = ppf_kernel();
+        for i in 0..5 {
+            assert_eq!(k[i], k[10 - i]);
+        }
+        assert_eq!(k[5] & 0x1ff, 227);
     }
 }

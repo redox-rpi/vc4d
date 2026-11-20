@@ -134,6 +134,7 @@ pub fn self_check(hvs: &Hvs, channel: Channel, ram_bus_offset: usize, fake: bool
         width: width as u32,
         height: height as u32,
         alpha: false,
+        scale: None,
     };
     let at = |x: u32, y: u32| Plane {
         bus: (cursor.physical() + ram_bus_offset) as u32,
@@ -143,6 +144,7 @@ pub fn self_check(hvs: &Hvs, channel: Channel, ram_bus_offset: usize, fake: bool
         width: 64.min(channel.width - x),
         height: 64.min(channel.height - y),
         alpha: true,
+        scale: None,
     };
     let moves = [(16, 16), (channel.width / 2, channel.height / 2)];
 

@@ -179,13 +179,32 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     }
     let shown = shot::Shown::default();
 
+    // The mode clients get: /etc/vc4d-mode ("1280x720"), shown scaled to
+    // the firmware's mode by the HVS. Smaller modes mean fewer pixels to
+    // draw and copy.
+    let screen = std::fs::read_to_string("/etc/vc4d-mode")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.trim().split_once('x')?;
+            Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+        })
+        .filter(|&(w, h)| (64..=channel.width).contains(&w) && (64..=channel.height).contains(&h))
+        .unwrap_or((channel.width, channel.height));
+    if screen != (channel.width, channel.height) {
+        hvs.upload_kernel();
+        println!(
+            "vc4d: mode: {}x{} for clients, scaled to {}x{} (/etc/vc4d-mode)",
+            screen.0, screen.1, channel.width, channel.height
+        );
+    }
+
     let flip_off = env::var("VC4D_FLIP").is_ok_and(|v| v == "off")
         || std::path::Path::new("/etc/vc4d-flip-off").exists();
     let flip = if flip_off {
         println!("vc4d: flip: off (VC4D_FLIP=off or /etc/vc4d-flip-off), clients' buffers scanned out directly");
         None
     } else {
-        let flip = adapter::Flip::new(channel.width, channel.height);
+        let flip = adapter::Flip::new(screen.0, screen.1);
         println!(
             "vc4d: flip: {}",
             if flip.is_some() { "two scanout buffers, damage copied" } else { "no contiguous memory for two buffers, off" }
@@ -196,6 +215,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         firmware_list: hvs.list_start(channel.index),
         hvs,
         channel,
+        screen,
         ram_bus_offset,
         next_slot: 0,
         list_frame: None,
