@@ -19,4 +19,6 @@ driver-graphics = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev =
 drm-sys = "0.8.1"
 fdt = { git = "https://github.com/repnop/fdt.git", rev = "059bb23" }
 redox_event = "0.4.8"
+redox-scheme = { version = "0.12.0", default-features = false }
+scheme-utils = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "eddcaa21fb2d11b4a6bd64478e0639153266dc04" }
 redox_syscall = { version = "0.9.5", features = ["std"] }

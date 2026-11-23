@@ -18,6 +18,7 @@
 //
 // v3dprobe [--csd] [--render [--triangle | --triangle-math] [--show SECONDS]]
 //          [--off] [--no-watchdog]
+// v3dprobe --via-v3dd [--loops N]
 //   --show: the rendered picture in an Orbital window for SECONDS (step 2c)
 //   --render: step 2 (redox-rpi#596): bin and render control lists, see
 //     v3d/render.rs; clear only, or with --triangle a red triangle whose
@@ -26,6 +27,8 @@
 //   --csd: step 1 (redox-rpi#595): MMU page table and one compute job, see
 //     v3d/csd.rs
 //   --off: close the bridges, assert the reset and power V3D off afterwards
+//   --via-v3dd: step 3 (redox-rpi#598): the --csd job N times (default
+//     100) through v3dd and /scheme/v3d; touches no registers itself.
 //   --no-watchdog: do not arm the SoC watchdog around the V3D accesses
 //
 // The first V3D accesses can hang the bus (a block without power or clock).
@@ -118,6 +121,12 @@ impl Regs {
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    // Step 3 (redox-rpi#598): the CSD job through v3dd, no register access.
+    if args.iter().any(|a| a == "--via-v3dd") {
+        let loops = args.iter().position(|a| a == "--loops").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(100);
+        std::process::exit(if csd::via_v3dd(loops) { 0 } else { 1 });
+    }
     common::init();
     let off = env::args().any(|a| a == "--off");
     let watchdog = !env::args().any(|a| a == "--no-watchdog");
@@ -130,7 +139,6 @@ fn main() {
     } else {
         render::Draw::Clear
     };
-    let args: Vec<String> = env::args().collect();
     let show_secs: Option<u64> =
         args.iter().position(|a| a == "--show").map(|i| args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(30));
     let mut picture = Vec::new();
