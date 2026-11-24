@@ -416,7 +416,8 @@ fn nothing_left() -> Result<String, String> {
 /// scheme calls. GET_PARAM; BOs made, mapped, located and closed by ioctl;
 /// `loops` compute jobs by SUBMIT_CSD and WAIT_BO; wrong arguments; then an
 /// endless bin job by SUBMIT_CL: WAIT_BO answers ETIME at timeout 0 while
-/// it runs, and EIO when it has failed.
+/// it runs, and EIO when it has failed. Sync objects (G3 step 2, #669):
+/// out_sync of a submit, SYNCOBJ_WAIT for all and for any, reset, signal.
 fn ioctl_check(loops: u32) -> Result<String, String> {
     use uapi::*;
     let mut v3d = client::Client::open()?;
@@ -482,6 +483,40 @@ fn ioctl_check(loops: u32) -> Result<String, String> {
     }
     let us = start.elapsed().as_micros() / loops.max(1) as u128;
     wait(&mut v3d, &result, 0).map_err(|e| format!("WAIT_BO on an idle BO with timeout 0: {e}"))?;
+    // Sync objects (G3 step 2): made, signalled by a job, reset, signalled.
+    let syncobj = |v3d: &mut client::Client, flags: u32| {
+        call(v3d, SYNCOBJ_CREATE, &SyncobjCreate { flags, ..Default::default() }, &[]).map(|s| s.handle)
+    };
+    // Timeout: an absolute CLOCK_MONOTONIC time; 0 lies in the past.
+    let sync_wait = |v3d: &mut client::Client, syncs: &[u32], flags: u32, timeout_nsec: i64| {
+        let arg = SyncobjWait { timeout_nsec, count_handles: syncs.len() as u32, flags, ..Default::default() };
+        call(v3d, SYNCOBJ_WAIT, &arg, syncs).map(|w| w.first_signaled)
+    };
+    let s = syncobj(&mut v3d, 0).map_err(|e| format!("SYNCOBJ_CREATE: {e}"))?;
+    let t = syncobj(&mut v3d, SYNCOBJ_CREATE_SIGNALED).map_err(|e| format!("SYNCOBJ_CREATE signalled: {e}"))?;
+    sync_wait(&mut v3d, &[t], 0, 0).map_err(|e| format!("SYNCOBJ_WAIT on a signalled syncobj: {e}"))?;
+    expect_err("SYNCOBJ_WAIT on a syncobj without fence", sync_wait(&mut v3d, &[s], 0, 0).map(|_| ()), syscall::EINVAL)?;
+    expect_err(
+        "SYNCOBJ_WAIT for its submit",
+        sync_wait(&mut v3d, &[s], SYNCOBJ_WAIT_FOR_SUBMIT, 0).map(|_| ()),
+        syscall::ETIME,
+    )?;
+    let constant = csd::constant(0xbeef);
+    v3d.fill(&result, 0, 16, 0xdead_0000)?;
+    v3d.put(&unif, 0, &[result.va, constant])?;
+    let arg = SubmitCsd { cfg: csd::job_cfg(code.va, unif.va), bo_handle_count: 3, out_sync: s, ..Default::default() };
+    call(&mut v3d, SUBMIT_CSD, &arg, &[code.id, unif.id, result.id]).map_err(|e| format!("SUBMIT_CSD with out_sync: {e}"))?;
+    sync_wait(&mut v3d, &[s], SYNCOBJ_WAIT_ALL, i64::MAX).map_err(|e| format!("SYNCOBJ_WAIT on the job: {e}"))?;
+    let got = v3d.get(&result, 0, 16)?;
+    if got != csd::want(constant) {
+        return Err(format!("after SYNCOBJ_WAIT: result {got:#x?}, want {:#x?}", csd::want(constant)));
+    }
+    call(&mut v3d, SYNCOBJ_RESET, &SyncobjArray { count_handles: 1, pad: 0 }, &[s]).map_err(|e| format!("SYNCOBJ_RESET: {e}"))?;
+    expect_err("SYNCOBJ_WAIT after a reset", sync_wait(&mut v3d, &[s], 0, i64::MAX).map(|_| ()), syscall::EINVAL)?;
+    call(&mut v3d, SYNCOBJ_SIGNAL, &SyncobjArray { count_handles: 1, pad: 0 }, &[s]).map_err(|e| format!("SYNCOBJ_SIGNAL: {e}"))?;
+    sync_wait(&mut v3d, &[s], 0, 0).map_err(|e| format!("SYNCOBJ_WAIT after a signal: {e}"))?;
+    let arg = SubmitCsd { cfg: csd::job_cfg(code.va, unif.va), bo_handle_count: 1, out_sync: 999, ..Default::default() };
+    expect_err("SUBMIT_CSD with out_sync 999", call(&mut v3d, SUBMIT_CSD, &arg, &[code.id]).map(|_| ()), syscall::ENOENT)?;
     expect_err("WAIT_BO on handle 999", wait(&mut v3d, &client::Bo { id: 999, va: 0 }, 0), syscall::ENOENT)?;
     let arg = SubmitCsd { cfg: csd::job_cfg(code.va, unif.va), bo_handle_count: 1, ..Default::default() };
     expect_err("SUBMIT_CSD naming handle 999", call(&mut v3d, SUBMIT_CSD, &arg, &[999]).map(|_| ()), syscall::ENOENT)?;
@@ -490,19 +525,38 @@ fn ioctl_check(loops: u32) -> Result<String, String> {
     // The endless bin job: busy, then failed.
     let (endless, _) = render::endless_job(&mut v3d)?;
     let end = endless.va + 0x100;
+    let e = syncobj(&mut v3d, 0).map_err(|e| format!("SYNCOBJ_CREATE: {e}"))?;
     let arg = SubmitCl {
         bcl_start: endless.va,
         bcl_end: end,
         rcl_start: endless.va,
         rcl_end: end,
         bo_handle_count: 1,
+        out_sync: e,
         ..Default::default()
     };
     call(&mut v3d, SUBMIT_CL, &arg, &[endless.id]).map_err(|e| format!("SUBMIT_CL: {e}"))?;
     expect_err("WAIT_BO with timeout 0 on the endless job", wait(&mut v3d, &endless, 0), syscall::ETIME)?;
+    expect_err("SYNCOBJ_WAIT with timeout 0 on the endless job", sync_wait(&mut v3d, &[e], 0, 0).map(|_| ()), syscall::ETIME)?;
+    // Any of the two: the signalled one, at once.
+    match sync_wait(&mut v3d, &[e, t], 0, i64::MAX) {
+        Ok(1) => {}
+        other => return Err(format!("SYNCOBJ_WAIT for any of the endless job and a signalled one: {other:?}, want Ok(1)")),
+    }
+    // A failed job signals its syncobj too; WAIT_BO tells it failed.
     let start = Instant::now();
-    expect_err("WAIT_BO on the endless job", wait(&mut v3d, &endless, u64::MAX), syscall::EIO)?;
+    sync_wait(&mut v3d, &[e], SYNCOBJ_WAIT_ALL, i64::MAX).map_err(|e| format!("SYNCOBJ_WAIT on the endless job: {e}"))?;
     let waited = start.elapsed().as_millis();
+    expect_err("WAIT_BO on the endless job", wait(&mut v3d, &endless, u64::MAX), syscall::EIO)?;
+    for sync in [s, t, e] {
+        call(&mut v3d, SYNCOBJ_DESTROY, &SyncobjDestroy { handle: sync, pad: 0 }, &[])
+            .map_err(|e| format!("SYNCOBJ_DESTROY {sync}: {e}"))?;
+    }
+    expect_err(
+        "SYNCOBJ_DESTROY twice",
+        call(&mut v3d, SYNCOBJ_DESTROY, &SyncobjDestroy { handle: s, pad: 0 }, &[]).map(|_| ()),
+        syscall::ENOENT,
+    )?;
     for bo in [&code, &unif, &result, &endless] {
         v3d.unmap(bo.id);
         call(&mut v3d, GEM_CLOSE, &GemClose { handle: bo.id, ..Default::default() }, &[])
@@ -514,7 +568,7 @@ fn ioctl_check(loops: u32) -> Result<String, String> {
         syscall::ENOENT,
     )?;
     Ok(format!(
-        "HUB_IDENT1 {ident1:#x}; {loops} of {loops} jobs right, {us} us per job round trip; wrong arguments refused; endless job: ETIME, then EIO after {waited} ms"
+        "HUB_IDENT1 {ident1:#x}; {loops} of {loops} jobs right, {us} us per job round trip; wrong arguments refused; syncobjs signalled, reset and waited on; endless job: ETIME, then signalled after {waited} ms and EIO"
     ))
 }
 

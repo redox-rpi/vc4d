@@ -1099,8 +1099,77 @@ struct Client {
     space: Option<u32>,
     /// The last job that named each BO in its submit (binary interface).
     bo_jobs: BTreeMap<u32, u64>,
-    /// WAIT_BO calls held until their job is done.
-    held_calls: Vec<(u64, HeldRead)>,
+    /// WAIT_BO and SYNCOBJ_WAIT calls held until a job is done.
+    held_calls: Vec<(u64, HeldCall)>,
+    /// DRM sync objects: None has no fence yet (made unsignalled, or
+    /// reset); Some(job) is signalled once that job is done (job 0: at
+    /// once).
+    syncobjs: BTreeMap<u32, Option<u64>>,
+    next_syncobj: u32,
+}
+
+/// A held binary-interface call and how to answer it.
+struct HeldCall {
+    held: HeldRead,
+    /// WAIT_BO: EIO if the job it waits for failed.
+    wait_bo: bool,
+    /// SYNCOBJ_WAIT for any: the index of the handle that is signalled
+    /// when the job it waits for is done.
+    first_signaled: Option<u32>,
+}
+
+/// Where a SYNCOBJ_WAIT stands.
+enum SyncWait {
+    /// Done; the first signalled handle (for a wait on any).
+    Done(u32),
+    /// Waits for this job; the index of its handle.
+    Job(u64, u32),
+    /// Waits for a submit that has not come (WAIT_FOR_SUBMIT): v3dd does
+    /// not hold such a wait, it answers ETIME.
+    Submit,
+}
+
+fn sync_wait(client: &Client, handles: &[u32], flags: u32, done: u64) -> Result<SyncWait> {
+    if flags & !(uapi::SYNCOBJ_WAIT_ALL | uapi::SYNCOBJ_WAIT_FOR_SUBMIT | uapi::SYNCOBJ_WAIT_AVAILABLE) != 0 || handles.is_empty() {
+        return Err(Error::new(EINVAL));
+    }
+    let all = flags & uapi::SYNCOBJ_WAIT_ALL != 0;
+    // The latest job (all) or the earliest (any) not done yet.
+    let mut wait: Option<(u64, u32)> = None;
+    let mut unsubmitted = false;
+    for (i, h) in handles.iter().enumerate() {
+        let i = i as u32;
+        match *client.syncobjs.get(h).ok_or(Error::new(ENOENT))? {
+            None if flags & uapi::SYNCOBJ_WAIT_FOR_SUBMIT == 0 => return Err(Error::new(EINVAL)),
+            None => unsubmitted = true,
+            Some(job) if job <= done => {
+                if !all {
+                    return Ok(SyncWait::Done(i));
+                }
+            }
+            Some(job) => {
+                let later = |(w, _): (u64, u32)| if all { job > w } else { job < w };
+                if wait.is_none_or(later) {
+                    wait = Some((job, i));
+                }
+            }
+        }
+    }
+    Ok(match (unsubmitted, wait) {
+        (true, _) if all => SyncWait::Submit,
+        (_, Some((job, i))) => SyncWait::Job(job, i),
+        (true, None) => SyncWait::Submit,
+        (false, None) => SyncWait::Done(0),
+    })
+}
+
+/// CLOCK_MONOTONIC in ns, the clock of SYNCOBJ_WAIT's timeout.
+fn monotonic_ns() -> i64 {
+    let mut time = syscall::TimeSpec::default();
+    match File::open(format!("/scheme/time/{}", syscall::CLOCK_MONOTONIC)).and_then(|mut f| f.read(&mut time)) {
+        Ok(_) => time.tv_sec * 1_000_000_000 + time.tv_nsec as i64,
+        Err(_) => 0,
+    }
 }
 
 /// A new BO in the client's own address space (made with its first BO):
@@ -1264,10 +1333,18 @@ impl Shared {
                 self.reap(&mut state);
                 held
             };
-            for (waits, held) in calls {
-                let result = if failed && waits == job.id { Err(Error::new(EIO)) } else { Ok(0) };
-                if let Err(err) = self.socket.write_response(Response::new(result, held.op), SignalBehavior::Restart) {
-                    say(&format!("answer to a held WAIT_BO failed: {err}"));
+            for (waits, call) in calls {
+                let HeldCall { held: HeldRead { mut op, .. }, wait_bo, first_signaled } = call;
+                let result = if wait_bo && failed && waits == job.id { Err(Error::new(EIO)) } else { Ok(0) };
+                if let (Some(i), Op::Call(call)) = (first_signaled, &mut op) {
+                    let (payload, _) = call.payload_and_metadata();
+                    let at = uapi::SYNCOBJ_WAIT_FIRST_SIGNALED;
+                    if let Some(field) = payload.get_mut(at..at + 4) {
+                        field.copy_from_slice(&i.to_ne_bytes());
+                    }
+                }
+                if let Err(err) = self.socket.write_response(Response::new(result, op), SignalBehavior::Restart) {
+                    say(&format!("answer to a held wait failed: {err}"));
                 }
             }
             if let Some(HeldRead { caller, op }) = held {
@@ -1497,23 +1574,27 @@ impl V3dScheme {
                 Ok(0)
             }
             uapi::SUBMIT_CL | uapi::SUBMIT_CSD => {
-                let (kind, count, rest, extensions, flags_ok) = if func == uapi::SUBMIT_CL {
+                let (kind, count, rest, extensions, flags_ok, in_syncs, out_sync) = if func == uapi::SUBMIT_CL {
                     let (arg, rest) = uapi::read::<uapi::SubmitCl>(payload).ok_or_else(einval)?;
                     // A render job without a bin job is not supported yet.
                     if arg.bcl_start == arg.bcl_end {
                         return Err(einval());
                     }
                     let a = [arg.bcl_start, arg.bcl_end, arg.rcl_start, arg.rcl_end, arg.qma, arg.qms, arg.qts];
-                    (JobKind::Cl(a), arg.bo_handle_count, rest, arg.extensions, arg.flags & !uapi::SUBMIT_CL_FLUSH_CACHE == 0)
+                    let flags_ok = arg.flags & !uapi::SUBMIT_CL_FLUSH_CACHE == 0;
+                    (JobKind::Cl(a), arg.bo_handle_count, rest, arg.extensions, flags_ok, vec![arg.in_sync_bcl, arg.in_sync_rcl], arg.out_sync)
                 } else {
                     let (arg, rest) = uapi::read::<uapi::SubmitCsd>(payload).ok_or_else(einval)?;
-                    (JobKind::Csd(arg.cfg), arg.bo_handle_count, rest, arg.extensions, arg.flags == 0)
+                    (JobKind::Csd(arg.cfg), arg.bo_handle_count, rest, arg.extensions, arg.flags == 0, vec![arg.in_sync], arg.out_sync)
                 };
-                // No syncobjs yet: jobs run in the order they came, which
-                // covers in_sync on the client's own jobs; out_sync is not
-                // signalled, WAIT_BO waits.
+                // Jobs run in the order they came, so an in_sync of the
+                // client's own jobs is met already; it only has to exist.
+                // out_sync gets this job's fence.
                 if extensions != 0 || !flags_ok {
                     return Err(einval());
+                }
+                if in_syncs.iter().chain([&out_sync]).any(|&s| s != 0 && !client.syncobjs.contains_key(&s)) {
+                    return Err(Error::new(ENOENT));
                 }
                 let bos = uapi::handles(rest, count).ok_or_else(einval)?;
                 if bos.iter().any(|h| !client.bos.contains_key(h)) {
@@ -1523,7 +1604,53 @@ impl V3dScheme {
                 for h in bos {
                     client.bo_jobs.insert(h, job);
                 }
+                if out_sync != 0 {
+                    client.syncobjs.insert(out_sync, Some(job));
+                }
                 Ok(0)
+            }
+            uapi::SYNCOBJ_CREATE => {
+                let (mut arg, _) = uapi::read::<uapi::SyncobjCreate>(payload).ok_or_else(einval)?;
+                if arg.flags & !uapi::SYNCOBJ_CREATE_SIGNALED != 0 {
+                    return Err(einval());
+                }
+                client.next_syncobj += 1;
+                arg.handle = client.next_syncobj;
+                let fence = (arg.flags & uapi::SYNCOBJ_CREATE_SIGNALED != 0).then_some(0);
+                client.syncobjs.insert(arg.handle, fence);
+                uapi::write(payload, &arg);
+                Ok(0)
+            }
+            uapi::SYNCOBJ_DESTROY => {
+                let (arg, _) = uapi::read::<uapi::SyncobjDestroy>(payload).ok_or_else(einval)?;
+                client.syncobjs.remove(&arg.handle).ok_or(Error::new(ENOENT))?;
+                Ok(0)
+            }
+            uapi::SYNCOBJ_RESET | uapi::SYNCOBJ_SIGNAL => {
+                let (arg, rest) = uapi::read::<uapi::SyncobjArray>(payload).ok_or_else(einval)?;
+                let syncs = uapi::handles(rest, arg.count_handles).ok_or_else(einval)?;
+                if syncs.iter().any(|s| !client.syncobjs.contains_key(s)) {
+                    return Err(Error::new(ENOENT));
+                }
+                let fence = (func == uapi::SYNCOBJ_SIGNAL).then_some(0);
+                for s in syncs {
+                    client.syncobjs.insert(s, fence);
+                }
+                Ok(0)
+            }
+            uapi::SYNCOBJ_WAIT => {
+                // A wait that can still end before its timeout was held
+                // (hold_op); here it is done, or it has timed out.
+                let (mut arg, rest) = uapi::read::<uapi::SyncobjWait>(payload).ok_or_else(einval)?;
+                let syncs = uapi::handles(rest, arg.count_handles).ok_or_else(einval)?;
+                match sync_wait(client, &syncs, arg.flags, *done_through)? {
+                    SyncWait::Done(first) => {
+                        arg.first_signaled = first;
+                        uapi::write(payload, &arg);
+                        Ok(0)
+                    }
+                    SyncWait::Job(..) | SyncWait::Submit => Err(Error::new(ETIME)),
+                }
             }
             uapi::WAIT_BO => {
                 let (arg, _) = uapi::read::<uapi::WaitBo>(payload).ok_or_else(einval)?;
@@ -1581,6 +1708,8 @@ impl SchemeSync for V3dScheme {
             space: None,
             bo_jobs: BTreeMap::new(),
             held_calls: Vec::new(),
+            syncobjs: BTreeMap::new(),
+            next_syncobj: 0,
         });
         Ok(OpenResult::ThisScheme { number: state.handles.insert(handle), flags: NewFdFlags::empty() })
     }
@@ -1680,18 +1809,36 @@ fn main() {
     daemon::SchemeDaemon::new(daemon);
 }
 
+/// What a held call waits on.
+enum CallWait {
+    Bo(u32),
+    /// The handles and flags of a SYNCOBJ_WAIT.
+    Syncobjs(Vec<u32>, u32),
+}
+
 /// Hands a request that must wait for a job to the job thread: a read on
-/// a client that waits for a job, or a WAIT_BO with a timeout on a BO whose
-/// last job is not done (the timeout is not kept: the job ends within its
-/// own 1 s limit). Returns the Op back if it can be answered now.
+/// a client that waits for a job, a WAIT_BO with a timeout on a BO whose
+/// last job is not done, or a SYNCOBJ_WAIT whose timeout lies ahead (the
+/// timeouts are not kept: the job ends within its own 1 s limit). Returns
+/// the Op back if it can be answered now.
 fn hold_op(shared: &Shared, caller: CallerCtx, mut op: Op) -> Option<(CallerCtx, Op)> {
-    let wait_bo = match &mut op {
+    let call_wait = match &mut op {
         Op::Read(_) => None,
         Op::Call(call) => {
             let fd = call.fd();
             let (payload, metadata) = call.payload_and_metadata();
-            match (metadata.first(), uapi::read::<uapi::WaitBo>(payload)) {
-                (Some(&uapi::WAIT_BO), Some((arg, _))) if arg.timeout_ns != 0 => Some((fd, arg.handle)),
+            match metadata.first() {
+                Some(&uapi::WAIT_BO) => match uapi::read::<uapi::WaitBo>(payload) {
+                    Some((arg, _)) if arg.timeout_ns != 0 => Some((fd, CallWait::Bo(arg.handle))),
+                    _ => return Some((caller, op)),
+                },
+                Some(&uapi::SYNCOBJ_WAIT) => match uapi::read::<uapi::SyncobjWait>(payload) {
+                    Some((arg, rest)) if arg.timeout_nsec > monotonic_ns() => match uapi::handles(rest, arg.count_handles) {
+                        Some(syncs) => Some((fd, CallWait::Syncobjs(syncs, arg.flags))),
+                        None => return Some((caller, op)),
+                    },
+                    _ => return Some((caller, op)),
+                },
                 _ => return Some((caller, op)),
             }
         }
@@ -1699,15 +1846,20 @@ fn hold_op(shared: &Shared, caller: CallerCtx, mut op: Op) -> Option<(CallerCtx,
     };
     let mut state = lock(&shared.state);
     let done = state.done_through;
-    if let Some((fd, handle)) = wait_bo {
-        if let Ok(Handle::Client(client)) = state.handles.get_mut(fd)
-            && let Some(&job) = client.bo_jobs.get(&handle)
-            && job > done
-        {
-            client.held_calls.push((job, HeldRead { caller, op }));
-            return None;
-        }
-        return Some((caller, op));
+    if let Some((fd, wait)) = call_wait {
+        let Ok(Handle::Client(client)) = state.handles.get_mut(fd) else { return Some((caller, op)) };
+        let (job, wait_bo, first_signaled) = match wait {
+            CallWait::Bo(handle) => match client.bo_jobs.get(&handle) {
+                Some(&job) if job > done => (job, true, None),
+                _ => return Some((caller, op)),
+            },
+            CallWait::Syncobjs(syncs, flags) => match sync_wait(client, &syncs, flags, done) {
+                Ok(SyncWait::Job(job, i)) => (job, false, (flags & uapi::SYNCOBJ_WAIT_ALL == 0).then_some(i)),
+                _ => return Some((caller, op)),
+            },
+        };
+        client.held_calls.push((job, HeldCall { held: HeldRead { caller, op }, wait_bo, first_signaled }));
+        return None;
     }
     let Op::Read(read) = &op else { return Some((caller, op)) };
     let fd = read.fd;
@@ -1758,10 +1910,10 @@ fn serve(shared: Arc<Shared>) -> ! {
                     let mut found = None;
                     for (&id, handle) in state.handles.iter_mut() {
                         if let Handle::Client(client) = handle
-                            && let Some(i) = client.held_calls.iter().position(|(_, held)| held.op.req_id() == cancel.id)
+                            && let Some(i) = client.held_calls.iter().position(|(_, call)| call.held.op.req_id() == cancel.id)
                         {
-                            say(&format!("client {id}: WAIT_BO cancelled"));
-                            found = Some(client.held_calls.remove(i).1);
+                            say(&format!("client {id}: a held wait was cancelled"));
+                            found = Some(client.held_calls.remove(i).1.held);
                             break;
                         }
                         if let Handle::Client(client) = handle

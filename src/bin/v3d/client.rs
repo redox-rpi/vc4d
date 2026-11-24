@@ -35,9 +35,12 @@ fn drm_request(nr: u64, size: usize, read_back: bool) -> u64 {
 /// Linux's struct differs from it only where a submit carries the
 /// pointer to its BO handles, which come after the fixed part.
 fn libc_ioctl(fd: i32, func: u64, payload: &mut [u8]) -> Result<usize, syscall::Error> {
-    // GEM_CLOSE 0x09, SUBMIT_CL 0x40, SUBMIT_CSD 0x47.
+    // GEM_CLOSE 0x09, SUBMIT_CL 0x40, SUBMIT_CSD 0x47, SYNCOBJ_DESTROY
+    // 0xC0, SYNCOBJ_WAIT 0xC3, SYNCOBJ_RESET/SIGNAL 0xC4/0xC5.
     let (fixed, at, gap, read_back) = match func {
         0x40 => (64, 40, 0, true),
+        0xC3 => (32, 0, 0, true),
+        0xC4 | 0xC5 => (8, 0, 0, true),
         // The wire form has 4 bytes of padding at 60 that Linux's struct
         // does not have there; it has 4 at 44 instead.
         0x47 => (80, 44, 4, false),
@@ -59,6 +62,11 @@ fn libc_ioctl(fd: i32, func: u64, payload: &mut [u8]) -> Result<usize, syscall::
             linux.extend_from_slice(&payload[at..60]);
             linux.extend_from_slice(&payload[64..fixed]);
         }
+        // The handles pointer comes first.
+        0xC3 | 0xC4 | 0xC5 => {
+            linux.extend_from_slice(&handles.to_ne_bytes());
+            linux.extend_from_slice(&payload[..fixed]);
+        }
         _ => linux.extend_from_slice(payload),
     }
     let request = drm_request(func, linux.len(), read_back);
@@ -66,8 +74,10 @@ fn libc_ioctl(fd: i32, func: u64, payload: &mut [u8]) -> Result<usize, syscall::
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(syscall::EIO);
         return Err(syscall::Error::new(errno));
     }
-    if func != 0x40 && func != 0x47 {
-        payload.copy_from_slice(&linux);
+    match func {
+        0x40 | 0x47 => {}
+        0xC3 | 0xC4 | 0xC5 => payload[..fixed].copy_from_slice(&linux[8..]),
+        _ => payload.copy_from_slice(&linux),
     }
     Ok(0)
 }
