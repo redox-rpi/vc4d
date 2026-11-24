@@ -297,6 +297,9 @@ struct Irq {
     file: File,
     timer: File,
     queue: EventQueue<IrqSource>,
+    /// A fallback timeout is pending: every write to /scheme/time adds one
+    /// more (Test 603: one per loop piled up to a wakeup every 0.12 ms).
+    armed: bool,
 }
 
 /// /scheme/irq/phandle-P/A,B,C for the v3d node: `interrupts` of the node
@@ -342,11 +345,15 @@ impl Irq {
         queue
             .subscribe(timer.as_raw_fd() as usize, IrqSource::Time, event::EventFlags::READ)
             .map_err(|err| format!("event queue: {err}"))?;
-        Ok(Irq { path, file, timer, queue })
+        Ok(Irq { path, file, timer, queue, armed: false })
     }
 
-    /// The fallback timer fires `after` from now.
+    /// The fallback timer fires `after` from now, unless one is pending.
     fn arm(&mut self, after: Duration) {
+        if self.armed {
+            return;
+        }
+        self.armed = true;
         let mut time = syscall::TimeSpec::default();
         if self.timer.read(&mut time).is_err() {
             return;
@@ -376,6 +383,7 @@ struct Stats {
     mmu_faults: u64,
     resets: u64,
     irqs: u64,
+    irq_wakeups: u64,
     timer_wakeups: u64,
 }
 
@@ -515,11 +523,13 @@ impl V3d {
     /// v3d_irq() and v3d_hub_irq(): takes the status bits, clears them in
     /// V3D (the line is level triggered), keeps them for the waiting code,
     /// then lets the interrupt controller deliver the next one.
-    fn handle_irq(&mut self) {
+    /// The read returns nothing when no interrupt is pending: then there is
+    /// nothing to ack either. Returns whether one was handled.
+    fn handle_irq(&mut self) -> bool {
         let mut token = [0u8; 8];
-        let Some(irq) = self.irq.as_mut() else { return };
-        if irq.file.read(&mut token).is_err() {
-            return;
+        let Some(irq) = self.irq.as_mut() else { return false };
+        if !matches!(irq.file.read(&mut token), Ok(8)) {
+            return false;
         }
         let core = self.core.read(V3D_CTL_INT_STS) & V3D_CORE_IRQS;
         let hub = self.hub.read(V3D_HUB_INT_STS) & V3D_HUB_IRQS;
@@ -529,6 +539,7 @@ impl V3d {
         self.hub_seen |= hub;
         self.stats.irqs += 1;
         let _ = irq.file.write(&token);
+        true
     }
 
     /// Waits until `done`, at most `ms`: on the interrupt with the fallback
@@ -550,8 +561,12 @@ impl V3d {
             irq.arm(IRQ_FALLBACK);
             match irq.queue.next() {
                 Some(Ok(event)) => match event.user_data {
-                    IrqSource::Irq => self.handle_irq(),
+                    IrqSource::Irq => {
+                        self.stats.irq_wakeups += 1;
+                        self.handle_irq();
+                    }
                     IrqSource::Time => {
+                        irq.armed = false;
                         let mut time = syscall::TimeSpec::default();
                         let _ = irq.timer.read(&mut time);
                         self.stats.timer_wakeups += 1;
@@ -658,6 +673,9 @@ impl V3d {
             self.stats.mmu_faults -= 1;
         }
         let result = run(self);
+        // A job that was done before v3dd waited leaves its interrupt
+        // pending; ack it now, or the line stays blocked for the next job.
+        self.handle_irq();
         // The register dump before mmu_fault() clears the fault state.
         if result.is_err() {
             self.state();
@@ -910,7 +928,7 @@ impl V3dScheme {
             Some("stats") => {
                 let s = &self.v3d.stats;
                 Ok(format!(
-                    "bos {} frees {} jobs {} cl_jobs {} failed {} mmu_faults {} resets {} job_us_max {} outomem {} overflow_chunks {} va_next {:#x} va_free_ranges {} irq {} irqs {} timer_wakeups {}",
+                    "bos {} frees {} jobs {} cl_jobs {} failed {} mmu_faults {} resets {} job_us_max {} outomem {} overflow_chunks {} va_next {:#x} va_free_ranges {} irq {} irqs {} irq_wakeups {} timer_wakeups {}",
                     s.bos,
                     s.frees,
                     s.jobs,
@@ -925,6 +943,7 @@ impl V3dScheme {
                     self.v3d.free_va.len(),
                     self.v3d.irq.as_ref().map(|irq| irq.path.as_str()).unwrap_or("off"),
                     s.irqs,
+                    s.irq_wakeups,
                     s.timer_wakeups
                 ))
             }
