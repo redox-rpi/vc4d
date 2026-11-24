@@ -364,3 +364,35 @@ pub fn via_v3dd(loops: u32) -> bool {
         }
     }
 }
+
+/// Step 3c (redox-rpi#598): the step 1 job with the result address in a
+/// part of the V3D address space with no page table entry. v3dd should
+/// answer with an MMU fault; returns its answer, or Err when the job
+/// passed.
+pub fn bad_address_via_v3dd(v3d: &mut super::client::Client) -> Result<String, String> {
+    const UNMAPPED_VA: u32 = 0x3f00_0000;
+    let code = v3d.bo(PAGE)?;
+    let unif = v3d.bo(PAGE)?;
+    let code_words: Vec<u32> = SHADER.iter().flat_map(|w| [*w as u32, (*w >> 32) as u32]).collect();
+    v3d.put(&code, 0, &code_words)?;
+    v3d.put(&unif, 0, &[UNMAPPED_VA, CONSTANT])?;
+    let wg_size: u32 = 16;
+    let wgs_per_sg: u32 = 16;
+    let cfg = [
+        1 << 16,
+        1 << 16,
+        1 << 16,
+        ((wgs_per_sg * wg_size).div_ceil(16) - 1) << 12 | wgs_per_sg << 8 | (wg_size & 0xff),
+        0,
+        code.va,
+        unif.va,
+    ];
+    let cfg: Vec<String> = cfg.iter().map(|w| format!("{w:#x}")).collect();
+    let answer = v3d.job(&format!("csd {}", cfg.join(" ")));
+    v3d.free(&code)?;
+    v3d.free(&unif)?;
+    match answer {
+        Ok(us) => Err(format!("the job stored to {UNMAPPED_VA:#x} and passed after {us} us, no MMU fault")),
+        Err(err) => Ok(err),
+    }
+}

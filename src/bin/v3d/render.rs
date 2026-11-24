@@ -799,3 +799,23 @@ pub fn via_v3dd(draw: Draw, loops: u32) -> bool {
         }
     }
 }
+
+/// Step 3c (redox-rpi#598): a bin job that never ends, a control list
+/// whose only packet branches to itself. v3dd should stop it after its
+/// timeout with a reset; returns its answer, or Err when the job ended.
+pub fn endless_via_v3dd(v3d: &mut super::client::Client) -> Result<String, String> {
+    const BRANCH: u8 = 16;
+    let bo = v3d.bo(PAGE)?;
+    let mut cl = Cl::default();
+    cl.emit(BRANCH, 5, f(bo.va as u64, 0, 32));
+    v3d.put_bytes(&bo, 0, &cl.0)?;
+    // The end address lies past the branch: the CLE would stop there (the
+    // rest of the page is HALT packets), but it never gets that far.
+    let end = bo.va + 0x100;
+    let answer = v3d.job(&format!("cl {:#x} {end:#x} {:#x} {end:#x} 0 0 0", bo.va, bo.va));
+    v3d.free(&bo)?;
+    match answer {
+        Ok(us) => Err(format!("the endless job ended after {us} us")),
+        Err(err) => Ok(err),
+    }
+}
