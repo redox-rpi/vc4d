@@ -18,7 +18,7 @@
 //
 // v3dprobe [--csd] [--render [--triangle | --triangle-math] [--show SECONDS]]
 //          [--off] [--no-watchdog]
-// v3dprobe --via-v3dd [--loops N]
+// v3dprobe --via-v3dd [--loops N] [--render [--triangle | --triangle-math]]
 //   --show: the rendered picture in an Orbital window for SECONDS (step 2c)
 //   --render: step 2 (redox-rpi#596): bin and render control lists, see
 //     v3d/render.rs; clear only, or with --triangle a red triangle whose
@@ -29,6 +29,7 @@
 //   --off: close the bridges, assert the reset and power V3D off afterwards
 //   --via-v3dd: step 3 (redox-rpi#598): the --csd job N times (default
 //     100) through v3dd and /scheme/v3d; touches no registers itself.
+//     With --render, the --render frame N times instead (step 3b).
 //   --no-watchdog: do not arm the SoC watchdog around the V3D accesses
 //
 // The first V3D accesses can hang the bus (a block without power or clock).
@@ -45,6 +46,8 @@ use std::time::{Duration, Instant};
 
 use fdt::Fdt;
 
+#[path = "v3d/client.rs"]
+mod client;
 #[path = "v3d/csd.rs"]
 mod csd;
 #[path = "v3d/render.rs"]
@@ -125,7 +128,19 @@ fn main() {
     // Step 3 (redox-rpi#598): the CSD job through v3dd, no register access.
     if args.iter().any(|a| a == "--via-v3dd") {
         let loops = args.iter().position(|a| a == "--loops").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(100);
-        std::process::exit(if csd::via_v3dd(loops) { 0 } else { 1 });
+        let ok = if args.iter().any(|a| a == "--render") {
+            let draw = if args.iter().any(|a| a == "--triangle-math") {
+                render::Draw::MathShaders
+            } else if args.iter().any(|a| a == "--triangle") {
+                render::Draw::CopyShaders
+            } else {
+                render::Draw::Clear
+            };
+            render::via_v3dd(draw, loops)
+        } else {
+            csd::via_v3dd(loops)
+        };
+        std::process::exit(if ok { 0 } else { 1 });
     }
     common::init();
     let off = env::args().any(|a| a == "--off");
