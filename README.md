@@ -129,7 +129,7 @@ a time, with the cache handling of Linux v3d. Clients open `/scheme/v3d`
 | `free ID` | `ok` |
 | `csd CFG0 ... CFG6` | `done US`: runs one CSD job and waits for it |
 | `cl BCL END RCL END QMA QMS QTS` | `done US bin US render US`: one bin job, then one render job |
-| `stats` | counters: BOs, frees, jobs, bin/render jobs, failed jobs, MMU faults, resets, longest job, overflow memory, free address ranges |
+| `stats` | counters: BOs, frees, jobs, bin/render jobs, failed jobs, MMU faults, resets, longest job, overflow memory, free address ranges, interrupt (on/off, interrupts, waits ended by the interrupt or the timer) |
 
 `cl` takes V3D addresses only: the bin and render control lists (start
 and end), the tile allocation memory and its size, and the tile state.
@@ -140,6 +140,13 @@ to v3dd: 512 KiB at the start of every bin job, and another 512 KiB chunk
 
 BOs belong to the open file and are freed when it closes. Freed address
 ranges are reused. On other boards v3dd leaves the hardware alone.
+
+**Interrupt.** v3dd waits for a job on the V3D interrupt, which it finds
+in the devicetree and opens through `/scheme/irq`. The core interrupts
+(bin done, render done, CSD done, out of overflow memory) and the hub
+interrupts (MMU faults) are those of Linux `v3d_irq.c`. A 5 ms timer is
+the fallback if an interrupt is lost. Without the interrupt v3dd polls.
+Jobs still run one at a time, and the client waits for `done`.
 
 **Errors.** A job that makes the V3D MMU fault (an address with no page
 table entry, a write to a read-only page) answers
@@ -167,8 +174,8 @@ their own page table.
 - Orbital: windows on overlay planes (redox-rpi experiment
   `orbital-planes`).
 - V3D (#598 and later): mapping BOs into
-  clients instead of `put`/`get`, the V3D interrupt instead of polling,
-  one address space per client, a directory
+  clients instead of `put`/`get` (redox-rpi#666), asynchronous jobs, one
+  address space per client, a directory
   listing of `/scheme/v3d`. Then a Mesa winsys for Redox.
 - The 3D block of the Pi 3, 3B+ and Zero 2 W (VideoCore IV, Linux `vc4`
   V3D) is a different GPU and has no code yet.
