@@ -22,7 +22,8 @@
 //          | --queue [--clients C]] [--mapped]
 //   --queue: v3dd's job queue (G2, redox-rpi#668): C clients (4) at once,
 //     each with N jobs (at most 64) in flight; an endless job in the middle
-//     of a queue; a client that closes with jobs in flight; no BOs left
+//     of a queue; a client that closes with jobs in flight; a client's job
+//     cannot reach another client's BO; no BOs and no address spaces left
 //   --show: the rendered picture in an Orbital window for SECONDS (step 2c)
 //   --render: step 2 (redox-rpi#596): bin and render control lists, see
 //     v3d/render.rs; clear only, or with --triangle a red triangle whose
@@ -304,6 +305,37 @@ fn queue_close() -> Result<(), String> {
     Ok(())
 }
 
+/// G2 step 2: each client has its own address space. Client A's third BO
+/// lies at an address where client B has none: B's job storing there must
+/// end in an MMU fault, and A's BO must stay as it was.
+fn queue_isolation() -> Result<String, String> {
+    let mut a = client::Client::open()?;
+    let mut b = client::Client::open()?;
+    let a_bos = [a.bo(4096)?, a.bo(4096)?, a.bo(4096)?];
+    a.fill(&a_bos[2], 0, 16, 0x1111_1111)?;
+    let code = b.bo(4096)?;
+    let unif = b.bo(4096)?;
+    if code.va != a_bos[0].va {
+        return Err(format!("B's first BO at {:#x}, A's at {:#x}: one shared address space", code.va, a_bos[0].va));
+    }
+    b.put(&code, 0, &csd::shader_words())?;
+    b.put(&unif, 0, &[a_bos[2].va, csd::constant(0xd000)])?;
+    let answer = b.job(&csd::job_line(code.va, unif.va));
+    let left = a.get(&a_bos[2], 0, 16)?;
+    let result = match answer {
+        Ok(us) => Err(format!("B's job stored to {:#x} and passed after {us} us", a_bos[2].va)),
+        Err(err) if !err.contains("mmu-fault") => Err(format!("B's job: not an MMU fault: {err}")),
+        Err(_) if left.iter().any(|&w| w != 0x1111_1111) => Err(format!("A's BO changed: {left:#x?}")),
+        Err(err) => Ok(format!("(both start at {:#x}; v3dd: {err})", code.va)),
+    };
+    for bo in &a_bos {
+        a.free(bo)?;
+    }
+    b.free(&code)?;
+    b.free(&unif)?;
+    result
+}
+
 /// A number from a stats line.
 fn stat(stats: &str, name: &str) -> Option<u64> {
     let mut it = stats.split(' ');
@@ -345,6 +377,7 @@ fn queue_via_v3dd(clients: u32, jobs: u32) -> bool {
     );
     check("an endless job in the middle of a queue", hung.map(|answer| format!("(v3dd: {answer})")));
     check("a client closed with jobs in flight", queue_close().map(|()| String::new()));
+    check("another client's BO is out of reach", queue_isolation());
     // The closed client's running job ends within its timeout.
     let deadline = Instant::now() + Duration::from_secs(3);
     let stats = loop {
@@ -359,8 +392,9 @@ fn queue_via_v3dd(clients: u32, jobs: u32) -> bool {
     };
     check(
         "no BOs left",
-        stats.and_then(|s| match (stat(&s, "live_bos"), stat(&s, "zombies"), stat(&s, "queued")) {
-            (Some(0), Some(0), Some(0)) => Ok(format!("({s})")),
+        stats.and_then(|s| match (stat(&s, "live_bos"), stat(&s, "zombies"), stat(&s, "queued"), stat(&s, "spaces")) {
+            // The stats client itself has no BO, so no space.
+            (Some(0), Some(0), Some(0), Some(0)) => Ok(format!("({s})")),
             _ => Err(format!("({s})")),
         }),
     );

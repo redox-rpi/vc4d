@@ -70,8 +70,16 @@
 // the MMU faults from the hub. A 5 ms timer stays as a fallback, and
 // without an interrupt v3dd polls as before.
 //
-// Not yet: one address space per client, a binary interface (G2 steps 2
-// and 3).
+// Address spaces (G2 step 2): every client gets its own V3D page table
+// with its first BO, and the job thread loads the job's table into the MMU
+// before the job runs (V3D has one page table base; jobs run one at a
+// time). A job reaches only its own client's BOs: any other address is an
+// MMU fault. Each table covers all 32-bit V3D addresses, 4 MiB of
+// contiguous memory per client. The binner's overflow memory is mapped
+// in every space at the same address, above the clients' range. A closed
+// client's space goes with its BOs, after its running job.
+//
+// Not yet: a binary interface (G2 step 3).
 //
 // The binner's overflow memory belongs to v3dd: 512 KiB at the start of
 // every bin job, and another 512 KiB chunk each time the binner reports
@@ -405,6 +413,8 @@ struct Bo {
     mem: Dma<[u32]>,
     va: u32,
     pages: usize,
+    /// The address space it is mapped in (OVERFLOW_SPACES: all of them).
+    space: u32,
 }
 
 #[derive(Default)]
@@ -424,6 +434,9 @@ struct Stats {
     maps: u64,
     unmaps: u64,
     overflow_chunks: usize,
+    /// Address spaces made for clients, and removed again.
+    spaces: u64,
+    spaces_removed: u64,
     /// The interrupt path, or "off" while v3dd polls.
     irq: String,
 }
@@ -433,17 +446,40 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The V3D page table and its address space. A lock of its own: the request
-/// loop maps and unmaps BOs while a job runs on the job thread, as Linux's
-/// v3d_mmu.c inserts PTEs while jobs run. A reset holds it throughout, so
-/// no MMU flush meets V3D in reset.
-struct Mmu {
-    hub: Regs,
+/// One V3D address space (G2 step 2, redox-rpi#668): a page table over all
+/// of V3D's 32-bit addresses (4 MiB), and its allocator. Every client gets
+/// its own on its first BO, so a job reaches only its own client's BOs.
+struct Space {
     pt: Dma<[u32]>,
-    scratch_phys: usize,
     /// Free V3D address ranges (VA, pages), first fit.
     free_va: Vec<(u32, usize)>,
     next_va: u32,
+}
+
+/// v3dd's own space: the MMU uses it when no client's is loaded. It holds
+/// only the overflow memory.
+const DAEMON_SPACE: u32 = 0;
+/// The space of the binner's overflow chunks: mapped in every space.
+const OVERFLOW_SPACES: u32 = u32::MAX;
+/// The overflow chunks lie above every client's addresses (VA_END), at
+/// the same address in every space.
+const OVERFLOW_VA: u32 = VA_END;
+
+/// The address spaces and the MMU. A lock of its own: the request loop maps
+/// and unmaps BOs while a job runs on the job thread, as Linux's v3d_mmu.c
+/// inserts PTEs while jobs run. The job thread loads the job's space
+/// before the job; a reset holds the lock throughout, so no MMU flush meets
+/// V3D in reset.
+struct Mmu {
+    hub: Regs,
+    scratch_phys: usize,
+    spaces: BTreeMap<u32, Space>,
+    next_space: u32,
+    /// The space whose page table the MMU walks.
+    loaded: u32,
+    /// The overflow chunks' physical addresses, chunk i at
+    /// OVERFLOW_VA + i * OVERFLOW_SIZE in every space.
+    overflow: Vec<usize>,
     stats: Arc<Mutex<Stats>>,
 }
 
@@ -464,7 +500,14 @@ struct V3d {
     overflow: Vec<Bo>,
 }
 
-impl Mmu {
+impl Space {
+    fn new() -> std::result::Result<Space, String> {
+        match Dma::<[u32]>::zeroed_slice(PT_ENTRIES) {
+            Ok(dma) => Ok(Space { pt: unsafe { dma.assume_init() }, free_va: Vec::new(), next_va: VA_START }),
+            Err(err) => Err(format!("no 4 MiB of contiguous memory for a page table: {err:?}")),
+        }
+    }
+
     fn alloc_va(&mut self, pages: usize) -> Option<u32> {
         if let Some(i) = self.free_va.iter().position(|&(_, n)| n >= pages) {
             let (va, n) = self.free_va[i];
@@ -484,7 +527,69 @@ impl Mmu {
         Some(va)
     }
 
-    fn new_bo(&mut self, bytes: usize) -> std::result::Result<Bo, String> {
+    fn map(&mut self, va: u32, phys: usize, pages: usize) {
+        for page in 0..pages {
+            self.pt[va as usize / PAGE + page] = V3D_PTE_WRITEABLE | V3D_PTE_VALID | ((phys / PAGE + page) as u32);
+        }
+    }
+
+    fn unmap(&mut self, va: u32, pages: usize) {
+        self.pt[va as usize / PAGE..va as usize / PAGE + pages].fill(0);
+    }
+}
+
+impl Mmu {
+    fn pt_phys(&self) -> usize {
+        self.spaces[&self.loaded].pt.physical()
+    }
+
+    /// A new space for a client, with the overflow chunks mapped.
+    fn new_space(&mut self) -> std::result::Result<u32, String> {
+        let mut space = Space::new()?;
+        for (i, &phys) in self.overflow.iter().enumerate() {
+            space.map(OVERFLOW_VA + (i * OVERFLOW_SIZE) as u32, phys, OVERFLOW_SIZE / PAGE);
+        }
+        self.next_space += 1;
+        let id = self.next_space;
+        self.spaces.insert(id, space);
+        lock(&self.stats).spaces += 1;
+        Ok(id)
+    }
+
+    /// Drops a client's space once its BOs and jobs are gone.
+    fn remove_space(&mut self, id: u32) {
+        if id == DAEMON_SPACE {
+            return;
+        }
+        if self.loaded == id
+            && let Err(err) = self.load(DAEMON_SPACE)
+        {
+            say(&format!("removing space {id}: {err}"));
+        }
+        if self.spaces.remove(&id).is_some() {
+            lock(&self.stats).spaces_removed += 1;
+        }
+    }
+
+    /// Points the MMU at a space's page table, then flushes it.
+    fn load(&mut self, id: u32) -> std::result::Result<(), String> {
+        if self.loaded == id {
+            return Ok(());
+        }
+        let phys = self.spaces.get(&id).ok_or_else(|| format!("no address space {id}"))?.pt.physical();
+        self.hub.write(V3D_MMU_PT_PA_BASE, (phys / PAGE) as u32);
+        self.loaded = id;
+        if !csd::mmu_flush(&self.hub) {
+            return Err("MMU flush did not finish".into());
+        }
+        Ok(())
+    }
+
+    fn flush_if_loaded(&self, space: u32) -> bool {
+        (space != self.loaded && space != OVERFLOW_SPACES) || csd::mmu_flush(&self.hub)
+    }
+
+    fn new_bo(&mut self, space: u32, bytes: usize) -> std::result::Result<Bo, String> {
         if bytes == 0 || bytes > BO_MAX {
             return Err(format!("size {bytes} not in 1..={BO_MAX}"));
         }
@@ -493,41 +598,57 @@ impl Mmu {
             Ok(dma) => unsafe { dma.assume_init() },
             Err(err) => return Err(format!("no contiguous memory: {err:?}")),
         };
-        let va = self.alloc_va(pages).ok_or("V3D address space full")?;
-        let phys = mem.physical();
-        for page in 0..pages {
-            self.pt[va as usize / PAGE + page] = V3D_PTE_WRITEABLE | V3D_PTE_VALID | ((phys / PAGE + page) as u32);
-        }
-        if !csd::mmu_flush(&self.hub) {
+        let table = self.spaces.get_mut(&space).ok_or_else(|| format!("no address space {space}"))?;
+        let va = table.alloc_va(pages).ok_or("V3D address space full")?;
+        table.map(va, mem.physical(), pages);
+        lock(&self.stats).bos += 1;
+        let bo = Bo { mem, va, pages, space };
+        if !self.flush_if_loaded(space) {
+            self.free_bo(bo);
             return Err("MMU flush did not finish".into());
         }
-        lock(&self.stats).bos += 1;
-        Ok(Bo { mem, va, pages })
+        Ok(bo)
     }
 
     fn free_bo(&mut self, bo: Bo) {
-        for page in 0..bo.pages {
-            self.pt[bo.va as usize / PAGE + page] = 0;
+        if let Some(table) = self.spaces.get_mut(&bo.space) {
+            table.unmap(bo.va, bo.pages);
+            release_va(&mut table.free_va, &mut table.next_va, bo.va, bo.pages);
         }
-        csd::mmu_flush(&self.hub);
-        release_va(&mut self.free_va, &mut self.next_va, bo.va, bo.pages);
+        self.flush_if_loaded(bo.space);
         lock(&self.stats).frees += 1;
         // bo.mem is freed here, after the MMU no longer maps it.
+    }
+
+    /// One more chunk of the binner's overflow memory, in every space.
+    fn new_overflow(&mut self) -> std::result::Result<Bo, String> {
+        let pages = OVERFLOW_SIZE / PAGE;
+        let mem = match Dma::<[u32]>::zeroed_slice(OVERFLOW_SIZE / 4) {
+            Ok(dma) => unsafe { dma.assume_init() },
+            Err(err) => return Err(format!("no contiguous memory: {err:?}")),
+        };
+        let va = OVERFLOW_VA + (self.overflow.len() * OVERFLOW_SIZE) as u32;
+        for table in self.spaces.values_mut() {
+            table.map(va, mem.physical(), pages);
+        }
+        self.overflow.push(mem.physical());
+        lock(&self.stats).bos += 1;
+        if !csd::mmu_flush(&self.hub) {
+            return Err("MMU flush did not finish".into());
+        }
+        Ok(Bo { mem, va, pages, space: OVERFLOW_SPACES })
     }
 }
 
 impl V3d {
     fn new(hub: Regs, core: Regs, pm: Regs, asb: Regs, irq: Option<Irq>) -> V3d {
-        let pt = match Dma::<[u32]>::zeroed_slice(PT_ENTRIES) {
-            Ok(dma) => unsafe { dma.assume_init() },
-            Err(err) => fail(&format!("no 4 MiB of contiguous memory for the page table: {err:?}")),
-        };
+        let daemon_space = Space::new().unwrap_or_else(|err| fail(&err));
+        let pt_phys = daemon_space.pt.physical();
         // The MMU sends illegal accesses here.
         let scratch = match Dma::<[u32]>::zeroed_slice(PAGE / 4) {
             Ok(dma) => unsafe { dma.assume_init() },
             Err(err) => fail(&format!("no scratch page: {err:?}")),
         };
-        let pt_phys = pt.physical();
         let scratch_phys = scratch.physical();
         // The scratch page lives as long as the daemon.
         std::mem::forget(scratch);
@@ -537,10 +658,11 @@ impl V3d {
         }));
         let mmu = Mmu {
             hub: Regs { base: hub.base },
-            pt,
             scratch_phys,
-            free_va: Vec::new(),
-            next_va: VA_START,
+            spaces: BTreeMap::from([(DAEMON_SPACE, daemon_space)]),
+            next_space: DAEMON_SPACE,
+            loaded: DAEMON_SPACE,
+            overflow: Vec::new(),
             stats: stats.clone(),
         };
         let mut v3d = V3d {
@@ -558,8 +680,8 @@ impl V3d {
         if !v3d.hw_setup(&lock(&v3d.mmu)) {
             fail("MMU flush did not finish");
         }
-        say(&format!("MMU on: page table at {pt_phys:#x}, scratch page at {scratch_phys:#x}"));
-        let overflow = lock(&v3d.mmu).new_bo(OVERFLOW_SIZE);
+        say(&format!("MMU on: v3dd's page table at {pt_phys:#x}, scratch page at {scratch_phys:#x}"));
+        let overflow = lock(&v3d.mmu).new_overflow();
         match overflow {
             Ok(bo) => v3d.overflow.push(bo),
             Err(err) => fail(&format!("no binner overflow memory: {err}")),
@@ -573,7 +695,7 @@ impl V3d {
     fn hw_setup(&self, mmu: &Mmu) -> bool {
         self.core.write(V3D_CTL_L2TFLSTA, 0);
         self.core.write(V3D_CTL_L2TFLEND, !0);
-        self.hub.write(V3D_MMU_PT_PA_BASE, (mmu.pt.physical() / PAGE) as u32);
+        self.hub.write(V3D_MMU_PT_PA_BASE, (mmu.pt_phys() / PAGE) as u32);
         self.hub.write(V3D_MMU_CTL, V3D_MMU_CTL_ENABLES);
         self.hub.write(V3D_MMU_ILLEGAL_ADDR, (mmu.scratch_phys / PAGE) as u32 | V3D_MMU_ILLEGAL_ADDR_ENABLE);
         self.hub.write(V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_ENABLE);
@@ -892,7 +1014,7 @@ impl V3d {
                     if next == OVERFLOW_CHUNKS_MAX {
                         return Err(format!("bin job: out of memory after {next} overflow chunks"));
                     }
-                    let bo = lock(&self.mmu).new_bo(OVERFLOW_SIZE);
+                    let bo = lock(&self.mmu).new_overflow();
                     let bo = bo.map_err(|err| format!("bin job: overflow memory: {err}"))?;
                     self.overflow.push(bo);
                     lock(&self.stats).overflow_chunks = self.overflow.len();
@@ -928,6 +1050,8 @@ impl V3d {
 struct Job {
     id: u64,
     client: usize,
+    /// The client's address space, loaded before the job runs.
+    space: u32,
     kind: JobKind,
 }
 
@@ -960,6 +1084,14 @@ struct Client {
     /// The job the next read waits for (wait, or the old csd/cl).
     waiting: Option<u64>,
     held: Option<HeldRead>,
+    /// The client's address space, made with its first BO.
+    space: Option<u32>,
+}
+
+/// Freed once the job it waits for is done, in the order they came.
+enum Zombie {
+    Bo(Bo),
+    Space(u32),
 }
 
 enum Handle {
@@ -973,9 +1105,9 @@ struct State {
     next_job: u64,
     running: Option<u64>,
     done_through: u64,
-    /// BOs freed (or closed) while jobs of their client were pending, with
-    /// the last such job: freed once it is done.
-    zombies: Vec<(u64, Bo)>,
+    /// BOs freed (or closed) while jobs of their client were pending, and
+    /// the spaces of clients closed meanwhile, with the last such job.
+    zombies: Vec<(u64, Zombie)>,
 }
 
 struct Shared {
@@ -988,26 +1120,25 @@ struct Shared {
 }
 
 impl Shared {
-    /// Frees the zombies whose jobs are done. Lock order: state, then mmu.
+    /// Frees the zombies whose jobs are done, in order: a client's BOs
+    /// before its space. Lock order: state, then mmu.
     fn reap(&self, state: &mut State) {
         let done = state.done_through;
-        let mut mmu = None;
-        let mut i = 0;
-        while i < state.zombies.len() {
-            if state.zombies[i].0 <= done {
-                let (_, bo) = state.zombies.swap_remove(i);
-                mmu.get_or_insert_with(|| lock(&self.mmu)).free_bo(bo);
-            } else {
-                i += 1;
+        let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut state.zombies).into_iter().partition(|(job, _)| *job <= done);
+        state.zombies = keep;
+        if !due.is_empty() {
+            let mut mmu = lock(&self.mmu);
+            for (_, zombie) in due {
+                bury(&mut mmu, zombie);
             }
         }
     }
 
-    /// Frees a BO now, or after the client's last pending job.
-    fn release(&self, state: &mut State, last_pending: Option<u64>, bo: Bo) {
+    /// Frees a BO or a space now, or after the client's last pending job.
+    fn release(&self, state: &mut State, last_pending: Option<u64>, zombie: Zombie) {
         match last_pending {
-            Some(job) => state.zombies.push((job, bo)),
-            None => lock(&self.mmu).free_bo(bo),
+            Some(job) => state.zombies.push((job, zombie)),
+            None => bury(&mut lock(&self.mmu), zombie),
         }
     }
 
@@ -1028,11 +1159,16 @@ impl Shared {
             };
             let answer = {
                 let mut v3d = lock(&self.v3d);
-                match job.kind {
+                let loaded = lock(&self.mmu).load(job.space);
+                if let Err(err) = loaded {
+                    Err(format!("address space: {err}"))
+                } else {
+                    match job.kind {
                     JobKind::Csd(cfg) => v3d.csd(cfg).map(|us| format!("done {us}")),
                     JobKind::Cl(a) => v3d
                         .bin_render((a[0], a[1]), (a[2], a[3]), a[4], a[5], a[6])
                         .map(|(bin, render)| format!("done {} bin {bin} render {render}", bin + render)),
+                    }
                 }
             };
             let answer = answer.unwrap_or_else(|err| format!("error {err}"));
@@ -1067,6 +1203,13 @@ impl Shared {
                 }
             }
         }
+    }
+}
+
+fn bury(mmu: &mut Mmu, zombie: Zombie) {
+    match zombie {
+        Zombie::Bo(bo) => mmu.free_bo(bo),
+        Zombie::Space(id) => mmu.remove_space(id),
     }
 }
 
@@ -1110,13 +1253,26 @@ impl V3dScheme {
             *next_job += 1;
             let job = *next_job;
             client.pending.insert(job);
-            queue.push_back(Job { id: job, client: id, kind });
+            let space = client.space.unwrap_or(DAEMON_SPACE);
+            queue.push_back(Job { id: job, client: id, space, kind });
             shared.work.notify_one();
             job
         };
         match words.first().copied() {
             Some("bo") => {
-                let bo = lock(&shared.mmu).new_bo(arg(1)? as usize)?;
+                let bytes = arg(1)? as usize;
+                let bo = {
+                    let mut mmu = lock(&shared.mmu);
+                    let space = match client.space {
+                        Some(space) => space,
+                        None => {
+                            let space = mmu.new_space()?;
+                            client.space = Some(space);
+                            space
+                        }
+                    };
+                    mmu.new_bo(space, bytes)?
+                };
                 let va = bo.va;
                 let bo_id = client.next_id;
                 client.next_id += 1;
@@ -1155,7 +1311,7 @@ impl V3dScheme {
                 let bo = client.bos.remove(&(arg(1)? as u32)).ok_or("no such BO")?;
                 let last = client.pending.last().copied();
                 match last {
-                    Some(job) => zombies.push((job, bo)),
+                    Some(job) => zombies.push((job, Zombie::Bo(bo))),
                     None => lock(&shared.mmu).free_bo(bo),
                 }
                 Ok(Answer::Now("ok".into()))
@@ -1193,13 +1349,13 @@ impl V3dScheme {
                 }
             }
             Some("stats") => {
-                let (va_next, va_free_ranges) = {
+                let (spaces, loaded) = {
                     let mmu = lock(&shared.mmu);
-                    (mmu.next_va, mmu.free_va.len())
+                    (mmu.spaces.len() - 1, mmu.loaded)
                 };
                 let s = lock(&shared.stats);
                 Ok(Answer::Now(format!(
-                    "bos {} frees {} jobs {} cl_jobs {} failed {} mmu_faults {} resets {} job_us_max {} outomem {} overflow_chunks {} va_next {:#x} va_free_ranges {} irq {} irqs {} irq_wakeups {} timer_wakeups {} maps {} unmaps {} live_bos {} submitted {} done_through {} queued {} running {} zombies {}",
+                    "bos {} frees {} jobs {} cl_jobs {} failed {} mmu_faults {} resets {} job_us_max {} outomem {} overflow_chunks {} spaces {} spaces_made {} space_loaded {} irq {} irqs {} irq_wakeups {} timer_wakeups {} maps {} unmaps {} live_bos {} submitted {} done_through {} queued {} running {} zombies {}",
                     s.bos,
                     s.frees,
                     s.jobs,
@@ -1210,8 +1366,9 @@ impl V3dScheme {
                     s.job_us_max,
                     s.outomem,
                     s.overflow_chunks,
-                    va_next,
-                    va_free_ranges,
+                    spaces,
+                    s.spaces,
+                    loaded,
                     s.irq,
                     s.irqs,
                     s.irq_wakeups,
@@ -1262,6 +1419,7 @@ impl SchemeSync for V3dScheme {
             results: BTreeMap::new(),
             waiting: None,
             held: None,
+            space: None,
         });
         Ok(OpenResult::ThisScheme { number: state.handles.insert(handle), flags: NewFdFlags::empty() })
     }
@@ -1347,7 +1505,10 @@ impl SchemeSync for V3dScheme {
         state.queue.retain(|job| job.client != id);
         let last = state.running.filter(|job| client.pending.contains(job));
         for bo in client.bos.into_values() {
-            shared.release(&mut state, last, bo);
+            shared.release(&mut state, last, Zombie::Bo(bo));
+        }
+        if let Some(space) = client.space {
+            shared.release(&mut state, last, Zombie::Space(space));
         }
         // A held read goes with the file: the kernel cancelled it.
         drop(client.held);
