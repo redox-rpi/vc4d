@@ -1,170 +1,168 @@
 # vc4d
 
-A display and 3D driver for the Broadcom VideoCore IV GPU (Raspberry Pi 3,
-3B+ and Zero 2 W) on [Redox OS](https://www.redox-os.org/), for the
-[redox-rpi](https://github.com/redox-rpi/redox-rpi) project.
-
-Status: stage 1 (display: HVS planes) has code, on branch `stage1-hvs`
-([#1](https://github.com/redox-rpi/vc4d/pull/1)), and runs on the Pi 3B+:
-the desktop with a hardware cursor plane at 1920x1080 (redox-rpi Pi tests
-220a, 256, 259 and 276). redox-rpi builds a pinned commit of it (experiment
-`vc4d`, on its branch `vc4d-fifo-diag` for now). The firmware still sets up
-HDMI and the mode. Stage 2 has started read only: branch `underrun-diag`
-logs the HVS FIFO, pixel valve 2, the HDMI encoder and the hotplug GPIO
-(Pi tests 316 to 328). Host tests: the HVS logic as the crate `vc4-hvs`
-([#2](https://github.com/redox-rpi/vc4d/pull/2)). Stage 2b reads the monitor's EDID over HDMI DDC
-([#4](https://github.com/redox-rpi/vc4d/pull/4)); on the Pi 3B+ the
-preferred mode is 1080p60, as the firmware set it (redox-rpi Pi test 387).
-Stage 3 has no code yet.
-The plan is
+Display and 3D drivers for the Broadcom VideoCore GPUs of the Raspberry Pi on
+[Redox OS](https://www.redox-os.org/), for the
+[redox-rpi](https://github.com/redox-rpi/redox-rpi) project. The plan is
 [redox-rpi#188](https://github.com/redox-rpi/redox-rpi/issues/188).
 
-## Plan
+| Program | What it does | Boards |
+|---|---|---|
+| `vc4d` | Display: HVS planes, modes, flips, screenshots | Pi 3, 3B+, Zero 2 W (HVS4); Pi 4 and 400 (HVS5) |
+| `vc4shot` | Saves the picture on the screen as a PPM file | all of the above |
+| `v3dprobe` | V3D bring-up probe: power, MMU, compute and render jobs | Pi 4 and 400 (V3D 4.2) |
+| `v3dd` | V3D daemon: buffer objects and compute jobs behind `/scheme/v3d` | Pi 4 and 400 (V3D 4.2) |
 
-1. **Display:** HVS planes and HDMI, as a replacement for `rpi-fbd`. The
-   mouse pointer and windows become hardware planes, so moving a window
-   needs almost no redrawing.
-2. **3D:** V3D job submission, plus Mesa's `vc4` Gallium driver (MIT) with a
-   small Redox winsys. This gives OpenGL ES 2.0 in hardware.
-3. **Compositing:** Orbital composes windows on the GPU.
+redox-rpi builds a pinned commit of this repository (experiments `vc4d` and
+`vc4d-flip`). Each image manifest names that commit.
 
-## Stage 1: HVS planes
+## Display: vc4d
 
-The firmware still sets up HDMI, the pixel valve and the mode at power-on,
-and leaves one HVS channel running with its own display list. `vc4d`:
+The firmware sets up HDMI, the clocks and the mode at power-on and leaves
+one HVS channel running. vc4d takes that channel over:
 
-- maps the HVS (`brcm,bcm2835-hvs` in the devicetree), finds the enabled
-  channel and its size, and logs the firmware's registers and list;
-- registers as a display (`display.vc4`) through Redox's `driver-graphics`,
-  with one mode, the firmware's;
-- gives clients dumb buffers in contiguous DMA memory and scans the primary
-  plane's buffer out directly: no copy into a firmware framebuffer;
-- offers a 64x64 ARGB cursor plane, which Orbital uses on its own, so the
-  pointer moves by changing the display list, without redrawing;
-- writes each new display list into a free place above the firmware's
-  lists, then points the channel at it.
+- **Planes.** vc4d writes its own display lists and points the channel at
+  them. It registers as a display (`display.vc4`) through Redox's
+  `driver-graphics` and gives clients dumb buffers in contiguous DMA
+  memory. Planes from bottom to top: the primary plane, three overlay
+  planes and a 64x64 ARGB cursor plane. Orbital uses the cursor plane on
+  its own. A compositor can show a window on an overlay plane, so moving the
+  pointer or the window only rewrites the display list.
+- **Display lists.** There are three list slots. A slot is reused only two
+  lists later, and the HVS gets at most one new list per frame, so it never
+  reads a list that is being overwritten.
+- **Flips.** Clients draw into normal memory and report what changed. vc4d
+  copies the damaged area into the scanout buffer the HVS is not reading
+  and switches the list at the next frame: no tearing, and clients never
+  read uncached memory. Flips are asynchronous: a client never waits for a
+  frame, newer damage is merged into the waiting frame, and a 4 ms timer
+  shows it once the HVS has taken the last list. `VC4D_FLIP=off` or
+  `/etc/vc4d-flip-off` scans the client buffer out directly instead.
+- **Scaled modes.** With `/etc/vc4d-mode` (for example `1280x720`), clients
+  see only that mode, and the HVS scales every plane to the firmware's mode
+  (the PPF and TPZ scalers and the Mitchell/Netravali kernel of Linux
+  `vc4_plane.c`).
+- **EDID** (HVS4 boards). At start vc4d reads the monitor's EDID over HDMI
+  DDC (BSC2 on the BCM2837) and logs it decoded: maker, name, the preferred
+  mode with its timing, the other modes, and the CEA-861 extension.
+  `VC4D_EDID=off` skips the read.
+- **Mode registers** (HVS4 boards). vc4d computes pixel valve 2 and the
+  HDMI core's timing from the EDID, laid out as Linux `vc4_crtc.c` and
+  `vc4_hdmi.c` do, and compares them with the firmware's. With
+  `VC4D_MODE=write`, if they match, it writes both itself in one blank
+  moment and reads them back. The mode is still the firmware's: the PLL,
+  the HDMI PHY and the encoder stay as the firmware set them.
+- **HVS5** (Pi 4 and 400). vc4d picks the HVS generation from the
+  devicetree. On the BCM2711 it uses the HVS5 list format (Linux
+  `SCALER5_*`) and keeps the firmware's mode. It reads no EDID there,
+  because HDMI and DDC are other blocks on that SoC.
+- **Check without a screen.** Before the handover vc4d shows colour bars
+  with a cursor, moves the cursor and reads back from the HVS: list address,
+  list words, frame counter, cursor position and error bits. A thread logs
+  the channel for two minutes afterwards. Lines start with `vc4d: check:`.
+  `VC4D_CHECK=off` skips it.
+- **Trace.** `VC4D_TRACE=<file>` or `/etc/vc4d-trace` writes a CSV time
+  series of damage, copies, lists, cursor moves and every HVS frame, to
+  find where the time of a display stall goes.
 
-Not yet: other modes, vertical blank interrupts, windows as planes (needs
-Orbital changes), the pixel valve and HDMI.
+Environment (set by the bootloader) and files:
 
-## Stage 2b: EDID over DDC
+| Setting | Effect |
+|---|---|
+| `VC4D=off` | vc4d does not start; `vesad` or `rpi-fbd` keeps the display |
+| `VC4D_FAKE=WxH` | runs against an HVS in normal memory, for QEMU (no HVS there) |
+| `VC4D_LOG=1` | logs every display list and overlay placement (the first four lists always) |
+| `VC4D_FLIP=off`, `/etc/vc4d-flip-off` | no flips, direct scanout of the client buffer |
+| `VC4D_MODE=write` | writes pixel valve 2 and the HDMI timing itself (HVS4) |
+| `VC4D_EDID=off` | no EDID read |
+| `VC4D_CHECK=off` | no check before the handover |
+| `VC4D_TRACE=<file>`, `/etc/vc4d-trace` | CSV trace |
+| `/etc/vc4d-mode` | the clients' mode, scaled by the HVS |
 
-At start, before it touches the HVS, `vc4d` reads the monitor's EDID over
-HDMI DDC: I2C address 0x50 on the BSC the devicetree's hdmi node names in
-`ddc` (BSC2, bus address 0x7e805000, on the BCM2837), base block and the
-first extension. It logs the raw bytes and what they say: maker, name,
-preferred mode with its full timing, the other detailed timings, the range
-limits, the established and standard modes, and the CEA-861 extension
-(HDMI or DVI, audio, video codes, its detailed timings). All lines start
-with `vc4d: edid:`; `PASS` when an EDID was read and parsed, `FAIL` with
-the reason otherwise (no monitor answers with `no acknowledge`). Nothing
-changes on the screen yet: the mode stays the firmware's. `VC4D_EDID=off`
-skips the read.
+### vc4shot
 
-The parser is the crate `vc4-edid` in `edid/`, without dependencies:
-`cargo test` there runs on any host. In QEMU (`raspi3b`, which models the
-BSCs) `-device i2c-ddc,bus=i2c-bus.2` puts QEMU's EDID generator (`QEMU Monitor`, 1280x800 at 75 Hz preferred; it ignores `xres`/`yres`)
-on the DDC bus. Blocks after the second (E-DDC segments) are not read yet.
+`vc4shot [file.ppm] [channel]` saves the picture on the screen, for
+checks without a person (default `/tmp/vc4shot.ppm`). It lists the planes of
+the channel's display list. Redox lets no program map RAM by its physical
+address, so vc4d composes the picture itself: when `/tmp/vc4shot.request`
+appears, vc4d writes `/tmp/vc4shot.ppm` from its mapped buffers, cursor alpha
+included. vc4d checks for the request every 3 s.
 
-## Stage 2c: mode registers, read only
+## 3D: V3D 4.2 on the Pi 4 and 400
 
-The crate `vc4-mode` (`mode/`, host tests) turns a timing from the EDID
-into the register values for pixel valve 2 and the HDMI core's timing, the
-way Linux's vc4 driver lays them out. The tests check them against what
-Broadcom's firmware programmed at 1080p60 (redox-rpi Pi test 337): for the
-test monitor's own EDID (Pi test 387) every one of them is the same.
+The steps are redox-rpi issues
+[#595](https://github.com/redox-rpi/redox-rpi/issues/595),
+[#596](https://github.com/redox-rpi/redox-rpi/issues/596) and
+[#598](https://github.com/redox-rpi/redox-rpi/issues/598). The code follows
+Linux v6.12 `drivers/gpu/drm/v3d` and Mesa's v3d driver; the file headers say
+which parts.
 
-On the Pi, after the EDID, vc4d reads pixel valve 2 and logs its values
-next to the firmware's (`vc4d: mode: pv2 ...`), then `vc4d: mode: PASS`
-or `DIFFERENT`. It writes nothing. The HDMI core is not read here: it
-needs its clocks running, which vc4d does not check yet. Next: write these
-values, then set up PLLH and the HDMI PHY for modes the firmware did not
-pick.
+**Power.** The firmware leaves the V3D power domain off. Both programs turn
+it on through `/scheme/rpi-firmware/v3d_power` (redox-rpi experiment
+`v3d-power`). They then release the reset in `PM_GRAFX` and open the async AXI
+bridges, master first, as Linux `bcm2835-power.c` does. The SoC watchdog is
+armed around the first accesses and around each job, so a bus hang resets
+the SoC instead of needing a person.
 
-## Stage 3a: vc4d programs pixel valve 2
+**v3dprobe.** Each step adds an option:
 
-With `VC4D_MODE=write`, when pixel valve 2's values equal the firmware's,
-vc4d writes them itself, in the order of Linux's `vc4_crtc.c`:
+- step 0: power, `HUB_IDENT` and `CTL_IDENT`;
+- step 1, `--csd`: a 4 MiB MMU page table, and one compute (CSD) job with a
+  hand-assembled QPU shader; the CPU checks its 16 results;
+- step 2, `--render [--triangle | --triangle-math] [--show N]`: bin and
+  render control lists for a 256x256 RGBA8 picture, cleared or with a red
+  triangle from hand-encoded coordinate, vertex and fragment shaders. The CPU
+  checks every pixel. `--show N` puts the picture in an Orbital window for N
+  seconds.
 
-1. video off at the end of the frame;
-2. the valve off, its FIFO emptied;
-3. the four timing registers;
-4. the valve on, the video on.
+**v3dd.** v3dd is started by init (redox-rpi experiment `v3dd`) and owns
+V3D. It powers it up, keeps one MMU page table, hands out zeroed buffer
+objects (BOs) mapped into it, and runs CSD jobs one at a time, with the
+cache handling of Linux v3d. Clients open `/scheme/v3d` (root only), write
+one command line and read the answer:
 
-The mode is the firmware's, so the monitor keeps it; the screen is blank
-for a few frames. vc4d then reads every register back (`vc4d: mode:
-write: PASS`). The usual checks follow: the HVS channel must run on, and
-the check without a screen must pass.
+| Command | Answer |
+|---|---|
+| `bo BYTES` | `ID VA`: a new zeroed BO, mapped at V3D address VA |
+| `put ID WORD HEX...` | `ok`: writes 32-bit words from word WORD on |
+| `get ID WORD COUNT` | COUNT words in hex |
+| `free ID` | `ok` |
+| `csd CFG0 ... CFG6` | `done US`: runs one CSD job and waits for it |
+| `stats` | counters: BOs, frees, jobs, failed jobs, longest job |
 
-`vc4_mode::pv_program()` gives the steps, and host tests check their order
-and the end state.
+BOs belong to the open file and are freed when it closes. On other boards
+v3dd leaves the hardware alone. `v3dprobe --via-v3dd [--loops N]` runs the
+step 1 job N times through v3dd. Do not run `v3dprobe --csd` or `--render`
+while v3dd runs: they set up their own page table.
 
-Also in this stage, read only: the HDMI core's timing is compared with
-the firmware's. It is read only after `CM_HSMCTL` shows the HSM clock
-running, since reading the block without its clock can hang the bus.
+## Open
 
-Without `VC4D_MODE=write`, vc4d only compares, as in stage 2c.
-
-On the Pi (Pi test 444) every register read back as written. The HVS
-channel ran on, and the check passed.
-
-## Stage 3b: the HDMI core's timing too
-
-When the HDMI timing compares equal too (which needs the HSM clock
-running), `VC4D_MODE=write` also writes the HDMI core's six timing
-registers: `HORZA`, `HORZB`, `VERTA0/1` and `VERTB0/1`. They go in the
-same blank moment, after the valve is off and its FIFO emptied, and
-before the valve's own timing, as in Linux, where
-`vc4_hdmi_set_timings()` runs before `vc4_crtc_config_pv()`.
-
-Only the timing registers are written: the encoder, its scheduler, the
-PHY and the clocks stay as the firmware set them. vc4d reads the HDMI
-registers back with the valve's (`vc4d: mode: write: hdmi ...`, then
-`PASS: pixel valve 2 and the HDMI timing read back as written`).
-`vc4_mode::mode_program()` gives the steps, and a host test checks where
-the HDMI writes go and what they are.
-
-Next: PLLH and the HDMI PHY, so vc4d can set a mode the firmware did not
-pick.
-
-Environment (the bootloader's): `VC4D=off` leaves the display to `vesad` or
-`rpi-fbd`. `VC4D_FAKE=WIDTHxHEIGHT` runs against an HVS in normal memory, for
-QEMU, which has none: everything but the picture. `VC4D_LOG=1` logs every
-new display list (the first four always are). `VC4D_CHECK=off` skips the
-check below. `VC4D_EDID=off` skips the EDID read.
-
-## Check without a screen
-
-Before it registers as a display, `vc4d` shows colour bars with a cursor
-square for a few frames, moves the cursor once, and reads back from the
-HVS: the channel points at its list, the list reads back as written, the
-active word is inside it, the frame count advances, the cursor's position
-word is the new one, and no error bits (underrun and the like) are set.
-Then it goes back to the firmware's list. A thread logs the channel 2, 5,
-10, 30, 60 and 120 s after the handover. All lines start with
-`vc4d: check:` and say `PASS` or `FAIL`. This needs no monitor, only an
-enabled HVS channel.
-
-## vc4shot
-
-`vc4shot [file.ppm] [channel]` saves what vc4d shows as a PPM picture
-(default `/tmp/vc4shot.ppm`), for checks without a person. It lists the
-planes of the enabled channel's display list (read-only), then asks vc4d
-for the picture: Redox lets no program map RAM by its physical address,
-so vc4d, which has the buffers mapped, composes them (cursor alpha
-included) when `/tmp/vc4shot.request` appears and writes
-`/tmp/vc4shot.ppm`. The watch thread looks every 3 s.
+- Display: modes the firmware did not pick (the PLLH divider and the HDMI
+  PHY; branch `mode-switch` has a first try), EDID and mode registers on
+  the BCM2711, vertical blank interrupts instead of the flush timer.
+- Orbital: windows on overlay planes (redox-rpi experiment
+  `orbital-planes`).
+- V3D (#598 and later): bin and render jobs through v3dd, mapping BOs into
+  clients instead of `put`/`get`, the V3D interrupt instead of polling,
+  recovery after a hung job, one address space per client, a directory
+  listing of `/scheme/v3d`. Then a Mesa winsys for Redox.
+- The 3D block of the Pi 3, 3B+ and Zero 2 W (VideoCore IV, Linux `vc4`
+  V3D) is a different GPU and has no code yet.
 
 ## Build
 
-redox-rpi's experiment `vc4d` builds a pinned commit of this repository
-with the cookbook. It needs large contiguous buffers (redox-rpi kernel
-patches `0049` and `0050`). The driver only builds for Redox
-(`aarch64-unknown-redox`).
+The drivers build only for Redox (`aarch64-unknown-redox`), through the
+redox-rpi cookbook. They need large contiguous buffers (redox-rpi kernel
+patches `0049` and `0050`).
 
-The logic without Redox dependencies is its own crate, `vc4-hvs` in
-`hvs/`: HVS registers, display list encoding and decoding, register
-fields. It builds and tests on any host with stable Rust:
+The logic without Redox dependencies is split into crates that build and
+test on any host with stable Rust:
+
+- `hvs/` (`vc4-hvs`): HVS registers, display lists for HVS4 and HVS5, and
+  the scaler;
+- `edid/` (`vc4-edid`): the EDID parser, with test EDIDs from QEMU and a
+  real monitor;
+- `mode/` (`vc4-mode`): pixel valve and HDMI timing registers, and the order
+  of the writes.
 
 ```
 cd hvs && cargo test
@@ -173,16 +171,17 @@ cd hvs && cargo test
 CI runs these tests and clippy (report only) on every push
 (`.github/workflows/host-tests.yml`).
 
+In QEMU (`raspi3b`), `VC4D_FAKE` stands in for the HVS, and
+`-device i2c-ddc,bus=i2c-bus.2` puts QEMU's EDID generator on the DDC bus.
+
 ## License
 
 GPL-2.0-only, see [LICENSE](LICENSE).
 
-The driver is a port of the Linux `vc4` DRM driver
-(`drivers/gpu/drm/vc4`), which is GPL-2.0-only. Each source file carries an
-`SPDX-License-Identifier: GPL-2.0-only` header and names the Linux files
-and kernel version it was translated from.
+The drivers are ports of the Linux `vc4` and `v3d` DRM drivers
+(`drivers/gpu/drm/vc4`, `drivers/gpu/drm/v3d`), which are GPL-2.0-only. Each
+source file carries an `SPDX-License-Identifier: GPL-2.0-only` header and
+names the Linux files and kernel version it was translated from.
 
-`vc4d` runs as its own program on Redox and talks to the kernel and to
-Orbital through schemes. The rest of redox-rpi stays MIT. redox-rpi builds
-`vc4d` from a fixed commit of this repository, and each image manifest names
-that commit.
+The programs run on their own on Redox and talk to the kernel and to Orbital
+through schemes. The rest of redox-rpi stays MIT.
