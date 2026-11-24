@@ -44,6 +44,7 @@ use crate::hvs::{Gen, Hvs, CHANNELS, HVS_BUS_ADDR};
 mod adapter;
 mod check;
 mod ddc;
+mod irqprobe;
 mod mode;
 use vc4_hvs as hvs;
 mod shot;
@@ -171,6 +172,13 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         "vc4d: taking over channel {} at {}x{}",
         channel.index, channel.width, channel.height
     );
+    // G1 (redox-rpi#667): which display interrupts the firmware uses, before
+    // vc4d waits on one. Read only. VC4D_IRQ_PROBE=off skips it.
+    if let (Some(fdt), Gen::Vc5, None) = (fdt.as_ref(), generation, fake) {
+        if !env::var("VC4D_IRQ_PROBE").is_ok_and(|v| v == "off") {
+            irqprobe::run(fdt);
+        }
+    }
 
     let checking = !env::var("VC4D_CHECK").is_ok_and(|v| v == "off");
     if checking {
