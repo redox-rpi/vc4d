@@ -1820,6 +1820,16 @@ impl SchemeSync for V3dScheme {
         Ok(())
     }
 
+    /// A character device, so stat() of the render node
+    /// /dev/dri/renderD128 (a link here) works: libdrm's drmGetDevices2
+    /// skips a node it cannot stat, and Mesa then finds no device.
+    fn fstat(&mut self, id: usize, stat: &mut syscall::Stat, _ctx: &CallerCtx) -> Result<()> {
+        lock(&self.shared.state).handles.get(id).map_err(|_| Error::new(EBADF))?;
+        stat.st_mode = syscall::MODE_CHR | 0o666;
+        stat.st_nlink = 1;
+        Ok(())
+    }
+
     fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
         lock(&self.shared.state).handles.get(id).map_err(|_| Error::new(EBADF))?;
         FpathWriter::with(buf, "v3d", |_| Ok(()))

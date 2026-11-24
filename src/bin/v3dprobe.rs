@@ -421,6 +421,13 @@ fn nothing_left() -> Result<String, String> {
 fn ioctl_check(loops: u32) -> Result<String, String> {
     use uapi::*;
     let mut v3d = client::Client::open()?;
+    // libdrm finds devices with stat() (G3 step 4).
+    let node = if client::LIBC.load(std::sync::atomic::Ordering::Relaxed) { "/dev/dri/renderD128" } else { "/scheme/v3d" };
+    match std::fs::metadata(node) {
+        Ok(meta) if std::os::unix::fs::FileTypeExt::is_char_device(&meta.file_type()) => {}
+        Ok(meta) => return Err(format!("stat {node}: not a character device ({:?})", meta.file_type())),
+        Err(err) => return Err(format!("stat {node}: {err}")),
+    }
     fn call<T: Copy>(v3d: &mut client::Client, func: u64, arg: &T, handles: &[u32]) -> Result<T, syscall::Error> {
         let mut buf = bytes(arg, handles);
         v3d.ioctl(func, &mut buf)?;
