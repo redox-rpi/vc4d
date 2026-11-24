@@ -140,7 +140,7 @@ a time, with the cache handling of Linux v3d. Clients open `/scheme/v3d`
 | `free ID` | `ok` |
 | `csd CFG0 ... CFG6` | `done US`: runs one CSD job and waits for it |
 | `cl BCL END RCL END QMA QMS QTS` | `done US bin US render US`: one bin job, then one render job |
-| `stats` | counters: BOs, frees, jobs, bin/render jobs, failed jobs, longest job, overflow memory, free address ranges |
+| `stats` | counters: BOs, frees, jobs, bin/render jobs, failed jobs, MMU faults, resets, longest job, overflow memory, free address ranges, interrupt (on/off, interrupts, waits ended by the interrupt or the timer) |
 
 `cl` takes V3D addresses only: the bin and render control lists (start
 and end), the tile allocation memory and its size, and the tile state.
@@ -151,9 +151,41 @@ to v3dd: 512 KiB at the start of every bin job, and another 512 KiB chunk
 
 BOs belong to the open file and are freed when it closes. Freed address
 ranges are reused. On other boards v3dd leaves the hardware alone.
+
+**Mapping BOs.** A client maps a BO into its own memory with `fmap` on
+the same handle: offset `(ID << 32) + BYTE` (BYTE a multiple of 4096),
+`MAP_SHARED`. The kernel maps the BO's own pages, with the memory type
+v3dd has (uncached, as all DMA memory on aarch64), so the client writes
+control lists and shader data and reads results directly, with no cache
+flush on either side; it issues a DSB before the command that starts the
+job. Private mappings are refused. A BO freed while mapped stays the
+client's memory until it unmaps it, but V3D no longer sees it. `put`,
+`get` and `fill` stay for tests.
+
+**Interrupt.** v3dd waits for a job on the V3D interrupt, which it finds
+in the devicetree and opens through `/scheme/irq`. The core interrupts
+(bin done, render done, CSD done, out of overflow memory) and the hub
+interrupts (MMU faults) are those of Linux `v3d_irq.c`. A 5 ms timer is
+the fallback if an interrupt is lost. Without the interrupt v3dd polls.
+Jobs still run one at a time, and the client waits for `done`.
+
+**Errors.** A job that makes the V3D MMU fault (an address with no page
+table entry, a write to a read-only page) answers
+`error mmu-fault KIND va ADDR unit UNIT`, as Linux `v3d_mmu_irq()` reports
+it. A job that is not done after 1 s answers `error timeout ...`. In both
+cases v3dd logs the core registers, resets V3D through the PM (as Linux
+`bcm2835_reset_reset()`), sets up the MMU and the caches again, and the
+next job runs. The SoC watchdog is armed only while a job runs, longer
+than the job timeout.
+
 `v3dprobe --via-v3dd [--loops N]` runs the step 1 job N times through
 v3dd; with `--render [--triangle | --triangle-math]` it runs the step 2
 frame N times instead and checks that every frame equals the first.
+`--faults` runs a job that stores to an unmapped address and one that
+never ends, and checks that both come back and the next jobs run right.
+With `--mapped`, every BO is mapped into v3dprobe and written and read
+there instead of through `put`/`get`; a check of the mappings runs first
+and a check for leaked BOs last.
 
 Do not run `v3dprobe --csd` or `--render` while v3dd runs: they set up
 their own page table.
@@ -165,9 +197,7 @@ their own page table.
   the BCM2711 (redox-rpi#671), the vertical blank on the BCM2837.
 - Orbital: windows on overlay planes (redox-rpi experiment
   `orbital-planes`).
-- V3D (#598 and later): mapping BOs into
-  clients instead of `put`/`get`, the V3D interrupt instead of polling,
-  recovery after a hung job, one address space per client, a directory
+- V3D: asynchronous jobs, one address space per client, a directory
   listing of `/scheme/v3d`. Then a Mesa winsys for Redox.
 - The 3D block of the Pi 3, 3B+ and Zero 2 W (VideoCore IV, Linux `vc4`
   V3D) is a different GPU and has no code yet.

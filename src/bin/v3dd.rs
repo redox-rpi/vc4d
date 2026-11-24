@@ -23,14 +23,37 @@
 //                                              the tile state)
 //   stats                     -> one line of counters
 //
+// A client maps a BO into its own memory with fmap on the same handle
+// (step 3e, redox-rpi#666): offset (ID << 32) + BYTE, BYTE a multiple of
+// the page size, MAP_SHARED. The mapping is the BO's own memory, with the
+// memory type v3dd has (uncached, as all DMA memory on aarch64), so
+// neither side needs a cache flush; the client issues a DSB before it
+// writes the job command. A BO freed while mapped stays the client's
+// memory until it unmaps it (the kernel counts references to the pages),
+// but V3D no longer sees it.
+//
 // Numbers are decimal or 0x hex. A failed command answers "error ...". BOs
 // belong to the open file and are freed when it is closed. Jobs run one at
 // a time, synchronously, with the caches handled as Linux's v3d driver does
 // (v3d_gem.c v3d_invalidate_caches(), v3d_clean_caches(); v3d_sched.c
 // v3d_csd_job_run()).
 //
-// Not yet (later steps of #598): bin/render jobs, mmap of BOs, the V3D
-// interrupt, recovery after a hung job, one address space per client.
+// Errors (step 3c): an MMU fault during a job (an address with no valid
+// page table entry, a write to a read-only page) comes back as "error
+// mmu-fault ..." with the faulting address and the unit, as Linux's
+// v3d_hub_irq() logs it. A job that does not end within 1 s is stopped by
+// a reset of V3D (Linux v3d_reset(): on the BCM2711 the PM reset line
+// with the bridges closed, then the MMU set up again) and comes back as
+// "error timeout ...". The daemon goes on in both cases.
+//
+// Interrupt (step 3d): v3dd waits for a job on the V3D interrupt (the
+// devicetree's v3d node, GIC SPI 74 on the BCM2711, through /scheme/irq),
+// as Linux's v3d_irq.c: FLDONE, FRDONE, CSDDONE and OUTOMEM from the core,
+// the MMU faults from the hub. A 5 ms timer stays as a fallback, and
+// without an interrupt v3dd polls as before. Jobs still run one at a time,
+// and a client's write waits for its job.
+//
+// Not yet: asynchronous jobs, one address space per client.
 //
 // The binner's overflow memory belongs to v3dd: 512 KiB at the start of
 // every bin job, and another 512 KiB chunk each time the binner reports
@@ -41,17 +64,21 @@
 // switch, and a GPU access that hangs the bus resets the SoC.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::Write as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write as _};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use common::dma::Dma;
+use event::{EventQueue, user_data};
 use redox_scheme::scheme::SchemeSync;
 use redox_scheme::{CallerCtx, OpenResult, Socket};
 use scheme_utils::{Blocking, FpathWriter, HandleMap};
-use syscall::error::{EACCES, EBADF, EINVAL, Error, Result};
+use syscall::error::{EACCES, EBADF, EINVAL, ENOENT, Error, Result};
+use syscall::flag::{MapFlags, MunmapFlags};
 use syscall::schemev2::NewFdFlags;
 
 #[path = "v3d/client.rs"]
@@ -95,6 +122,33 @@ const V3D_MMU_CTL_ENABLES: u32 =
 const V3D_MMU_PT_PA_BASE: usize = 0x1204;
 const V3D_MMU_ILLEGAL_ADDR: usize = 0x1230;
 const V3D_MMU_ILLEGAL_ADDR_ENABLE: u32 = 1 << 31;
+const V3D_MMU_CTL_CAP_EXCEEDED: u32 = 1 << 27;
+const V3D_MMU_CTL_PT_INVALID: u32 = 1 << 20;
+const V3D_MMU_CTL_WRITE_VIOLATION: u32 = 1 << 12;
+const V3D_MMU_VIO_ID: usize = 0x122c;
+const V3D_MMU_VIO_ADDR: usize = 0x1234;
+const V3D_MMU_DEBUG_INFO: usize = 0x1238;
+const V3D_HUB_INT_STS: usize = 0x0050;
+const V3D_HUB_INT_CLR: usize = 0x0058;
+const V3D_HUB_INT_MMU_WRV: u32 = 1 << 5;
+const V3D_HUB_INT_MMU_PTI: u32 = 1 << 4;
+const V3D_HUB_INT_MMU_CAP: u32 = 1 << 3;
+const V3D_HUB_INT_MMU: u32 = V3D_HUB_INT_MMU_WRV | V3D_HUB_INT_MMU_PTI | V3D_HUB_INT_MMU_CAP;
+const V3D_ERR_STAT: usize = 0x0f20;
+const V3D_HUB_INT_MSK_SET: usize = 0x0060;
+const V3D_HUB_INT_MSK_CLR: usize = 0x0064;
+const V3D_CTL_INT_MSK_SET: usize = 0x0060;
+const V3D_CTL_INT_MSK_CLR: usize = 0x0064;
+const V3D_INT_CSDDONE: u32 = 1 << 7;
+const V3D_INT_FLDONE: u32 = 1 << 1;
+const V3D_INT_FRDONE: u32 = 1 << 0;
+/// v3d_irq.c V3D_CORE_IRQS and V3D_HUB_IRQS for V3D 4.2 (no TFU here).
+const V3D_CORE_IRQS: u32 = V3D_INT_OUTOMEM | V3D_INT_FLDONE | V3D_INT_FRDONE | V3D_INT_CSDDONE;
+const V3D_HUB_IRQS: u32 = V3D_HUB_INT_MMU;
+/// The fallback check while v3dd waits for the interrupt.
+const IRQ_FALLBACK: Duration = Duration::from_millis(5);
+/// The Pi 400's v3d node: GIC SPI 74, level high.
+const V3D_IRQ_DEFAULT: [u32; 3] = [0, 74, 4];
 
 const V3D_CTL_SLCACTL: usize = 0x0024;
 const V3D_CTL_L2TCACTL: usize = 0x0030;
@@ -217,6 +271,113 @@ fn power_up(pm: &Regs, asb: &Regs) {
     }
 }
 
+/// Gives a V3D address range back: sorted, merged with its neighbours, and
+/// handed back to the top (`next_va`) when it ends there, so freed ranges
+/// do not pile up (Test 600: 3 -> 23 ranges).
+fn release_va(free: &mut Vec<(u32, usize)>, next_va: &mut u32, va: u32, pages: usize) {
+    let end = |(va, pages): (u32, usize)| va + (pages * PAGE) as u32;
+    let i = free.partition_point(|&(v, _)| v < va);
+    free.insert(i, (va, pages));
+    if i + 1 < free.len() && end(free[i]) == free[i + 1].0 {
+        free[i].1 += free[i + 1].1;
+        free.remove(i + 1);
+    }
+    if i > 0 && end(free[i - 1]) == free[i].0 {
+        free[i - 1].1 += free[i].1;
+        free.remove(i);
+    }
+    if let Some(&last) = free.last()
+        && end(last) == *next_va
+    {
+        *next_va = last.0;
+        free.pop();
+    }
+}
+
+user_data! {
+    enum IrqSource {
+        Irq,
+        Time,
+    }
+}
+
+/// The V3D interrupt from /scheme/irq and the fallback timer.
+struct Irq {
+    path: String,
+    file: File,
+    timer: File,
+    queue: EventQueue<IrqSource>,
+    /// A fallback timeout is pending: every write to /scheme/time adds one
+    /// more (Test 603: one per loop piled up to a wakeup every 0.12 ms).
+    armed: bool,
+}
+
+/// /scheme/irq/phandle-P/A,B,C for the v3d node: `interrupts` of the node
+/// (GIC SPI 74 when the devicetree has no v3d node), the controller from
+/// the first `interrupt-parent` of the node, its bus or the root.
+fn irq_path(fdt: &fdt::Fdt) -> Option<String> {
+    let cells = |raw: &[u8]| -> Vec<u32> {
+        raw.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect()
+    };
+    let node = fdt.find_compatible(&["brcm,2711-v3d"]);
+    let parent = [node, fdt.find_node("/v3dbus"), fdt.find_node("/scb"), fdt.find_node("/")]
+        .into_iter()
+        .flatten()
+        .find_map(|n| cells(n.property("interrupt-parent")?.value).first().copied())?;
+    let gic = fdt.find_phandle(parent)?;
+    let count = *cells(gic.property("#interrupt-cells")?.value).first()? as usize;
+    let spec = node
+        .and_then(|n| n.property("interrupts"))
+        .map(|p| cells(p.value))
+        .unwrap_or_else(|| V3D_IRQ_DEFAULT.to_vec());
+    let spec: Vec<String> = spec.get(..count)?.iter().map(u32::to_string).collect();
+    Some(format!("/scheme/irq/phandle-{parent}/{}", spec.join(",")))
+}
+
+impl Irq {
+    fn open(path: String) -> std::result::Result<Irq, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .map_err(|err| format!("{path}: {err}"))?;
+        let timer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(syscall::O_NONBLOCK as i32)
+            .open(format!("/scheme/time/{}", syscall::CLOCK_MONOTONIC))
+            .map_err(|err| format!("/scheme/time: {err}"))?;
+        let queue = EventQueue::<IrqSource>::new().map_err(|err| format!("event queue: {err}"))?;
+        queue
+            .subscribe(file.as_raw_fd() as usize, IrqSource::Irq, event::EventFlags::READ)
+            .map_err(|err| format!("event queue: {err}"))?;
+        queue
+            .subscribe(timer.as_raw_fd() as usize, IrqSource::Time, event::EventFlags::READ)
+            .map_err(|err| format!("event queue: {err}"))?;
+        Ok(Irq { path, file, timer, queue, armed: false })
+    }
+
+    /// The fallback timer fires `after` from now, unless one is pending.
+    fn arm(&mut self, after: Duration) {
+        if self.armed {
+            return;
+        }
+        self.armed = true;
+        let mut time = syscall::TimeSpec::default();
+        if self.timer.read(&mut time).is_err() {
+            return;
+        }
+        let nsec = time.tv_nsec as u64 + u64::from(after.subsec_nanos());
+        time.tv_sec += after.as_secs() as i64 + (nsec / 1_000_000_000) as i64;
+        time.tv_nsec = (nsec % 1_000_000_000) as i32;
+        let _ = self.timer.write(&time);
+    }
+}
+
+/// fmap offsets: the BO ID above this bit, the byte in the BO below.
+const MAP_ID_SHIFT: u32 = 32;
+
 struct Bo {
     mem: Dma<[u32]>,
     va: u32,
@@ -232,24 +393,38 @@ struct Stats {
     job_us_max: u128,
     cl_jobs: u64,
     outomem: u64,
+    mmu_faults: u64,
+    resets: u64,
+    irqs: u64,
+    irq_wakeups: u64,
+    timer_wakeups: u64,
+    maps: u64,
+    unmaps: u64,
 }
 
 struct V3d {
     hub: Regs,
     core: Regs,
     pm: Regs,
+    asb: Regs,
     pt: Dma<[u32]>,
+    scratch_phys: usize,
     /// Free V3D address ranges (VA, pages), first fit.
     free_va: Vec<(u32, usize)>,
     next_va: u32,
     stats: Stats,
+    /// None: v3dd polls.
+    irq: Option<Irq>,
+    /// Interrupt bits the handler took and cleared, for the waiting code.
+    core_seen: u32,
+    hub_seen: u32,
     /// The binner's overflow memory: chunk 0 at the start of each bin job,
     /// more on OUTOMEM. Kept for the next jobs.
     overflow: Vec<Bo>,
 }
 
 impl V3d {
-    fn new(hub: Regs, core: Regs, pm: Regs) -> V3d {
+    fn new(hub: Regs, core: Regs, pm: Regs, asb: Regs, irq: Option<Irq>) -> V3d {
         let pt = match Dma::<[u32]>::zeroed_slice(PT_ENTRIES) {
             Ok(dma) => unsafe { dma.assume_init() },
             Err(err) => fail(&format!("no 4 MiB of contiguous memory for the page table: {err:?}")),
@@ -263,18 +438,25 @@ impl V3d {
         let scratch_phys = scratch.physical();
         // The scratch page lives as long as the daemon.
         std::mem::forget(scratch);
-        core.write(V3D_CTL_L2TFLSTA, 0);
-        core.write(V3D_CTL_L2TFLEND, !0);
-        hub.write(V3D_MMU_PT_PA_BASE, (pt_phys / PAGE) as u32);
-        hub.write(V3D_MMU_CTL, V3D_MMU_CTL_ENABLES);
-        hub.write(V3D_MMU_ILLEGAL_ADDR, (scratch_phys / PAGE) as u32 | V3D_MMU_ILLEGAL_ADDR_ENABLE);
-        hub.write(V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_ENABLE);
-        if !csd::mmu_flush(&hub) {
+        let mut v3d = V3d {
+            hub,
+            core,
+            pm,
+            asb,
+            pt,
+            scratch_phys,
+            free_va: Vec::new(),
+            next_va: VA_START,
+            stats: Stats::default(),
+            irq,
+            core_seen: 0,
+            hub_seen: 0,
+            overflow: Vec::new(),
+        };
+        if !v3d.hw_setup() {
             fail("MMU flush did not finish");
         }
         say(&format!("MMU on: page table at {pt_phys:#x}, scratch page at {scratch_phys:#x}"));
-        let mut v3d =
-            V3d { hub, core, pm, pt, free_va: Vec::new(), next_va: VA_START, stats: Stats::default(), overflow: Vec::new() };
         match v3d.new_bo(OVERFLOW_SIZE) {
             Ok(bo) => v3d.overflow.push(bo),
             Err(err) => fail(&format!("no binner overflow memory: {err}")),
@@ -327,59 +509,222 @@ impl V3d {
             self.pt[bo.va as usize / PAGE + page] = 0;
         }
         csd::mmu_flush(&self.hub);
-        self.free_va.push((bo.va, bo.pages));
+        release_va(&mut self.free_va, &mut self.next_va, bo.va, bo.pages);
         self.stats.frees += 1;
         // bo.mem is freed here, after the MMU no longer maps it.
     }
 
-    /// One CSD job (v3d_csd_job_run()), caches as v3d_invalidate_caches()
-    /// before and v3d_clean_caches() after.
-    fn csd(&mut self, cfg: [u32; 7]) -> std::result::Result<u128, String> {
-        let core = &self.core;
-        let watchdog = Watchdog(&self.pm);
-        watchdog.arm();
-        core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS);
-        core.write(V3D_CTL_SLCACTL, 0x0f0f_0f0f);
-        let completed_before = (core.read(V3D_CSD_STATUS) >> 4) & 0xff;
-        for i in 1..=6 {
-            core.write(V3D_CSD_QUEUED_CFG0 + 4 * i, cfg[i]);
+    /// v3d_init_core() and v3d_mmu_set_page_table(): after power-up and
+    /// after every reset.
+    fn hw_setup(&self) -> bool {
+        self.core.write(V3D_CTL_L2TFLSTA, 0);
+        self.core.write(V3D_CTL_L2TFLEND, !0);
+        self.hub.write(V3D_MMU_PT_PA_BASE, (self.pt.physical() / PAGE) as u32);
+        self.hub.write(V3D_MMU_CTL, V3D_MMU_CTL_ENABLES);
+        self.hub.write(V3D_MMU_ILLEGAL_ADDR, (self.scratch_phys / PAGE) as u32 | V3D_MMU_ILLEGAL_ADDR_ENABLE);
+        self.hub.write(V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_ENABLE);
+        if self.irq.is_some() {
+            // v3d_irq_enable(): ours unmasked, all others masked.
+            self.core.write(V3D_CTL_INT_CLR, V3D_CORE_IRQS);
+            self.hub.write(V3D_HUB_INT_CLR, V3D_HUB_IRQS);
+            self.core.write(V3D_CTL_INT_MSK_SET, !V3D_CORE_IRQS);
+            self.core.write(V3D_CTL_INT_MSK_CLR, V3D_CORE_IRQS);
+            self.hub.write(V3D_HUB_INT_MSK_SET, !V3D_HUB_IRQS);
+            self.hub.write(V3D_HUB_INT_MSK_CLR, V3D_HUB_IRQS);
         }
+        csd::mmu_flush(&self.hub)
+    }
+
+    /// v3d_irq() and v3d_hub_irq(): takes the status bits, clears them in
+    /// V3D (the line is level triggered), keeps them for the waiting code,
+    /// then lets the interrupt controller deliver the next one.
+    /// The read returns nothing when no interrupt is pending: then there is
+    /// nothing to ack either. Returns whether one was handled.
+    fn handle_irq(&mut self) -> bool {
+        let mut token = [0u8; 8];
+        let Some(irq) = self.irq.as_mut() else { return false };
+        if !matches!(irq.file.read(&mut token), Ok(8)) {
+            return false;
+        }
+        let core = self.core.read(V3D_CTL_INT_STS) & V3D_CORE_IRQS;
+        let hub = self.hub.read(V3D_HUB_INT_STS) & V3D_HUB_IRQS;
+        self.core.write(V3D_CTL_INT_CLR, core);
+        self.hub.write(V3D_HUB_INT_CLR, hub);
+        self.core_seen |= core;
+        self.hub_seen |= hub;
+        self.stats.irqs += 1;
+        let _ = irq.file.write(&token);
+        true
+    }
+
+    /// Waits until `done`, at most `ms`: on the interrupt with the fallback
+    /// timer, or by polling when there is no interrupt.
+    fn wait_for(&mut self, what: &str, ms: u64, done: impl Fn(&V3d) -> bool) -> bool {
         let start = Instant::now();
-        core.write(V3D_CSD_QUEUED_CFG0, cfg[0]);
-        let finished = csd::wait("job", 1000, || {
-            let s = core.read(V3D_CSD_STATUS);
-            (s >> 4) & 0xff != completed_before && s & 0x3 == 0
-        });
-        let us = start.elapsed().as_micros();
-        if finished {
-            core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_TMUWCF);
-            csd::wait("TMU write combiner flush", 100, || core.read(V3D_CTL_L2TCACTL) & V3D_L2TCACTL_TMUWCF == 0);
-            core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_CLEAN);
-            csd::wait("L2T clean", 100, || core.read(V3D_CTL_L2TCACTL) & V3D_L2TCACTL_L2TFLS == 0);
+        loop {
+            if done(self) {
+                return true;
+            }
+            if start.elapsed() > Duration::from_millis(ms) {
+                say(&format!("timeout: {what} ({ms} ms)"));
+                return false;
+            }
+            let Some(irq) = self.irq.as_mut() else {
+                thread::yield_now();
+                continue;
+            };
+            irq.arm(IRQ_FALLBACK);
+            match irq.queue.next() {
+                Some(Ok(event)) => match event.user_data {
+                    IrqSource::Irq => {
+                        self.stats.irq_wakeups += 1;
+                        self.handle_irq();
+                    }
+                    IrqSource::Time => {
+                        irq.armed = false;
+                        let mut time = syscall::TimeSpec::default();
+                        let _ = irq.timer.read(&mut time);
+                        self.stats.timer_wakeups += 1;
+                    }
+                },
+                Some(Err(err)) if err.is_interrupt() => {}
+                Some(Err(err)) => {
+                    say(&format!("interrupt: event queue failed ({err}): polling from now on"));
+                    self.irq = None;
+                }
+                None => self.irq = None,
+            }
+        }
+    }
+
+    /// v3d_reset() on the BCM2711: the reset controller is the PM's
+    /// (bcm2835_reset_reset(): bridges closed, slave first, PM_V3DRSTN
+    /// asserted, then released and the bridges opened, master first), then
+    /// the core and the MMU set up again. The jobs in flight are lost.
+    fn reset(&mut self) {
+        let (pm, asb) = (&self.pm, &self.asb);
+        say(&format!("reset: V3D_ERR_STAT {:#x}", self.core.read(V3D_ERR_STAT)));
+        let bridge = |reg: usize, stop: bool| -> bool {
+            let v = asb.read(reg);
+            asb.write(reg, PM_PASSWORD | if stop { v | ASB_REQ_STOP } else { v & !ASB_REQ_STOP });
+            let start = Instant::now();
+            while (asb.read(reg) & ASB_ACK != 0) != stop {
+                if start.elapsed() > Duration::from_millis(10) {
+                    return false;
+                }
+            }
+            true
+        };
+        // A bridge that does not ack its stop (an access stuck in it) does
+        // not stop the reset: Linux gives up there, v3dd goes on, so the
+        // core is reset either way.
+        for (reg, name) in [(ASB_V3D_S_CTRL, "slave"), (ASB_V3D_M_CTRL, "master")] {
+            if !bridge(reg, true) {
+                say(&format!("reset: ASB {name} bridge: no ack for the stop within 10 ms"));
+            }
+        }
+        pm.write(PM_GRAFX, PM_PASSWORD | (pm.read(PM_GRAFX) & !PM_V3DRSTN));
+        thread::sleep(Duration::from_millis(1));
+        pm.write(PM_GRAFX, PM_PASSWORD | pm.read(PM_GRAFX) | PM_V3DRSTN);
+        thread::sleep(Duration::from_millis(1));
+        let mut open = true;
+        for (reg, name) in [(ASB_V3D_M_CTRL, "master"), (ASB_V3D_S_CTRL, "slave")] {
+            if !bridge(reg, false) {
+                say(&format!("reset: ASB {name} bridge: no ack for the start within 10 ms"));
+                open = false;
+            }
+        }
+        let setup = open && self.hw_setup();
+        self.stats.resets += 1;
+        self.core_seen = 0;
+        self.hub_seen = 0;
+        say(&format!(
+            "reset: {} (resets so far: {})",
+            if setup { "done, MMU set up again" } else { "FAILED: V3D is not usable" },
+            self.stats.resets
+        ));
+    }
+
+    /// An MMU fault since the last call, cleared, as v3d_hub_irq() reports
+    /// it: the address (MMU_VIO_ADDR << (va_width - 32)) and the unit.
+    fn mmu_fault(&mut self) -> Option<String> {
+        let hub = &self.hub;
+        let ints = (hub.read(V3D_HUB_INT_STS) | self.hub_seen) & V3D_HUB_INT_MMU;
+        self.hub_seen = 0;
+        let ctl = hub.read(V3D_MMU_CTL);
+        let flags = ctl & (V3D_MMU_CTL_CAP_EXCEEDED | V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION);
+        if ints == 0 && flags == 0 {
+            return None;
+        }
+        let va_width = 30 + ((hub.read(V3D_MMU_DEBUG_INFO) >> 4) & 0xf);
+        let addr = (hub.read(V3D_MMU_VIO_ADDR) as u64) << va_width.saturating_sub(32);
+        let id = hub.read(V3D_MMU_VIO_ID) >> 5;
+        let unit = ["L2T", "PTB", "PSE", "TLB", "CLE", "TFU", "MMU", "GMP"].get(id as usize).copied().unwrap_or("?");
+        let mut kinds = Vec::new();
+        if ints & V3D_HUB_INT_MMU_PTI != 0 || flags & V3D_MMU_CTL_PT_INVALID != 0 {
+            kinds.push("no-pte");
+        }
+        if ints & V3D_HUB_INT_MMU_WRV != 0 || flags & V3D_MMU_CTL_WRITE_VIOLATION != 0 {
+            kinds.push("write-violation");
+        }
+        if ints & V3D_HUB_INT_MMU_CAP != 0 || flags & V3D_MMU_CTL_CAP_EXCEEDED != 0 {
+            kinds.push("cap-exceeded");
+        }
+        // The status bits in MMU_CTL are write-1-to-clear (v3d_hub_irq()).
+        hub.write(V3D_MMU_CTL, ctl);
+        hub.write(V3D_HUB_INT_CLR, V3D_HUB_INT_MMU);
+        self.stats.mmu_faults += 1;
+        Some(format!("{} va {addr:#x} unit {unit}", kinds.join(",")))
+    }
+
+    /// Runs one job with the watchdog armed, then looks for an MMU fault;
+    /// a job that did not end (any Err of `run`) resets V3D.
+    fn job<T>(&mut self, run: impl FnOnce(&mut V3d) -> std::result::Result<T, String>) -> std::result::Result<T, String> {
+        let pm = Regs { base: self.pm.base };
+        let watchdog = Watchdog(&pm);
+        watchdog.arm();
+        if let Some(old) = self.mmu_fault() {
+            say(&format!("stale MMU fault before a job, cleared: {old}"));
+            self.stats.mmu_faults -= 1;
+        }
+        let result = run(self);
+        // A job that was done before v3dd waited leaves its interrupt
+        // pending; ack it now, or the line stays blocked for the next job.
+        self.handle_irq();
+        // The register dump before mmu_fault() clears the fault state.
+        if result.is_err() {
+            self.state();
+        }
+        let fault = self.mmu_fault();
+        if result.is_err() {
+            self.reset();
         }
         watchdog.stop();
         self.stats.jobs += 1;
-        if finished {
-            self.stats.job_us_max = self.stats.job_us_max.max(us);
-            Ok(us)
-        } else {
-            self.stats.failed_jobs += 1;
-            csd::state(&self.hub, &self.core);
-            Err(format!("job not done after {us} us"))
+        match (result, fault) {
+            (Ok(value), None) => Ok(value),
+            (Ok(_), Some(fault)) => {
+                self.stats.failed_jobs += 1;
+                say(&format!("job ended with an MMU fault: {fault}"));
+                Err(format!("mmu-fault {fault}"))
+            }
+            (Err(err), None) => {
+                self.stats.failed_jobs += 1;
+                say(&format!("job failed: {err}; V3D reset"));
+                Err(format!("{err}; V3D reset"))
+            }
+            (Err(err), Some(fault)) => {
+                self.stats.failed_jobs += 1;
+                say(&format!("job failed: {err}, MMU fault {fault}; V3D reset"));
+                Err(format!("mmu-fault {fault}; {err}; V3D reset"))
+            }
         }
     }
-}
 
-impl V3d {
-    fn invalidate_caches(&self) {
-        self.core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS);
-        self.core.write(V3D_CTL_SLCACTL, 0x0f0f_0f0f);
-    }
-
-    fn cle_state(&self) {
+    fn state(&self) {
         let core = &self.core;
         say(&format!(
-            "cl: CT0CS {:#x} CT0CA {:#x}, CT1CS {:#x} CT1CA {:#x}, BFC {:#x}, RFC {:#x}, CTL_INT_STS {:#x}",
+            "state: CT0CS {:#x} CT0CA {:#x}, CT1CS {:#x} CT1CA {:#x}, BFC {:#x}, RFC {:#x}, CTL_INT_STS {:#x}",
             core.read(V3D_CLE_CT0CS),
             core.read(V3D_CLE_CT0CA),
             core.read(V3D_CLE_CT1CS),
@@ -391,26 +736,57 @@ impl V3d {
         csd::state(&self.hub, &self.core);
     }
 
+    fn invalidate_caches(&self) {
+        self.core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS);
+        self.core.write(V3D_CTL_SLCACTL, 0x0f0f_0f0f);
+    }
+
+    /// v3d_clean_caches(): the TMU write combiner, then L2T, so the CPU
+    /// sees what the job wrote.
+    fn clean_caches(&self) {
+        let core = &self.core;
+        core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_TMUWCF);
+        csd::wait("TMU write combiner flush", 100, || core.read(V3D_CTL_L2TCACTL) & V3D_L2TCACTL_TMUWCF == 0);
+        core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_CLEAN);
+        csd::wait("L2T clean", 100, || core.read(V3D_CTL_L2TCACTL) & V3D_L2TCACTL_L2TFLS == 0);
+    }
+
+    /// One CSD job (v3d_csd_job_run()). Time in microseconds.
+    fn csd(&mut self, cfg: [u32; 7]) -> std::result::Result<u128, String> {
+        let us = self.job(|v3d| {
+            v3d.invalidate_caches();
+            let core = &v3d.core;
+            let completed_before = (core.read(V3D_CSD_STATUS) >> 4) & 0xff;
+            for i in 1..=6 {
+                core.write(V3D_CSD_QUEUED_CFG0 + 4 * i, cfg[i]);
+            }
+            let start = Instant::now();
+            core.write(V3D_CSD_QUEUED_CFG0, cfg[0]);
+            let finished = v3d.wait_for("CSD job", 1000, |v3d| {
+                let s = v3d.core.read(V3D_CSD_STATUS);
+                (s >> 4) & 0xff != completed_before && s & 0x3 == 0
+            });
+            v3d.core_seen &= !V3D_INT_CSDDONE;
+            let us = start.elapsed().as_micros();
+            if !finished {
+                return Err(format!("timeout: CSD job not done after {us} us"));
+            }
+            v3d.clean_caches();
+            Ok(us)
+        })?;
+        self.stats.job_us_max = self.stats.job_us_max.max(us);
+        Ok(us)
+    }
+
     /// One bin job (v3d_bin_job_run()), the binner's OUTOMEM answered with
     /// more overflow memory (v3d_overflow_mem_work()), then one render job
     /// (v3d_render_job_run()). Times in microseconds.
     fn bin_render(&mut self, bcl: (u32, u32), rcl: (u32, u32), qma: u32, qms: u32, qts: u32)
         -> std::result::Result<(u128, u128), String> {
-        let pm = Regs { base: self.pm.base };
-        let watchdog = Watchdog(&pm);
-        watchdog.arm();
-        let result = self.bin_render_armed(bcl, rcl, qma, qms, qts);
-        watchdog.stop();
-        self.stats.jobs += 1;
         self.stats.cl_jobs += 1;
-        match &result {
-            Ok((bin, render)) => self.stats.job_us_max = self.stats.job_us_max.max(bin + render),
-            Err(_) => {
-                self.stats.failed_jobs += 1;
-                self.cle_state();
-            }
-        }
-        result
+        let (bin, render) = self.job(|v3d| v3d.bin_render_armed(bcl, rcl, qma, qms, qts))?;
+        self.stats.job_us_max = self.stats.job_us_max.max(bin + render);
+        Ok((bin, render))
     }
 
     fn bin_render_armed(&mut self, bcl: (u32, u32), rcl: (u32, u32), qma: u32, qms: u32, qts: u32)
@@ -431,13 +807,20 @@ impl V3d {
         let start = Instant::now();
         self.core.write(V3D_CLE_CT0QEA, bcl.1);
         let mut next = 1;
+        let binned = |v3d: &V3d| v3d.core.read(V3D_CLE_BFC) & 0xff != bfc;
+        let outomem = |v3d: &V3d| (v3d.core.read(V3D_CTL_INT_STS) | v3d.core_seen) & V3D_INT_OUTOMEM != 0;
         loop {
-            if self.core.read(V3D_CLE_BFC) & 0xff != bfc {
+            let left = 1000u64.saturating_sub(start.elapsed().as_millis() as u64);
+            if !self.wait_for("bin job", left, |v3d| binned(v3d) || outomem(v3d)) {
+                return Err(format!("timeout: bin job not done after {} us", start.elapsed().as_micros()));
+            }
+            if binned(self) {
                 break;
             }
-            if self.core.read(V3D_CTL_INT_STS) & V3D_INT_OUTOMEM != 0 {
+            {
                 // Edge signalled: cleared first, set again only after the
                 // binner has used the new memory up too.
+                self.core_seen &= !V3D_INT_OUTOMEM;
                 self.core.write(V3D_CTL_INT_CLR, V3D_INT_OUTOMEM);
                 if next == self.overflow.len() {
                     if next == OVERFLOW_CHUNKS_MAX {
@@ -451,28 +834,23 @@ impl V3d {
                 next += 1;
                 self.stats.outomem += 1;
             }
-            if start.elapsed() > Duration::from_secs(1) {
-                return Err(format!("bin job not done after {} us", start.elapsed().as_micros()));
-            }
-            thread::yield_now();
         }
+        self.core_seen &= !V3D_INT_FLDONE;
         let bin_us = start.elapsed().as_micros();
 
         self.invalidate_caches();
-        let core = &self.core;
-        let rfc = core.read(V3D_CLE_RFC) & 0xff;
-        core.write(V3D_CLE_CT1QBA, rcl.0);
+        let rfc = self.core.read(V3D_CLE_RFC) & 0xff;
+        self.core.write(V3D_CLE_CT1QBA, rcl.0);
         let start = Instant::now();
-        core.write(V3D_CLE_CT1QEA, rcl.1);
-        if !csd::wait("render job", 1000, || core.read(V3D_CLE_RFC) & 0xff != rfc) {
-            return Err(format!("render job not done after {} us", start.elapsed().as_micros()));
+        self.core.write(V3D_CLE_CT1QEA, rcl.1);
+        let rendered = self.wait_for("render job", 1000, |v3d| v3d.core.read(V3D_CLE_RFC) & 0xff != rfc);
+        self.core_seen &= !V3D_INT_FRDONE;
+        if !rendered {
+            return Err(format!("timeout: render job not done after {} us", start.elapsed().as_micros()));
         }
         let render_us = start.elapsed().as_micros();
         // As after a CSD job, so the CPU sees what the TLB stored.
-        core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_TMUWCF);
-        csd::wait("TMU write combiner flush", 100, || core.read(V3D_CTL_L2TCACTL) & V3D_L2TCACTL_TMUWCF == 0);
-        core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_CLEAN);
-        csd::wait("L2T clean", 100, || core.read(V3D_CTL_L2TCACTL) & V3D_L2TCACTL_L2TFLS == 0);
+        self.clean_caches();
         Ok((bin_us, render_us))
     }
 }
@@ -565,17 +943,25 @@ impl V3dScheme {
             Some("stats") => {
                 let s = &self.v3d.stats;
                 Ok(format!(
-                    "bos {} frees {} jobs {} cl_jobs {} failed {} job_us_max {} outomem {} overflow_chunks {} va_next {:#x} va_free_ranges {}",
+                    "bos {} frees {} jobs {} cl_jobs {} failed {} mmu_faults {} resets {} job_us_max {} outomem {} overflow_chunks {} va_next {:#x} va_free_ranges {} irq {} irqs {} irq_wakeups {} timer_wakeups {} maps {} unmaps {}",
                     s.bos,
                     s.frees,
                     s.jobs,
                     s.cl_jobs,
                     s.failed_jobs,
+                    s.mmu_faults,
+                    s.resets,
                     s.job_us_max,
                     s.outomem,
                     self.v3d.overflow.len(),
                     self.v3d.next_va,
-                    self.v3d.free_va.len()
+                    self.v3d.free_va.len(),
+                    self.v3d.irq.as_ref().map(|irq| irq.path.as_str()).unwrap_or("off"),
+                    s.irqs,
+                    s.irq_wakeups,
+                    s.timer_wakeups,
+                    s.maps,
+                    s.unmaps
                 ))
             }
             _ => Err(format!("unknown command: {line}")),
@@ -633,6 +1019,33 @@ impl SchemeSync for V3dScheme {
         Ok(buf.len())
     }
 
+    /// fmap of a BO (see the top of the file). Returns where the BO lies in
+    /// v3dd: the kernel maps the same pages into the client.
+    fn mmap_prep(&mut self, id: usize, offset: u64, size: usize, flags: MapFlags, _ctx: &CallerCtx) -> Result<usize> {
+        let Handle::Client { bos, .. } = self.handles.get(id)? else {
+            return Err(Error::new(EBADF));
+        };
+        // A private (copy-on-write) mapping would also make v3dd's own
+        // pages read-only, and V3D would never see the client's writes.
+        if !flags.contains(MapFlags::MAP_SHARED) {
+            return Err(Error::new(EINVAL));
+        }
+        let bo = bos.get(&((offset >> MAP_ID_SHIFT) as u32)).ok_or(Error::new(ENOENT))?;
+        let at = (offset & ((1 << MAP_ID_SHIFT) - 1)) as usize;
+        if at % PAGE != 0 || size == 0 || at.checked_add(size).is_none_or(|end| end > bo.pages * PAGE) {
+            return Err(Error::new(EINVAL));
+        }
+        self.v3d.stats.maps += 1;
+        Ok(bo.mem.as_ptr() as usize + at)
+    }
+
+    /// The client unmapped (part of) a BO. The kernel keeps the pages
+    /// until the last mapping goes, so there is nothing to free here.
+    fn munmap(&mut self, _id: usize, _offset: u64, _size: usize, _flags: MunmapFlags, _ctx: &CallerCtx) -> Result<()> {
+        self.v3d.stats.unmaps += 1;
+        Ok(())
+    }
+
     fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
         self.handles.get(id).map_err(|_| Error::new(EBADF))?;
         FpathWriter::with(buf, "v3d", |_| Ok(()))
@@ -654,7 +1067,8 @@ fn main() {
 fn daemon(daemon: daemon::SchemeDaemon) -> ! {
     common::init();
     let dtb = fs::read("/scheme/kernel.dtb").unwrap_or_default();
-    let bcm2711 = fdt::Fdt::new(&dtb).is_ok_and(|f| {
+    let fdt = fdt::Fdt::new(&dtb).ok();
+    let bcm2711 = fdt.as_ref().is_some_and(|f| {
         f.find_compatible(&["brcm,2711-v3d"]).is_some() || f.root().compatible().all().any(|c| c == "brcm,bcm2711")
     });
     if !bcm2711 {
@@ -674,7 +1088,23 @@ fn daemon(daemon: daemon::SchemeDaemon) -> ! {
         fail(&format!("V3D version {ver} (HUB_IDENT1 {h1:#x})"));
     }
     say(&format!("V3D {ver} powered up"));
-    let v3d = V3d::new(hub, core, pm);
+    let irq = match fdt.as_ref().and_then(irq_path) {
+        Some(path) => match Irq::open(path) {
+            Ok(irq) => {
+                say(&format!("interrupt: {}", irq.path));
+                Some(irq)
+            }
+            Err(err) => {
+                say(&format!("interrupt: {err}: polling"));
+                None
+            }
+        },
+        None => {
+            say("interrupt: none in the devicetree: polling");
+            None
+        }
+    };
+    let v3d = V3d::new(hub, core, pm, asb, irq);
     let mut scheme = V3dScheme { v3d, handles: HandleMap::new() };
 
     let socket = Socket::create().expect("v3dd: failed to create the v3d scheme");

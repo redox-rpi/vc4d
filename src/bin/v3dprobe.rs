@@ -18,7 +18,8 @@
 //
 // v3dprobe [--csd] [--render [--triangle | --triangle-math] [--show SECONDS]]
 //          [--off] [--no-watchdog]
-// v3dprobe --via-v3dd [--loops N] [--render [--triangle | --triangle-math]]
+// v3dprobe --via-v3dd [--loops N] [--render [--triangle | --triangle-math] | --faults]
+//          [--mapped]
 //   --show: the rendered picture in an Orbital window for SECONDS (step 2c)
 //   --render: step 2 (redox-rpi#596): bin and render control lists, see
 //     v3d/render.rs; clear only, or with --triangle a red triangle whose
@@ -30,6 +31,11 @@
 //   --via-v3dd: step 3 (redox-rpi#598): the --csd job N times (default
 //     100) through v3dd and /scheme/v3d; touches no registers itself.
 //     With --render, the --render frame N times instead (step 3b).
+//     With --faults, a job with a bad address and a job that never ends,
+//     then jobs that must still pass (step 3c).
+//     With --mapped, the BOs are mapped into v3dprobe and written and read
+//     there instead of through put/get (step 3e, redox-rpi#666); a check of
+//     the mappings runs first and a check for leaked BOs last.
 //   --no-watchdog: do not arm the SoC watchdog around the V3D accesses
 //
 // The first V3D accesses can hang the bus (a block without power or clock).
@@ -123,12 +129,114 @@ impl Regs {
     }
 }
 
+/// Step 3c (redox-rpi#598): a job with a bad address and a job that never
+/// ends; v3dd must report both and run the next jobs right.
+fn faults_via_v3dd() -> bool {
+    let mut v3d = match client::Client::open() {
+        Ok(v3d) => v3d,
+        Err(err) => {
+            say(&format!("faults: FAIL: {err}"));
+            return false;
+        }
+    };
+    let mut ok = true;
+    let mut check = |name: &str, pass: bool, what: String| {
+        say(&format!("faults: {name}: {} {what}", if pass { "PASS" } else { "FAIL" }));
+        ok &= pass;
+    };
+    match csd::bad_address_via_v3dd(&mut v3d) {
+        Ok(answer) => check("bad address", answer.contains("mmu-fault"), format!("(v3dd: {answer})")),
+        Err(err) => check("bad address", false, err),
+    }
+    check("CSD after the fault", csd::via_v3dd(10), String::new());
+    match render::endless_via_v3dd(&mut v3d) {
+        Ok(answer) => check(
+            "endless job",
+            answer.contains("timeout") && answer.contains("reset"),
+            format!("(v3dd: {answer})"),
+        ),
+        Err(err) => check("endless job", false, err),
+    }
+    check("CSD after the reset", csd::via_v3dd(10), String::new());
+    check("render after the reset", render::via_v3dd(render::Draw::Clear, 10), String::new());
+    if let Ok(stats) = v3d.ask("stats") {
+        say(&format!("faults: v3dd stats: {stats}"));
+    }
+    say(if ok {
+        "faults: PASS: the MMU fault came back, the endless job was reset, the next jobs ran right"
+    } else {
+        "faults: FAIL"
+    });
+    ok
+}
+
+/// Step 3e (redox-rpi#666): what is written through a mapping is what v3dd
+/// reads, and the other way round; a BO freed while mapped stays usable
+/// memory for the client.
+fn mapped_check() -> Result<String, String> {
+    let mut v3d = client::Client::open()?;
+    let bo = v3d.bo(2 * 4096)?;
+    let words = 2 * 4096 / 4;
+    let a: Vec<u32> = (0..words as u32).map(|i| 0x5a00_0000 ^ i.wrapping_mul(0x9e37_79b9)).collect();
+    v3d.put(&bo, 0, &a)?;
+    if v3d.get_by_command(&bo, 0, words)? != a {
+        return Err("v3dd does not read what was written through the mapping".into());
+    }
+    let b: Vec<u32> = a.iter().map(|w| !w).collect();
+    v3d.put_by_command(&bo, 0, &b)?;
+    if v3d.get(&bo, 0, words)? != b {
+        return Err("the mapping does not show what v3dd wrote".into());
+    }
+    // Freed by command while still mapped: V3D loses it, the client keeps
+    // its pages until it unmaps them (when v3d is dropped).
+    v3d.ask(&format!("free {}", bo.id))?;
+    v3d.put(&bo, 0, &a)?;
+    if v3d.get(&bo, 0, words)? != a {
+        return Err("a BO freed while mapped changed under the client".into());
+    }
+    v3d.ask("stats")
+}
+
+/// BOs v3dd still holds besides its overflow memory: none once every
+/// client has closed.
+fn leak_check() -> Result<String, String> {
+    let stats = client::Client::open()?.ask("stats")?;
+    let field = |name: &str| -> u64 {
+        let mut it = stats.split(' ');
+        while let Some(key) = it.next() {
+            if key == name {
+                return it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+        }
+        0
+    };
+    let held = field("bos").saturating_sub(field("frees"));
+    if held == field("overflow_chunks") {
+        Ok(stats)
+    } else {
+        Err(format!("{held} BOs held, {} of them overflow memory: {stats}", field("overflow_chunks")))
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     // Step 3 (redox-rpi#598): the CSD job through v3dd, no register access.
     if args.iter().any(|a| a == "--via-v3dd") {
+        let mapped = args.iter().any(|a| a == "--mapped");
+        if mapped {
+            client::MAPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+            match mapped_check() {
+                Ok(stats) => say(&format!("mapped: PASS: both ways, and after a free while mapped ({stats})")),
+                Err(err) => {
+                    say(&format!("mapped: FAIL: {err}"));
+                    std::process::exit(1);
+                }
+            }
+        }
         let loops = args.iter().position(|a| a == "--loops").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(100);
-        let ok = if args.iter().any(|a| a == "--render") {
+        let ok = if args.iter().any(|a| a == "--faults") {
+            faults_via_v3dd()
+        } else if args.iter().any(|a| a == "--render") {
             let draw = if args.iter().any(|a| a == "--triangle-math") {
                 render::Draw::MathShaders
             } else if args.iter().any(|a| a == "--triangle") {
@@ -140,6 +248,18 @@ fn main() {
         } else {
             csd::via_v3dd(loops)
         };
+        let ok = ok
+            && (!mapped
+                || match leak_check() {
+                    Ok(stats) => {
+                        say(&format!("mapped: no BOs leaked ({stats})"));
+                        true
+                    }
+                    Err(err) => {
+                        say(&format!("mapped: FAIL: {err}"));
+                        false
+                    }
+                });
         std::process::exit(if ok { 0 } else { 1 });
     }
     common::init();
