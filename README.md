@@ -10,7 +10,7 @@ Display and 3D drivers for the Broadcom VideoCore GPUs of the Raspberry Pi on
 | `vc4d` | Display: HVS planes, modes, flips, screenshots | Pi 3, 3B+, Zero 2 W (HVS4); Pi 4 and 400 (HVS5) |
 | `vc4shot` | Saves the picture on the screen as a PPM file | all of the above |
 | `v3dprobe` | V3D bring-up probe: power, MMU, compute and render jobs | Pi 4 and 400 (V3D 4.2) |
-| `v3dd` | V3D daemon: buffer objects and compute jobs behind `/scheme/v3d` | Pi 4 and 400 (V3D 4.2) |
+| `v3dd` | V3D daemon: buffer objects, compute and bin/render jobs behind `/scheme/v3d` | Pi 4 and 400 (V3D 4.2) |
 
 redox-rpi builds a pinned commit of this repository (experiments `vc4d` and
 `vc4d-flip`). Each image manifest names that commit.
@@ -116,23 +116,48 @@ the SoC instead of needing a person.
 
 **v3dd.** v3dd is started by init (redox-rpi experiment `v3dd`) and owns
 V3D. It powers it up, keeps one MMU page table, hands out zeroed buffer
-objects (BOs) mapped into it, and runs CSD jobs one at a time, with the
-cache handling of Linux v3d. Clients open `/scheme/v3d` (root only), write
-one command line and read the answer:
+objects (BOs) mapped into it, and runs CSD jobs and bin/render jobs one at
+a time, with the cache handling of Linux v3d. Clients open `/scheme/v3d`
+(root only), write one command line and read the answer:
 
 | Command | Answer |
 |---|---|
 | `bo BYTES` | `ID VA`: a new zeroed BO, mapped at V3D address VA |
 | `put ID WORD HEX...` | `ok`: writes 32-bit words from word WORD on |
 | `get ID WORD COUNT` | COUNT words in hex |
+| `fill ID WORD COUNT HEX` | `ok`: sets COUNT words to HEX |
 | `free ID` | `ok` |
 | `csd CFG0 ... CFG6` | `done US`: runs one CSD job and waits for it |
-| `stats` | counters: BOs, frees, jobs, failed jobs, longest job |
+| `cl BCL END RCL END QMA QMS QTS` | `done US bin US render US`: one bin job, then one render job |
+| `stats` | counters: BOs, frees, jobs, bin/render jobs, failed jobs, MMU faults, resets, longest job, overflow memory, free address ranges |
 
-BOs belong to the open file and are freed when it closes. On other boards
-v3dd leaves the hardware alone. `v3dprobe --via-v3dd [--loops N]` runs the
-step 1 job N times through v3dd. Do not run `v3dprobe --csd` or `--render`
-while v3dd runs: they set up their own page table.
+`cl` takes V3D addresses only: the bin and render control lists (start
+and end), the tile allocation memory and its size, and the tile state.
+The client builds them in its BOs. The binner's overflow memory belongs
+to v3dd: 512 KiB at the start of every bin job, and another 512 KiB chunk
+(at most 16) each time the binner runs out (`OUTOMEM`), as Linux
+`v3d_overflow_mem_work()`.
+
+BOs belong to the open file and are freed when it closes. Freed address
+ranges are reused. On other boards v3dd leaves the hardware alone.
+
+**Errors.** A job that makes the V3D MMU fault (an address with no page
+table entry, a write to a read-only page) answers
+`error mmu-fault KIND va ADDR unit UNIT`, as Linux `v3d_mmu_irq()` reports
+it. A job that is not done after 1 s answers `error timeout ...`. In both
+cases v3dd logs the core registers, resets V3D through the PM (as Linux
+`bcm2835_reset_reset()`), sets up the MMU and the caches again, and the
+next job runs. The SoC watchdog is armed only while a job runs, longer
+than the job timeout.
+
+`v3dprobe --via-v3dd [--loops N]` runs the step 1 job N times through
+v3dd; with `--render [--triangle | --triangle-math]` it runs the step 2
+frame N times instead and checks that every frame equals the first.
+`--faults` runs a job that stores to an unmapped address and one that
+never ends, and checks that both come back and the next jobs run right.
+
+Do not run `v3dprobe --csd` or `--render` while v3dd runs: they set up
+their own page table.
 
 ## Open
 
@@ -141,9 +166,9 @@ while v3dd runs: they set up their own page table.
   the BCM2711, vertical blank interrupts instead of the flush timer.
 - Orbital: windows on overlay planes (redox-rpi experiment
   `orbital-planes`).
-- V3D (#598 and later): bin and render jobs through v3dd, mapping BOs into
+- V3D (#598 and later): mapping BOs into
   clients instead of `put`/`get`, the V3D interrupt instead of polling,
-  recovery after a hung job, one address space per client, a directory
+  one address space per client, a directory
   listing of `/scheme/v3d`. Then a Mesa winsys for Redox.
 - The 3D block of the Pi 3, 3B+ and Zero 2 W (VideoCore IV, Linux `vc4`
   V3D) is a different GPU and has no code yet.
