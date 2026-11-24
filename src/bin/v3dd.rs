@@ -11,8 +11,16 @@
 //   bo BYTES                  -> ID VA         a new zeroed BO, mapped at VA
 //   put ID WORD HEX...        -> ok            writes 32-bit words from word WORD
 //   get ID WORD COUNT         -> HEX...        reads COUNT words from word WORD
+//   fill ID WORD COUNT HEX    -> ok            sets COUNT words to HEX
 //   free ID                   -> ok
 //   csd CFG0 CFG1 ... CFG6    -> done US       runs one CSD job, waits for it
+//   cl BCL END RCL END QMA QMS QTS
+//                             -> done US bin US render US
+//                                              one bin job, then one render
+//                                              job (all V3D addresses: the
+//                                              control lists, the tile
+//                                              allocation memory and its size,
+//                                              the tile state)
 //   stats                     -> one line of counters
 //
 // Numbers are decimal or 0x hex. A failed command answers "error ...". BOs
@@ -23,6 +31,10 @@
 //
 // Not yet (later steps of #598): bin/render jobs, mmap of BOs, the V3D
 // interrupt, recovery after a hung job, one address space per client.
+//
+// The binner's overflow memory belongs to v3dd: 512 KiB at the start of
+// every bin job, and another 512 KiB chunk each time the binner reports
+// it is out of memory (OUTOMEM), as Linux's v3d_overflow_mem_work().
 //
 // The SoC watchdog (bcm2835_wdt) is armed around the power-up and around
 // each job, as in v3dprobe: the Pi 400 in the lab has no remote power
@@ -42,6 +54,9 @@ use scheme_utils::{Blocking, FpathWriter, HandleMap};
 use syscall::error::{EACCES, EBADF, EINVAL, Error, Result};
 use syscall::schemev2::NewFdFlags;
 
+#[path = "v3d/client.rs"]
+#[allow(dead_code)]
+mod client;
 #[path = "v3d/csd.rs"]
 #[allow(dead_code)]
 mod csd;
@@ -88,6 +103,25 @@ const V3D_L2TCACTL_FLM_CLEAN: u32 = 2 << 1;
 const V3D_L2TCACTL_L2TFLS: u32 = 1 << 0;
 const V3D_CTL_L2TFLSTA: usize = 0x0034;
 const V3D_CTL_L2TFLEND: usize = 0x0038;
+const V3D_CTL_INT_STS: usize = 0x0050;
+const V3D_CTL_INT_CLR: usize = 0x0058;
+const V3D_INT_OUTOMEM: u32 = 1 << 2;
+const V3D_CLE_CT0CS: usize = 0x0100;
+const V3D_CLE_CT1CS: usize = 0x0104;
+const V3D_CLE_CT0CA: usize = 0x0110;
+const V3D_CLE_CT1CA: usize = 0x0114;
+const V3D_CLE_BFC: usize = 0x0134;
+const V3D_CLE_RFC: usize = 0x0138;
+const V3D_CLE_CT0QTS: usize = 0x015c;
+const V3D_CLE_CT0QTS_ENABLE: u32 = 1 << 1;
+const V3D_CLE_CT0QBA: usize = 0x0160;
+const V3D_CLE_CT1QBA: usize = 0x0164;
+const V3D_CLE_CT0QEA: usize = 0x0168;
+const V3D_CLE_CT1QEA: usize = 0x016c;
+const V3D_CLE_CT0QMA: usize = 0x0170;
+const V3D_CLE_CT0QMS: usize = 0x0174;
+const V3D_PTB_BPOA: usize = 0x0308;
+const V3D_PTB_BPOS: usize = 0x030c;
 const V3D_CSD_STATUS: usize = 0x0900;
 const V3D_CSD_QUEUED_CFG0: usize = 0x0904;
 
@@ -99,6 +133,9 @@ const PT_ENTRIES: usize = 1 << 20;
 const VA_START: u32 = 0x10_0000;
 const VA_END: u32 = 0x4000_0000;
 const BO_MAX: usize = 16 << 20;
+/// Binner overflow chunks, as Linux (V3D_OVERFLOW_SIZE is 512 KiB there).
+const OVERFLOW_SIZE: usize = 512 * 1024;
+const OVERFLOW_CHUNKS_MAX: usize = 16;
 
 const V3D_POWER: &str = "/scheme/rpi-firmware/v3d_power";
 
@@ -193,6 +230,8 @@ struct Stats {
     jobs: u64,
     failed_jobs: u64,
     job_us_max: u128,
+    cl_jobs: u64,
+    outomem: u64,
 }
 
 struct V3d {
@@ -204,6 +243,9 @@ struct V3d {
     free_va: Vec<(u32, usize)>,
     next_va: u32,
     stats: Stats,
+    /// The binner's overflow memory: chunk 0 at the start of each bin job,
+    /// more on OUTOMEM. Kept for the next jobs.
+    overflow: Vec<Bo>,
 }
 
 impl V3d {
@@ -231,7 +273,13 @@ impl V3d {
             fail("MMU flush did not finish");
         }
         say(&format!("MMU on: page table at {pt_phys:#x}, scratch page at {scratch_phys:#x}"));
-        V3d { hub, core, pm, pt, free_va: Vec::new(), next_va: VA_START, stats: Stats::default() }
+        let mut v3d =
+            V3d { hub, core, pm, pt, free_va: Vec::new(), next_va: VA_START, stats: Stats::default(), overflow: Vec::new() };
+        match v3d.new_bo(OVERFLOW_SIZE) {
+            Ok(bo) => v3d.overflow.push(bo),
+            Err(err) => fail(&format!("no binner overflow memory: {err}")),
+        }
+        v3d
     }
 
     fn alloc_va(&mut self, pages: usize) -> Option<u32> {
@@ -322,6 +370,113 @@ impl V3d {
     }
 }
 
+impl V3d {
+    fn invalidate_caches(&self) {
+        self.core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS);
+        self.core.write(V3D_CTL_SLCACTL, 0x0f0f_0f0f);
+    }
+
+    fn cle_state(&self) {
+        let core = &self.core;
+        say(&format!(
+            "cl: CT0CS {:#x} CT0CA {:#x}, CT1CS {:#x} CT1CA {:#x}, BFC {:#x}, RFC {:#x}, CTL_INT_STS {:#x}",
+            core.read(V3D_CLE_CT0CS),
+            core.read(V3D_CLE_CT0CA),
+            core.read(V3D_CLE_CT1CS),
+            core.read(V3D_CLE_CT1CA),
+            core.read(V3D_CLE_BFC),
+            core.read(V3D_CLE_RFC),
+            core.read(V3D_CTL_INT_STS)
+        ));
+        csd::state(&self.hub, &self.core);
+    }
+
+    /// One bin job (v3d_bin_job_run()), the binner's OUTOMEM answered with
+    /// more overflow memory (v3d_overflow_mem_work()), then one render job
+    /// (v3d_render_job_run()). Times in microseconds.
+    fn bin_render(&mut self, bcl: (u32, u32), rcl: (u32, u32), qma: u32, qms: u32, qts: u32)
+        -> std::result::Result<(u128, u128), String> {
+        let pm = Regs { base: self.pm.base };
+        let watchdog = Watchdog(&pm);
+        watchdog.arm();
+        let result = self.bin_render_armed(bcl, rcl, qma, qms, qts);
+        watchdog.stop();
+        self.stats.jobs += 1;
+        self.stats.cl_jobs += 1;
+        match &result {
+            Ok((bin, render)) => self.stats.job_us_max = self.stats.job_us_max.max(bin + render),
+            Err(_) => {
+                self.stats.failed_jobs += 1;
+                self.cle_state();
+            }
+        }
+        result
+    }
+
+    fn bin_render_armed(&mut self, bcl: (u32, u32), rcl: (u32, u32), qma: u32, qms: u32, qts: u32)
+        -> std::result::Result<(u128, u128), String> {
+        self.invalidate_caches();
+        self.core.write(V3D_CTL_INT_CLR, V3D_INT_OUTOMEM);
+        let bfc = self.core.read(V3D_CLE_BFC) & 0xff;
+        self.core.write(V3D_PTB_BPOA, self.overflow[0].va);
+        self.core.write(V3D_PTB_BPOS, OVERFLOW_SIZE as u32);
+        if qma != 0 {
+            self.core.write(V3D_CLE_CT0QMA, qma);
+            self.core.write(V3D_CLE_CT0QMS, qms);
+        }
+        if qts != 0 {
+            self.core.write(V3D_CLE_CT0QTS, qts | V3D_CLE_CT0QTS_ENABLE);
+        }
+        self.core.write(V3D_CLE_CT0QBA, bcl.0);
+        let start = Instant::now();
+        self.core.write(V3D_CLE_CT0QEA, bcl.1);
+        let mut next = 1;
+        loop {
+            if self.core.read(V3D_CLE_BFC) & 0xff != bfc {
+                break;
+            }
+            if self.core.read(V3D_CTL_INT_STS) & V3D_INT_OUTOMEM != 0 {
+                // Edge signalled: cleared first, set again only after the
+                // binner has used the new memory up too.
+                self.core.write(V3D_CTL_INT_CLR, V3D_INT_OUTOMEM);
+                if next == self.overflow.len() {
+                    if next == OVERFLOW_CHUNKS_MAX {
+                        return Err(format!("bin job: out of memory after {next} overflow chunks"));
+                    }
+                    let bo = self.new_bo(OVERFLOW_SIZE).map_err(|err| format!("bin job: overflow memory: {err}"))?;
+                    self.overflow.push(bo);
+                }
+                self.core.write(V3D_PTB_BPOA, self.overflow[next].va);
+                self.core.write(V3D_PTB_BPOS, OVERFLOW_SIZE as u32);
+                next += 1;
+                self.stats.outomem += 1;
+            }
+            if start.elapsed() > Duration::from_secs(1) {
+                return Err(format!("bin job not done after {} us", start.elapsed().as_micros()));
+            }
+            thread::yield_now();
+        }
+        let bin_us = start.elapsed().as_micros();
+
+        self.invalidate_caches();
+        let core = &self.core;
+        let rfc = core.read(V3D_CLE_RFC) & 0xff;
+        core.write(V3D_CLE_CT1QBA, rcl.0);
+        let start = Instant::now();
+        core.write(V3D_CLE_CT1QEA, rcl.1);
+        if !csd::wait("render job", 1000, || core.read(V3D_CLE_RFC) & 0xff != rfc) {
+            return Err(format!("render job not done after {} us", start.elapsed().as_micros()));
+        }
+        let render_us = start.elapsed().as_micros();
+        // As after a CSD job, so the CPU sees what the TLB stored.
+        core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_TMUWCF);
+        csd::wait("TMU write combiner flush", 100, || core.read(V3D_CTL_L2TCACTL) & V3D_L2TCACTL_TMUWCF == 0);
+        core.write(V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_CLEAN);
+        csd::wait("L2T clean", 100, || core.read(V3D_CTL_L2TCACTL) & V3D_L2TCACTL_L2TFLS == 0);
+        Ok((bin_us, render_us))
+    }
+}
+
 enum Handle {
     Root,
     Client { reply: Vec<u8>, bos: BTreeMap<u32, Bo>, next_id: u32 },
@@ -377,6 +532,23 @@ impl V3dScheme {
                 }
                 Ok(bo.mem[first..first + count].iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>().join(" "))
             }
+            Some("fill") => {
+                let bo = bos.get_mut(&(arg(1)? as u32)).ok_or("no such BO")?;
+                let (first, count, value) = (arg(2)? as usize, arg(3)? as usize, arg(4)? as u32);
+                if first + count > bo.mem.len() {
+                    return Err("past the end of the BO".into());
+                }
+                bo.mem[first..first + count].fill(value);
+                Ok("ok".into())
+            }
+            Some("cl") => {
+                let mut a = [0u32; 7];
+                for (i, v) in a.iter_mut().enumerate() {
+                    *v = arg(i + 1)? as u32;
+                }
+                let (bin, render) = self.v3d.bin_render((a[0], a[1]), (a[2], a[3]), a[4], a[5], a[6])?;
+                Ok(format!("done {} bin {bin} render {render}", bin + render))
+            }
             Some("free") => {
                 let bo = bos.remove(&(arg(1)? as u32)).ok_or("no such BO")?;
                 self.v3d.free_bo(bo);
@@ -393,12 +565,15 @@ impl V3dScheme {
             Some("stats") => {
                 let s = &self.v3d.stats;
                 Ok(format!(
-                    "bos {} frees {} jobs {} failed {} job_us_max {} va_next {:#x} va_free_ranges {}",
+                    "bos {} frees {} jobs {} cl_jobs {} failed {} job_us_max {} outomem {} overflow_chunks {} va_next {:#x} va_free_ranges {}",
                     s.bos,
                     s.frees,
                     s.jobs,
+                    s.cl_jobs,
                     s.failed_jobs,
                     s.job_us_max,
+                    s.outomem,
+                    self.v3d.overflow.len(),
                     self.v3d.next_va,
                     self.v3d.free_va.len()
                 ))

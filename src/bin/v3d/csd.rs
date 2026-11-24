@@ -296,93 +296,58 @@ pub fn run(hub: &Regs, core: &Regs) -> bool {
 /// result BO and takes a new one, so the MMU mappings change under the
 /// jobs. No register access here: v3dd owns V3D.
 pub fn via_v3dd(loops: u32) -> bool {
-    use std::fs::OpenOptions;
-    use std::io::{Read, Write};
-
-    let mut file = match OpenOptions::new().read(true).write(true).open("/scheme/v3d") {
-        Ok(file) => file,
+    let mut v3d = match super::client::Client::open() {
+        Ok(v3d) => v3d,
         Err(err) => {
-            say(&format!("v3dd: FAIL: /scheme/v3d: {err} (v3dd not running?)"));
+            say(&format!("v3dd: FAIL: {err}"));
             return false;
         }
     };
-    let mut ask = |line: &str| -> Result<String, String> {
-        file.write_all(line.as_bytes()).map_err(|err| format!("{line}: write: {err}"))?;
-        let mut reply = Vec::new();
-        let mut buf = [0u8; 4096];
-        while !reply.ends_with(b"\n") {
-            let n = file.read(&mut buf).map_err(|err| format!("{line}: read: {err}"))?;
-            if n == 0 {
-                break;
-            }
-            reply.extend_from_slice(&buf[..n]);
-        }
-        let reply = String::from_utf8_lossy(&reply).trim().to_string();
-        if reply.starts_with("error") || reply.is_empty() {
-            Err(format!("{}: {reply}", line.split(' ').next().unwrap_or(line)))
-        } else {
-            Ok(reply)
-        }
-    };
-    let bo = |ask: &mut dyn FnMut(&str) -> Result<String, String>, bytes: usize| -> Result<(u32, u32), String> {
-        let reply = ask(&format!("bo {bytes}"))?;
-        let mut it = reply.split(' ');
-        let id = it.next().and_then(|s| s.parse().ok());
-        let va = it.next().and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-        match (id, va) {
-            (Some(id), Some(va)) => Ok((id, va)),
-            _ => Err(format!("bo: bad reply {reply}")),
-        }
-    };
-    let hex = |words: &[u32]| words.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>().join(" ");
-
     let mut run = || -> Result<(u128, u128), String> {
-        let (code, code_va) = bo(&mut ask, PAGE)?;
-        let (unif, unif_va) = bo(&mut ask, PAGE)?;
-        let (mut result, mut result_va) = bo(&mut ask, PAGE)?;
-        say(&format!("v3dd: BOs: code {code_va:#x}, uniforms {unif_va:#x}, result {result_va:#x}"));
+        let code = v3d.bo(PAGE)?;
+        let unif = v3d.bo(PAGE)?;
+        let mut result = v3d.bo(PAGE)?;
+        say(&format!("v3dd: BOs: code {:#x}, uniforms {:#x}, result {:#x}", code.va, unif.va, result.va));
         let code_words: Vec<u32> = SHADER.iter().flat_map(|w| [*w as u32, (*w >> 32) as u32]).collect();
-        ask(&format!("put {code} 0 {}", hex(&code_words)))?;
+        v3d.put(&code, 0, &code_words)?;
         let wg_size: u32 = 16;
         let wgs_per_sg: u32 = 16;
         let (mut us_sum, mut us_max) = (0u128, 0u128);
         for i in 0..loops {
             if i > 0 && i % 10 == 0 {
-                ask(&format!("free {result}"))?;
-                (result, result_va) = bo(&mut ask, PAGE)?;
+                v3d.free(&result)?;
+                result = v3d.bo(PAGE)?;
             }
             let constant = CONSTANT.wrapping_add(i << 4);
             let dead: Vec<u32> = (0..LANES as u32).map(|lane| 0xdead_0000 | lane).collect();
-            ask(&format!("put {result} 0 {}", hex(&dead)))?;
-            ask(&format!("put {unif} 0 {result_va:#x} {constant:#x}"))?;
+            v3d.put(&result, 0, &dead)?;
+            v3d.put(&unif, 0, &[result.va, constant])?;
             let cfg = [
                 1 << 16,
                 1 << 16,
                 1 << 16,
                 ((wgs_per_sg * wg_size).div_ceil(16) - 1) << 12 | wgs_per_sg << 8 | (wg_size & 0xff),
                 0,
-                code_va,
-                unif_va,
+                code.va,
+                unif.va,
             ];
-            let done = ask(&format!("csd {}", hex(&cfg)))?;
-            let us: u128 = done.strip_prefix("done ").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let cfg: Vec<String> = cfg.iter().map(|w| format!("{w:#x}")).collect();
+            let us = v3d.job(&format!("csd {}", cfg.join(" ")))?;
             us_sum += us;
             us_max = us_max.max(us);
-            let got = ask(&format!("get {result} 0 {LANES}"))?;
-            let got: Vec<u32> =
-                got.split(' ').filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).collect();
+            let got = v3d.get(&result, 0, LANES)?;
             let want: Vec<u32> = (0..LANES as u32).map(|lane| constant + lane).collect();
             if got != want {
-                return Err(format!("loop {i}: result {got:#x?}, want {want:#x?} (result BO at {result_va:#x})"));
+                return Err(format!("loop {i}: result {got:#x?}, want {want:#x?} (result BO at {:#x})", result.va));
             }
         }
-        for id in [code, unif, result] {
-            ask(&format!("free {id}"))?;
+        for bo in [code, unif, result] {
+            v3d.free(&bo)?;
         }
         Ok((us_sum, us_max))
     };
     let outcome = run();
-    if let Ok(stats) = ask("stats") {
+    if let Ok(stats) = v3d.ask("stats") {
         say(&format!("v3dd: stats: {stats}"));
     }
     match outcome {

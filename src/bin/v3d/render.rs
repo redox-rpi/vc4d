@@ -96,8 +96,12 @@ const _: () = assert!(GEOM + PAGE <= ARENA);
 /// The triangle's colour: opaque red (bytes R, G, B, A in memory).
 pub const TRIANGLE_COLOR: u32 = 0xff_00_00_ff;
 
+/// Where the arena is in V3D memory: ARENA_VA when v3dprobe sets the MMU
+/// up itself, the arena BO's address when v3dd does (via_v3dd).
+static ARENA_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(ARENA_VA);
+
 fn va(offset: usize) -> u32 {
-    ARENA_VA + offset as u32
+    ARENA_BASE.load(std::sync::atomic::Ordering::Relaxed) + offset as u32
 }
 
 /// A control list being built: opcode byte, then the fields packed little
@@ -688,4 +692,110 @@ pub fn run(hub: &Regs, core: &Regs, draw: Draw) -> (bool, Vec<u32>) {
         say("render: FAIL: not every pixel has the clear colour");
     }
     (ok, pixels.to_vec())
+}
+
+/// Step 3b (redox-rpi#598): the same frame through v3dd, `loops` times. The
+/// arena is a BO of v3dd's, a new one every tenth loop; the first frame is
+/// checked as in `run`, every later one must equal it. No register access
+/// here: v3dd owns V3D.
+pub fn via_v3dd(draw: Draw, loops: u32) -> bool {
+    let mut v3d = match super::client::Client::open() {
+        Ok(v3d) => v3d,
+        Err(err) => {
+            say(&format!("render: FAIL: {err}"));
+            return false;
+        }
+    };
+    say(&format!("render: draw {draw:?} through v3dd, {loops} frames"));
+    let mut first: Option<Vec<u32>> = None;
+    let mut run = |v3d: &mut super::client::Client| -> Result<(u128, u128), String> {
+        let (mut us_sum, mut us_max) = (0u128, 0u128);
+        let mut arena = None;
+        let mut lists = (0usize, 0usize);
+        for i in 0..loops {
+            if i % 10 == 0 {
+                if let Some(old) = arena.take() {
+                    v3d.free(&old)?;
+                }
+                let bo = v3d.bo(ARENA)?;
+                ARENA_BASE.store(bo.va, std::sync::atomic::Ordering::Relaxed);
+                // Control lists and geometry for this address.
+                let mut bytes = vec![0u8; ARENA];
+                let shader_state = (draw != Draw::Clear).then(|| geometry(&mut bytes, draw));
+                let bcl = binning_cl(shader_state);
+                let gtl = generic_tile_list();
+                let rcl = rcl(va(GTL), va(GTL) + gtl.len() as u32);
+                v3d.put_bytes(&bo, BCL, &bcl.0)?;
+                v3d.put_bytes(&bo, RCL, &rcl.0)?;
+                v3d.put_bytes(&bo, GTL, &gtl.0)?;
+                if shader_state.is_some() {
+                    v3d.put_bytes(&bo, GEOM, &bytes[GEOM..GEOM + PAGE])?;
+                }
+                if i == 0 {
+                    say(&format!("render: arena BO at {:#x}, BCL {} bytes, RCL {} bytes", bo.va, bcl.len(), rcl.len()));
+                }
+                lists = (bcl.len(), rcl.len());
+                arena = Some(bo);
+            }
+            let bo = arena.as_ref().unwrap();
+            v3d.fill(bo, FB / 4, FB_SIZE / 4, 0xdead_beef)?;
+            v3d.fill(bo, TILE_STATE / 4, PAGE / 4, 0)?;
+            v3d.fill(bo, TILE_ALLOC / 4, TILE_ALLOC_SIZE / 4, 0)?;
+            let us = v3d.job(&format!(
+                "cl {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                va(BCL),
+                va(BCL) + lists.0 as u32,
+                va(RCL),
+                va(RCL) + lists.1 as u32,
+                va(TILE_ALLOC),
+                TILE_ALLOC_SIZE,
+                va(TILE_STATE)
+            ))?;
+            us_sum += us;
+            us_max = us_max.max(us);
+            let pixels = v3d.get(bo, FB / 4, FB_SIZE / 4)?;
+            match &first {
+                None => {
+                    let ok = if draw == Draw::Clear {
+                        let right = pixels.iter().filter(|&&p| p == CLEAR_COLOR).count();
+                        say(&format!("render: frame 0: {right} of {} pixels have {CLEAR_COLOR:#010x}", pixels.len()));
+                        right == pixels.len()
+                    } else {
+                        check_triangle(&pixels)
+                    };
+                    if !ok {
+                        return Err("frame 0 is not right".into());
+                    }
+                    first = Some(pixels);
+                }
+                Some(want) => {
+                    if pixels != *want {
+                        let diff = pixels.iter().zip(want).filter(|(a, b)| a != b).count();
+                        return Err(format!("frame {i}: {diff} pixels differ from frame 0 (arena at {:#x})", bo.va));
+                    }
+                }
+            }
+        }
+        if let Some(bo) = arena {
+            v3d.free(&bo)?;
+        }
+        Ok((us_sum, us_max))
+    };
+    let outcome = run(&mut v3d);
+    if let Ok(stats) = v3d.ask("stats") {
+        say(&format!("render: v3dd stats: {stats}"));
+    }
+    match outcome {
+        Ok((sum, max)) => {
+            say(&format!(
+                "render: PASS: {loops} of {loops} {draw:?} frames through /scheme/v3d right, {} us average, {max} us max (bin + render, daemon side)",
+                sum / loops.max(1) as u128
+            ));
+            true
+        }
+        Err(err) => {
+            say(&format!("render: FAIL: {err}"));
+            false
+        }
+    }
 }
