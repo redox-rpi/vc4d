@@ -44,6 +44,8 @@ use crate::hvs::{Gen, Hvs, CHANNELS, HVS_BUS_ADDR};
 mod adapter;
 mod check;
 mod ddc;
+mod irqprobe;
+mod vblank;
 mod mode;
 use vc4_hvs as hvs;
 mod shot;
@@ -55,6 +57,9 @@ const RAM_BUS_OFFSET: usize = 0xc000_0000;
 
 /// How often a frame waiting for the HVS is looked at (a quarter frame).
 const FLUSH_TICK: Duration = Duration::from_millis(4);
+/// With the vertical blank interrupt, the timer only catches a frame the
+/// interrupt missed.
+const FLUSH_FALLBACK: Duration = Duration::from_millis(20);
 
 /// Arms the timer `after` from now; false if the clock cannot be read.
 fn arm(time: &mut std::fs::File, after: Duration) -> bool {
@@ -171,6 +176,13 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         "vc4d: taking over channel {} at {}x{}",
         channel.index, channel.width, channel.height
     );
+    // G1 (redox-rpi#667): which display interrupts the firmware uses, before
+    // vc4d waits on one. Read only. VC4D_IRQ_PROBE=off skips it.
+    if let (Some(fdt), Gen::Vc5, None) = (fdt.as_ref(), generation, fake) {
+        if !env::var("VC4D_IRQ_PROBE").is_ok_and(|v| v == "off") {
+            irqprobe::run(fdt);
+        }
+    }
 
     let checking = !env::var("VC4D_CHECK").is_ok_and(|v| v == "off");
     if checking {
@@ -240,6 +252,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         enum Source {
             Scheme,
             Time,
+            Vblank,
         }
     }
     let event_queue: EventQueue<Source> =
@@ -258,6 +271,25 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         .subscribe(time.as_raw_fd() as usize, Source::Time, event::EventFlags::READ)
         .unwrap();
     let mut armed = false;
+    // G1 (redox-rpi#667): flips on pixel valve 2's vertical blank on the
+    // BCM2711. VC4D_VBLANK=off keeps the timer.
+    let mut vblank = match (fdt.as_ref(), generation, fake) {
+        (Some(fdt), Gen::Vc5, None) if !env::var("VC4D_VBLANK").is_ok_and(|v| v == "off") => {
+            match vblank::Vblank::open(fdt) {
+                Ok(v) => {
+                    event_queue.subscribe(v.fd(), Source::Vblank, event::EventFlags::READ).unwrap();
+                    println!("vc4d: vblank: pixel valve 2, {}", v.path);
+                    Some(v)
+                }
+                Err(err) => {
+                    println!("vc4d: vblank: {err}: flips on the {} ms timer", FLUSH_TICK.as_millis());
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let (mut on_vblank, mut on_timer) = (0u64, 0u64);
 
     daemon.ready();
     check::watch(watched, channel, screen, fake.is_some(), checking, shown);
@@ -272,11 +304,32 @@ fn daemon(daemon: daemon::Daemon) -> ! {
             Source::Scheme => scheme.tick().expect("vc4d: failed to handle scheme events"),
             Source::Time => {
                 armed = false;
-                scheme.adapter_mut().flush();
+                if scheme.adapter_mut().flip_pending() {
+                    scheme.adapter_mut().flush();
+                    on_timer += u64::from(!scheme.adapter_mut().flip_pending());
+                }
+            }
+            Source::Vblank => {
+                if let Some(v) = vblank.as_mut() {
+                    if v.handle() && scheme.adapter_mut().flip_pending() {
+                        scheme.adapter_mut().flush();
+                        on_vblank += u64::from(!scheme.adapter_mut().flip_pending());
+                    }
+                    if [60, 600, 6000, 60000].contains(&v.count) {
+                        println!(
+                            "vc4d: vblank: {} interrupts; flips shown on the interrupt {on_vblank}, on the timer {on_timer}",
+                            v.count
+                        );
+                    }
+                }
             }
         }
-        if !armed && scheme.adapter_mut().flip_pending() {
-            armed = arm(&mut time, FLUSH_TICK);
+        let pending = scheme.adapter_mut().flip_pending();
+        if let Some(v) = vblank.as_mut() {
+            v.want(pending);
+        }
+        if !armed && pending {
+            armed = arm(&mut time, if vblank.is_some() { FLUSH_FALLBACK } else { FLUSH_TICK });
         }
     }
 
