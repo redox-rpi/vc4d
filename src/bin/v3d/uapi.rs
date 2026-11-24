@@ -7,8 +7,11 @@
 // metadata[0] and the argument as payload, written as redox-ioctl's
 // define_ioctl_data! does: the struct without its pointer fields, then the
 // arrays those pointers point to (here the BO handles of a submit). The
-// structs below are that wire form. relibc does not list the V3D numbers
-// yet (G3).
+// structs below are that wire form. relibc lists the V3D numbers with
+// redox-rpi's experiment v3d-ioctl (G3, redox-rpi#669).
+//
+// Mesa's v3d driver also needs DRM sync objects (G3 step 2): v3dd keeps
+// them per file, next to the BOs.
 
 pub const GEM_CLOSE: u64 = 0x09;
 pub const SUBMIT_CL: u64 = 0x40;
@@ -18,6 +21,18 @@ pub const MMAP_BO: u64 = 0x43;
 pub const GET_PARAM: u64 = 0x44;
 pub const GET_BO_OFFSET: u64 = 0x45;
 pub const SUBMIT_CSD: u64 = 0x47;
+pub const SYNCOBJ_CREATE: u64 = 0xBF;
+pub const SYNCOBJ_DESTROY: u64 = 0xC0;
+pub const SYNCOBJ_WAIT: u64 = 0xC3;
+pub const SYNCOBJ_RESET: u64 = 0xC4;
+pub const SYNCOBJ_SIGNAL: u64 = 0xC5;
+
+/// DRM_SYNCOBJ_CREATE_SIGNALED.
+pub const SYNCOBJ_CREATE_SIGNALED: u32 = 1;
+/// DRM_SYNCOBJ_WAIT_FLAGS_*.
+pub const SYNCOBJ_WAIT_ALL: u32 = 1;
+pub const SYNCOBJ_WAIT_FOR_SUBMIT: u32 = 2;
+pub const SYNCOBJ_WAIT_AVAILABLE: u32 = 4;
 
 /// DRM_V3D_SUBMIT_CL_FLUSH_CACHE: v3dd flushes the caches around every job.
 pub const SUBMIT_CL_FLUSH_CACHE: u32 = 0x01;
@@ -108,6 +123,46 @@ pub struct SubmitCsd {
     pub perfmon_id: u32,
     pub extensions: u64,
     pub flags: u32,
+    pub pad: u32,
+}
+
+/// struct drm_syncobj_create.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SyncobjCreate {
+    pub handle: u32,
+    pub flags: u32,
+}
+
+/// struct drm_syncobj_destroy.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SyncobjDestroy {
+    pub handle: u32,
+    pub pad: u32,
+}
+
+/// struct drm_syncobj_wait without `handles`; then the handles.
+/// `timeout_nsec` is an absolute CLOCK_MONOTONIC time.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SyncobjWait {
+    pub timeout_nsec: i64,
+    pub count_handles: u32,
+    pub flags: u32,
+    pub first_signaled: u32,
+    pub pad: u32,
+    pub deadline_nsec: u64,
+}
+
+/// Where `first_signaled` lies in the SyncobjWait payload.
+pub const SYNCOBJ_WAIT_FIRST_SIGNALED: usize = 16;
+
+/// struct drm_syncobj_array without `handles`; then the handles.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SyncobjArray {
+    pub count_handles: u32,
     pub pad: u32,
 }
 
