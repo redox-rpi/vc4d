@@ -23,6 +23,15 @@
 //                                              the tile state)
 //   stats                     -> one line of counters
 //
+// A client maps a BO into its own memory with fmap on the same handle
+// (step 3e, redox-rpi#666): offset (ID << 32) + BYTE, BYTE a multiple of
+// the page size, MAP_SHARED. The mapping is the BO's own memory, with the
+// memory type v3dd has (uncached, as all DMA memory on aarch64), so
+// neither side needs a cache flush; the client issues a DSB before it
+// writes the job command. A BO freed while mapped stays the client's
+// memory until it unmaps it (the kernel counts references to the pages),
+// but V3D no longer sees it.
+//
 // Numbers are decimal or 0x hex. A failed command answers "error ...". BOs
 // belong to the open file and are freed when it is closed. Jobs run one at
 // a time, synchronously, with the caches handled as Linux's v3d driver does
@@ -44,7 +53,7 @@
 // without an interrupt v3dd polls as before. Jobs still run one at a time,
 // and a client's write waits for its job.
 //
-// Not yet: mmap of BOs, asynchronous jobs, one address space per client.
+// Not yet: asynchronous jobs, one address space per client.
 //
 // The binner's overflow memory belongs to v3dd: 512 KiB at the start of
 // every bin job, and another 512 KiB chunk each time the binner reports
@@ -68,7 +77,8 @@ use event::{EventQueue, user_data};
 use redox_scheme::scheme::SchemeSync;
 use redox_scheme::{CallerCtx, OpenResult, Socket};
 use scheme_utils::{Blocking, FpathWriter, HandleMap};
-use syscall::error::{EACCES, EBADF, EINVAL, Error, Result};
+use syscall::error::{EACCES, EBADF, EINVAL, ENOENT, Error, Result};
+use syscall::flag::{MapFlags, MunmapFlags};
 use syscall::schemev2::NewFdFlags;
 
 #[path = "v3d/client.rs"]
@@ -365,6 +375,9 @@ impl Irq {
     }
 }
 
+/// fmap offsets: the BO ID above this bit, the byte in the BO below.
+const MAP_ID_SHIFT: u32 = 32;
+
 struct Bo {
     mem: Dma<[u32]>,
     va: u32,
@@ -385,6 +398,8 @@ struct Stats {
     irqs: u64,
     irq_wakeups: u64,
     timer_wakeups: u64,
+    maps: u64,
+    unmaps: u64,
 }
 
 struct V3d {
@@ -928,7 +943,7 @@ impl V3dScheme {
             Some("stats") => {
                 let s = &self.v3d.stats;
                 Ok(format!(
-                    "bos {} frees {} jobs {} cl_jobs {} failed {} mmu_faults {} resets {} job_us_max {} outomem {} overflow_chunks {} va_next {:#x} va_free_ranges {} irq {} irqs {} irq_wakeups {} timer_wakeups {}",
+                    "bos {} frees {} jobs {} cl_jobs {} failed {} mmu_faults {} resets {} job_us_max {} outomem {} overflow_chunks {} va_next {:#x} va_free_ranges {} irq {} irqs {} irq_wakeups {} timer_wakeups {} maps {} unmaps {}",
                     s.bos,
                     s.frees,
                     s.jobs,
@@ -944,7 +959,9 @@ impl V3dScheme {
                     self.v3d.irq.as_ref().map(|irq| irq.path.as_str()).unwrap_or("off"),
                     s.irqs,
                     s.irq_wakeups,
-                    s.timer_wakeups
+                    s.timer_wakeups,
+                    s.maps,
+                    s.unmaps
                 ))
             }
             _ => Err(format!("unknown command: {line}")),
@@ -1000,6 +1017,33 @@ impl SchemeSync for V3dScheme {
             *reply = format!("{answer}\n").into_bytes();
         }
         Ok(buf.len())
+    }
+
+    /// fmap of a BO (see the top of the file). Returns where the BO lies in
+    /// v3dd: the kernel maps the same pages into the client.
+    fn mmap_prep(&mut self, id: usize, offset: u64, size: usize, flags: MapFlags, _ctx: &CallerCtx) -> Result<usize> {
+        let Handle::Client { bos, .. } = self.handles.get(id)? else {
+            return Err(Error::new(EBADF));
+        };
+        // A private (copy-on-write) mapping would also make v3dd's own
+        // pages read-only, and V3D would never see the client's writes.
+        if !flags.contains(MapFlags::MAP_SHARED) {
+            return Err(Error::new(EINVAL));
+        }
+        let bo = bos.get(&((offset >> MAP_ID_SHIFT) as u32)).ok_or(Error::new(ENOENT))?;
+        let at = (offset & ((1 << MAP_ID_SHIFT) - 1)) as usize;
+        if at % PAGE != 0 || size == 0 || at.checked_add(size).is_none_or(|end| end > bo.pages * PAGE) {
+            return Err(Error::new(EINVAL));
+        }
+        self.v3d.stats.maps += 1;
+        Ok(bo.mem.as_ptr() as usize + at)
+    }
+
+    /// The client unmapped (part of) a BO. The kernel keeps the pages
+    /// until the last mapping goes, so there is nothing to free here.
+    fn munmap(&mut self, _id: usize, _offset: u64, _size: usize, _flags: MunmapFlags, _ctx: &CallerCtx) -> Result<()> {
+        self.v3d.stats.unmaps += 1;
+        Ok(())
     }
 
     fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
