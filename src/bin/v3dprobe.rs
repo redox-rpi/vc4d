@@ -18,7 +18,7 @@
 //
 // v3dprobe [--csd] [--render [--triangle | --triangle-math] [--show SECONDS]]
 //          [--off] [--no-watchdog]
-// v3dprobe --via-v3dd [--loops N] [--render [--triangle | --triangle-math]]
+// v3dprobe --via-v3dd [--loops N] [--render [--triangle | --triangle-math] | --faults]
 //   --show: the rendered picture in an Orbital window for SECONDS (step 2c)
 //   --render: step 2 (redox-rpi#596): bin and render control lists, see
 //     v3d/render.rs; clear only, or with --triangle a red triangle whose
@@ -30,6 +30,8 @@
 //   --via-v3dd: step 3 (redox-rpi#598): the --csd job N times (default
 //     100) through v3dd and /scheme/v3d; touches no registers itself.
 //     With --render, the --render frame N times instead (step 3b).
+//     With --faults, a job with a bad address and a job that never ends,
+//     then jobs that must still pass (step 3c).
 //   --no-watchdog: do not arm the SoC watchdog around the V3D accesses
 //
 // The first V3D accesses can hang the bus (a block without power or clock).
@@ -123,12 +125,55 @@ impl Regs {
     }
 }
 
+/// Step 3c (redox-rpi#598): a job with a bad address and a job that never
+/// ends; v3dd must report both and run the next jobs right.
+fn faults_via_v3dd() -> bool {
+    let mut v3d = match client::Client::open() {
+        Ok(v3d) => v3d,
+        Err(err) => {
+            say(&format!("faults: FAIL: {err}"));
+            return false;
+        }
+    };
+    let mut ok = true;
+    let mut check = |name: &str, pass: bool, what: String| {
+        say(&format!("faults: {name}: {} {what}", if pass { "PASS" } else { "FAIL" }));
+        ok &= pass;
+    };
+    match csd::bad_address_via_v3dd(&mut v3d) {
+        Ok(answer) => check("bad address", answer.contains("mmu-fault"), format!("(v3dd: {answer})")),
+        Err(err) => check("bad address", false, err),
+    }
+    check("CSD after the fault", csd::via_v3dd(10), String::new());
+    match render::endless_via_v3dd(&mut v3d) {
+        Ok(answer) => check(
+            "endless job",
+            answer.contains("timeout") && answer.contains("reset"),
+            format!("(v3dd: {answer})"),
+        ),
+        Err(err) => check("endless job", false, err),
+    }
+    check("CSD after the reset", csd::via_v3dd(10), String::new());
+    check("render after the reset", render::via_v3dd(render::Draw::Clear, 10), String::new());
+    if let Ok(stats) = v3d.ask("stats") {
+        say(&format!("faults: v3dd stats: {stats}"));
+    }
+    say(if ok {
+        "faults: PASS: the MMU fault came back, the endless job was reset, the next jobs ran right"
+    } else {
+        "faults: FAIL"
+    });
+    ok
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     // Step 3 (redox-rpi#598): the CSD job through v3dd, no register access.
     if args.iter().any(|a| a == "--via-v3dd") {
         let loops = args.iter().position(|a| a == "--loops").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(100);
-        let ok = if args.iter().any(|a| a == "--render") {
+        let ok = if args.iter().any(|a| a == "--faults") {
+            faults_via_v3dd()
+        } else if args.iter().any(|a| a == "--render") {
             let draw = if args.iter().any(|a| a == "--triangle-math") {
                 render::Draw::MathShaders
             } else if args.iter().any(|a| a == "--triangle") {
