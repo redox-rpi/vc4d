@@ -238,6 +238,29 @@ fn power_up(pm: &Regs, asb: &Regs) {
     }
 }
 
+/// Gives a V3D address range back: sorted, merged with its neighbours, and
+/// handed back to the top (`next_va`) when it ends there, so freed ranges
+/// do not pile up (Test 600: 3 -> 23 ranges).
+fn release_va(free: &mut Vec<(u32, usize)>, next_va: &mut u32, va: u32, pages: usize) {
+    let end = |(va, pages): (u32, usize)| va + (pages * PAGE) as u32;
+    let i = free.partition_point(|&(v, _)| v < va);
+    free.insert(i, (va, pages));
+    if i + 1 < free.len() && end(free[i]) == free[i + 1].0 {
+        free[i].1 += free[i + 1].1;
+        free.remove(i + 1);
+    }
+    if i > 0 && end(free[i - 1]) == free[i].0 {
+        free[i - 1].1 += free[i].1;
+        free.remove(i);
+    }
+    if let Some(&last) = free.last()
+        && end(last) == *next_va
+    {
+        *next_va = last.0;
+        free.pop();
+    }
+}
+
 struct Bo {
     mem: Dma<[u32]>,
     va: u32,
@@ -356,7 +379,7 @@ impl V3d {
             self.pt[bo.va as usize / PAGE + page] = 0;
         }
         csd::mmu_flush(&self.hub);
-        self.free_va.push((bo.va, bo.pages));
+        release_va(&mut self.free_va, &mut self.next_va, bo.va, bo.pages);
         self.stats.frees += 1;
         // bo.mem is freed here, after the MMU no longer maps it.
     }
@@ -461,9 +484,12 @@ impl V3d {
             self.stats.mmu_faults -= 1;
         }
         let result = run(self);
-        let fault = self.mmu_fault();
+        // The register dump before mmu_fault() clears the fault state.
         if result.is_err() {
             self.state();
+        }
+        let fault = self.mmu_fault();
+        if result.is_err() {
             self.reset();
         }
         watchdog.stop();
