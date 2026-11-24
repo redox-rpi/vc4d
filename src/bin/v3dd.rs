@@ -79,7 +79,15 @@
 // in every space at the same address, above the clients' range. A closed
 // client's space goes with its BOs, after its running job.
 //
-// Not yet: a binary interface (G2 step 3).
+// Binary interface (G2 step 3): the V3D ioctls of Linux as scheme calls
+// (see v3d/uapi.rs for the wire form): CREATE_BO, MMAP_BO (the fmap offset
+// above), GET_BO_OFFSET, GEM_CLOSE, GET_PARAM, SUBMIT_CL and SUBMIT_CSD
+// with their BO lists, and WAIT_BO, which waits for the last job that named
+// the BO; it answers EIO when that job failed, and ETIME for timeout 0
+// while the job runs (another timeout is not kept: jobs end within 1 s).
+// Not yet: syncobjs (in_sync is covered by the queue order, out_sync is
+// not signalled), TFU jobs, a render job without a bin job, perfmon. Both
+// interfaces work on the same handle.
 //
 // The binner's overflow memory belongs to v3dd: 512 KiB at the start of
 // every bin job, and another 512 KiB chunk each time the binner reports
@@ -104,7 +112,7 @@ use event::{EventQueue, user_data};
 use redox_scheme::scheme::{IntoTag as _, Op, SchemeState, SchemeSync};
 use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
 use scheme_utils::{FpathWriter, HandleMap};
-use syscall::error::{EACCES, EBADF, EINTR, EINVAL, ENOENT, ENOSYS, Error, Result};
+use syscall::error::{EACCES, EBADF, EINTR, EINVAL, EIO, ENOENT, ENOMEM, ENOSYS, ETIME, Error, Result};
 use syscall::flag::{MapFlags, MunmapFlags};
 use syscall::schemev2::NewFdFlags;
 
@@ -114,6 +122,9 @@ mod client;
 #[path = "v3d/csd.rs"]
 #[allow(dead_code)]
 mod csd;
+#[path = "v3d/uapi.rs"]
+#[allow(dead_code)]
+mod uapi;
 
 // Addresses as in v3dprobe (the Pi 400's devicetree).
 const HUB_PHYS: usize = 0xfec0_0000;
@@ -1086,6 +1097,53 @@ struct Client {
     held: Option<HeldRead>,
     /// The client's address space, made with its first BO.
     space: Option<u32>,
+    /// The last job that named each BO in its submit (binary interface).
+    bo_jobs: BTreeMap<u32, u64>,
+    /// WAIT_BO calls held until their job is done.
+    held_calls: Vec<(u64, HeldRead)>,
+}
+
+/// A new BO in the client's own address space (made with its first BO):
+/// its ID and V3D address.
+fn client_bo(shared: &Shared, client: &mut Client, bytes: usize) -> std::result::Result<(u32, u32), String> {
+    let bo = {
+        let mut mmu = lock(&shared.mmu);
+        let space = match client.space {
+            Some(space) => space,
+            None => {
+                let space = mmu.new_space()?;
+                client.space = Some(space);
+                space
+            }
+        };
+        mmu.new_bo(space, bytes)?
+    };
+    let (bo_id, va) = (client.next_id, bo.va);
+    client.next_id += 1;
+    client.bos.insert(bo_id, bo);
+    Ok((bo_id, va))
+}
+
+/// Frees a client's BO now, or after the client's last pending job.
+fn client_free(shared: &Shared, zombies: &mut Vec<(u64, Zombie)>, client: &mut Client, bo_id: u32) -> bool {
+    let Some(bo) = client.bos.remove(&bo_id) else { return false };
+    client.bo_jobs.remove(&bo_id);
+    match client.pending.last().copied() {
+        Some(job) => zombies.push((job, Zombie::Bo(bo))),
+        None => lock(&shared.mmu).free_bo(bo),
+    }
+    true
+}
+
+/// Queues a job; its number.
+fn submit_job(shared: &Shared, queue: &mut VecDeque<Job>, next_job: &mut u64, id: usize, client: &mut Client, kind: JobKind) -> u64 {
+    *next_job += 1;
+    let job = *next_job;
+    client.pending.insert(job);
+    let space = client.space.unwrap_or(DAEMON_SPACE);
+    queue.push_back(Job { id: job, client: id, space, kind });
+    shared.work.notify_one();
+    job
 }
 
 /// Freed once the job it waits for is done, in the order they came.
@@ -1111,6 +1169,8 @@ struct State {
 }
 
 struct Shared {
+    /// GET_PARAM's identification registers, read at start.
+    params: [u64; 7],
     v3d: Mutex<V3d>,
     mmu: Arc<Mutex<Mmu>>,
     stats: Arc<Mutex<Stats>>,
@@ -1172,6 +1232,8 @@ impl Shared {
                 }
             };
             let answer = answer.unwrap_or_else(|err| format!("error {err}"));
+            let failed = answer.starts_with("error");
+            let mut calls = Vec::new();
             let held = {
                 let mut state = lock(&self.state);
                 state.running = None;
@@ -1179,6 +1241,12 @@ impl Shared {
                 let held = match state.handles.get_mut(job.client) {
                     Ok(Handle::Client(client)) => {
                         client.pending.remove(&job.id);
+                        // WAIT_BOs on this job (jobs end in order: also on
+                        // earlier ones, if any were left).
+                        let (due, keep): (Vec<_>, Vec<_>) =
+                            std::mem::take(&mut client.held_calls).into_iter().partition(|(waits, _)| *waits <= job.id);
+                        client.held_calls = keep;
+                        calls = due;
                         if client.waiting == Some(job.id) {
                             client.waiting = None;
                             client.reply = format!("{answer}\n").into_bytes();
@@ -1196,6 +1264,12 @@ impl Shared {
                 self.reap(&mut state);
                 held
             };
+            for (waits, held) in calls {
+                let result = if failed && waits == job.id { Err(Error::new(EIO)) } else { Ok(0) };
+                if let Err(err) = self.socket.write_response(Response::new(result, held.op), SignalBehavior::Restart) {
+                    say(&format!("answer to a held WAIT_BO failed: {err}"));
+                }
+            }
             if let Some(HeldRead { caller, op }) = held {
                 let response = op.handle_sync(caller, &mut scheme, &mut scheme_state);
                 if let Err(err) = self.socket.write_response(response, SignalBehavior::Restart) {
@@ -1249,34 +1323,10 @@ impl V3dScheme {
             }
             Ok(a)
         };
-        let mut submit = |client: &mut Client, kind: JobKind| -> u64 {
-            *next_job += 1;
-            let job = *next_job;
-            client.pending.insert(job);
-            let space = client.space.unwrap_or(DAEMON_SPACE);
-            queue.push_back(Job { id: job, client: id, space, kind });
-            shared.work.notify_one();
-            job
-        };
+        let mut submit = |client: &mut Client, kind: JobKind| -> u64 { submit_job(&shared, queue, next_job, id, client, kind) };
         match words.first().copied() {
             Some("bo") => {
-                let bytes = arg(1)? as usize;
-                let bo = {
-                    let mut mmu = lock(&shared.mmu);
-                    let space = match client.space {
-                        Some(space) => space,
-                        None => {
-                            let space = mmu.new_space()?;
-                            client.space = Some(space);
-                            space
-                        }
-                    };
-                    mmu.new_bo(space, bytes)?
-                };
-                let va = bo.va;
-                let bo_id = client.next_id;
-                client.next_id += 1;
-                client.bos.insert(bo_id, bo);
+                let (bo_id, va) = client_bo(&shared, client, arg(1)? as usize)?;
                 Ok(Answer::Now(format!("{bo_id} {va:#x}")))
             }
             Some("put") => {
@@ -1308,11 +1358,8 @@ impl V3dScheme {
                 Ok(Answer::Now("ok".into()))
             }
             Some("free") => {
-                let bo = client.bos.remove(&(arg(1)? as u32)).ok_or("no such BO")?;
-                let last = client.pending.last().copied();
-                match last {
-                    Some(job) => zombies.push((job, Zombie::Bo(bo))),
-                    None => lock(&shared.mmu).free_bo(bo),
+                if !client_free(&shared, zombies, client, arg(1)? as u32) {
+                    return Err("no such BO".into());
                 }
                 Ok(Answer::Now("ok".into()))
             }
@@ -1389,7 +1436,119 @@ impl V3dScheme {
     }
 }
 
+impl V3dScheme {
+    /// The binary interface (see v3d/uapi.rs): one V3D ioctl.
+    fn ioctl(&mut self, state: &mut State, id: usize, func: u64, payload: &mut [u8]) -> Result<usize> {
+        let shared = self.shared.clone();
+        let State { handles, queue, next_job, done_through, zombies, .. } = state;
+        let Ok(Handle::Client(client)) = handles.get_mut(id) else {
+            return Err(Error::new(EBADF));
+        };
+        let einval = || Error::new(EINVAL);
+        match func {
+            uapi::CREATE_BO => {
+                let (mut arg, _) = uapi::read::<uapi::CreateBo>(payload).ok_or_else(einval)?;
+                if arg.flags != 0 || arg.size == 0 || arg.size as usize > BO_MAX {
+                    return Err(einval());
+                }
+                let (handle, va) = client_bo(&shared, client, arg.size as usize).map_err(|err| {
+                    say(&format!("client {id}: CREATE_BO: {err}"));
+                    Error::new(ENOMEM)
+                })?;
+                arg.handle = handle;
+                arg.offset = va;
+                uapi::write(payload, &arg);
+                Ok(0)
+            }
+            uapi::MMAP_BO => {
+                let (mut arg, _) = uapi::read::<uapi::MmapBo>(payload).ok_or_else(einval)?;
+                if arg.flags != 0 {
+                    return Err(einval());
+                }
+                client.bos.get(&arg.handle).ok_or(Error::new(ENOENT))?;
+                arg.offset = (arg.handle as u64) << MAP_ID_SHIFT;
+                uapi::write(payload, &arg);
+                Ok(0)
+            }
+            uapi::GET_BO_OFFSET => {
+                let (mut arg, _) = uapi::read::<uapi::GetBoOffset>(payload).ok_or_else(einval)?;
+                arg.offset = client.bos.get(&arg.handle).ok_or(Error::new(ENOENT))?.va;
+                uapi::write(payload, &arg);
+                Ok(0)
+            }
+            uapi::GEM_CLOSE => {
+                let (arg, _) = uapi::read::<uapi::GemClose>(payload).ok_or_else(einval)?;
+                if !client_free(&shared, zombies, client, arg.handle) {
+                    return Err(Error::new(ENOENT));
+                }
+                Ok(0)
+            }
+            uapi::GET_PARAM => {
+                let (mut arg, _) = uapi::read::<uapi::GetParam>(payload).ok_or_else(einval)?;
+                arg.value = match arg.param {
+                    p @ uapi::PARAM_UIFCFG..=uapi::PARAM_CORE0_IDENT2 => shared.params[p as usize],
+                    uapi::PARAM_SUPPORTS_CSD => 1,
+                    // No TFU, cache flush, perfmon, multisync, CPU queue,
+                    // performance counters or super pages.
+                    uapi::PARAM_SUPPORTS_TFU..=uapi::PARAM_SUPPORTS_SUPER_PAGES => 0,
+                    _ => return Err(einval()),
+                };
+                uapi::write(payload, &arg);
+                Ok(0)
+            }
+            uapi::SUBMIT_CL | uapi::SUBMIT_CSD => {
+                let (kind, count, rest, extensions, flags_ok) = if func == uapi::SUBMIT_CL {
+                    let (arg, rest) = uapi::read::<uapi::SubmitCl>(payload).ok_or_else(einval)?;
+                    // A render job without a bin job is not supported yet.
+                    if arg.bcl_start == arg.bcl_end {
+                        return Err(einval());
+                    }
+                    let a = [arg.bcl_start, arg.bcl_end, arg.rcl_start, arg.rcl_end, arg.qma, arg.qms, arg.qts];
+                    (JobKind::Cl(a), arg.bo_handle_count, rest, arg.extensions, arg.flags & !uapi::SUBMIT_CL_FLUSH_CACHE == 0)
+                } else {
+                    let (arg, rest) = uapi::read::<uapi::SubmitCsd>(payload).ok_or_else(einval)?;
+                    (JobKind::Csd(arg.cfg), arg.bo_handle_count, rest, arg.extensions, arg.flags == 0)
+                };
+                // No syncobjs yet: jobs run in the order they came, which
+                // covers in_sync on the client's own jobs; out_sync is not
+                // signalled, WAIT_BO waits.
+                if extensions != 0 || !flags_ok {
+                    return Err(einval());
+                }
+                let bos = uapi::handles(rest, count).ok_or_else(einval)?;
+                if bos.iter().any(|h| !client.bos.contains_key(h)) {
+                    return Err(Error::new(ENOENT));
+                }
+                let job = submit_job(&shared, queue, next_job, id, client, kind);
+                for h in bos {
+                    client.bo_jobs.insert(h, job);
+                }
+                Ok(0)
+            }
+            uapi::WAIT_BO => {
+                let (arg, _) = uapi::read::<uapi::WaitBo>(payload).ok_or_else(einval)?;
+                client.bos.get(&arg.handle).ok_or(Error::new(ENOENT))?;
+                match client.bo_jobs.get(&arg.handle) {
+                    // A job of this BO not done: a wait with a timeout was
+                    // held (hold_op), so only timeout 0 comes here.
+                    Some(&job) if job > *done_through => Err(Error::new(ETIME)),
+                    Some(&job) if client.results.get(&job).is_some_and(|r| r.starts_with("error")) => Err(Error::new(EIO)),
+                    _ => Ok(0),
+                }
+            }
+            _ => Err(Error::new(ENOSYS)),
+        }
+    }
+}
+
 impl SchemeSync for V3dScheme {
+    fn call(&mut self, id: usize, payload: &mut [u8], metadata: &[u64], _ctx: &CallerCtx) -> Result<usize> {
+        let shared = self.shared.clone();
+        let mut state = lock(&shared.state);
+        let func = *metadata.first().ok_or(Error::new(EINVAL))?;
+        self.ioctl(&mut state, id, func, payload)
+    }
+
     fn scheme_root(&mut self) -> Result<usize> {
         Ok(lock(&self.shared.state).handles.insert(Handle::Root))
     }
@@ -1420,6 +1579,8 @@ impl SchemeSync for V3dScheme {
             waiting: None,
             held: None,
             space: None,
+            bo_jobs: BTreeMap::new(),
+            held_calls: Vec::new(),
         });
         Ok(OpenResult::ThisScheme { number: state.handles.insert(handle), flags: NewFdFlags::empty() })
     }
@@ -1519,12 +1680,37 @@ fn main() {
     daemon::SchemeDaemon::new(daemon);
 }
 
-/// Hands a read on a client that waits for a job to the job thread.
-/// Returns the Op back if the read can be answered now.
-fn hold_read(shared: &Shared, caller: CallerCtx, op: Op) -> Option<(CallerCtx, Op)> {
+/// Hands a request that must wait for a job to the job thread: a read on
+/// a client that waits for a job, or a WAIT_BO with a timeout on a BO whose
+/// last job is not done (the timeout is not kept: the job ends within its
+/// own 1 s limit). Returns the Op back if it can be answered now.
+fn hold_op(shared: &Shared, caller: CallerCtx, mut op: Op) -> Option<(CallerCtx, Op)> {
+    let wait_bo = match &mut op {
+        Op::Read(_) => None,
+        Op::Call(call) => {
+            let fd = call.fd();
+            let (payload, metadata) = call.payload_and_metadata();
+            match (metadata.first(), uapi::read::<uapi::WaitBo>(payload)) {
+                (Some(&uapi::WAIT_BO), Some((arg, _))) if arg.timeout_ns != 0 => Some((fd, arg.handle)),
+                _ => return Some((caller, op)),
+            }
+        }
+        _ => return Some((caller, op)),
+    };
+    let mut state = lock(&shared.state);
+    let done = state.done_through;
+    if let Some((fd, handle)) = wait_bo {
+        if let Ok(Handle::Client(client)) = state.handles.get_mut(fd)
+            && let Some(&job) = client.bo_jobs.get(&handle)
+            && job > done
+        {
+            client.held_calls.push((job, HeldRead { caller, op }));
+            return None;
+        }
+        return Some((caller, op));
+    }
     let Op::Read(read) = &op else { return Some((caller, op)) };
     let fd = read.fd;
-    let mut state = lock(&shared.state);
     match state.handles.get_mut(fd) {
         Ok(Handle::Client(client)) if client.waiting.is_some() && client.held.is_none() => {
             client.held = Some(HeldRead { caller, op });
@@ -1556,7 +1742,7 @@ fn serve(shared: Arc<Shared>) -> ! {
             RequestKind::Call(call) => {
                 let caller = call.caller();
                 match call.op() {
-                    Ok(op) => match hold_read(&shared, caller, op) {
+                    Ok(op) => match hold_op(&shared, caller, op) {
                         Some((caller, op)) => op.handle_sync(caller, &mut scheme, &mut scheme_state),
                         None => continue,
                     },
@@ -1571,6 +1757,13 @@ fn serve(shared: Arc<Shared>) -> ! {
                     let mut state = lock(&shared.state);
                     let mut found = None;
                     for (&id, handle) in state.handles.iter_mut() {
+                        if let Handle::Client(client) = handle
+                            && let Some(i) = client.held_calls.iter().position(|(_, held)| held.op.req_id() == cancel.id)
+                        {
+                            say(&format!("client {id}: WAIT_BO cancelled"));
+                            found = Some(client.held_calls.remove(i).1);
+                            break;
+                        }
                         if let Handle::Client(client) = handle
                             && client.held.as_ref().is_some_and(|held| held.op.req_id() == cancel.id)
                         {
@@ -1649,7 +1842,19 @@ fn daemon(daemon: daemon::SchemeDaemon) -> ! {
     };
     let v3d = V3d::new(hub, core, pm, asb, irq);
     let socket = Socket::create().expect("v3dd: failed to create the v3d scheme");
+    // UIFCFG, HUB_IDENT1..3, CORE0 IDENT0..2 (Linux v3d_get_param_ioctl()).
+    let params = [
+        v3d.hub.read(0x0004),
+        v3d.hub.read(V3D_HUB_IDENT1),
+        v3d.hub.read(0x0010),
+        v3d.hub.read(0x0014),
+        v3d.core.read(0x0000),
+        v3d.core.read(0x0004),
+        v3d.core.read(0x0008),
+    ]
+    .map(u64::from);
     let shared = Arc::new(Shared {
+        params,
         mmu: v3d.mmu.clone(),
         stats: v3d.stats.clone(),
         v3d: Mutex::new(v3d),
