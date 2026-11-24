@@ -141,6 +141,16 @@ to v3dd: 512 KiB at the start of every bin job, and another 512 KiB chunk
 BOs belong to the open file and are freed when it closes. Freed address
 ranges are reused. On other boards v3dd leaves the hardware alone.
 
+**Mapping BOs.** A client maps a BO into its own memory with `fmap` on
+the same handle: offset `(ID << 32) + BYTE` (BYTE a multiple of 4096),
+`MAP_SHARED`. The kernel maps the BO's own pages, with the memory type
+v3dd has (uncached, as all DMA memory on aarch64), so the client writes
+control lists and shader data and reads results directly, with no cache
+flush on either side; it issues a DSB before the command that starts the
+job. Private mappings are refused. A BO freed while mapped stays the
+client's memory until it unmaps it, but V3D no longer sees it. `put`,
+`get` and `fill` stay for tests.
+
 **Interrupt.** v3dd waits for a job on the V3D interrupt, which it finds
 in the devicetree and opens through `/scheme/irq`. The core interrupts
 (bin done, render done, CSD done, out of overflow memory) and the hub
@@ -162,6 +172,9 @@ v3dd; with `--render [--triangle | --triangle-math]` it runs the step 2
 frame N times instead and checks that every frame equals the first.
 `--faults` runs a job that stores to an unmapped address and one that
 never ends, and checks that both come back and the next jobs run right.
+With `--mapped`, every BO is mapped into v3dprobe and written and read
+there instead of through `put`/`get`; a check of the mappings runs first
+and a check for leaked BOs last.
 
 Do not run `v3dprobe --csd` or `--render` while v3dd runs: they set up
 their own page table.
@@ -173,9 +186,7 @@ their own page table.
   the BCM2711, vertical blank interrupts instead of the flush timer.
 - Orbital: windows on overlay planes (redox-rpi experiment
   `orbital-planes`).
-- V3D (#598 and later): mapping BOs into
-  clients instead of `put`/`get` (redox-rpi#666), asynchronous jobs, one
-  address space per client, a directory
+- V3D: asynchronous jobs, one address space per client, a directory
   listing of `/scheme/v3d`. Then a Mesa winsys for Redox.
 - The 3D block of the Pi 3, 3B+ and Zero 2 W (VideoCore IV, Linux `vc4`
   V3D) is a different GPU and has no code yet.
