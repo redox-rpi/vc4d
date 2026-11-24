@@ -18,7 +18,8 @@ pub static MAPPED: AtomicBool = AtomicBool::new(false);
 
 /// ioctl() through relibc with Linux's request numbers and structs
 /// (v3dprobe --libc, G3 of redox-rpi#669) instead of the scheme call:
-/// the path Mesa and libdrm take.
+/// the path Mesa and libdrm take, on the render node /dev/dri/renderD128
+/// (a link to /scheme/v3d).
 pub static LIBC: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
@@ -45,6 +46,9 @@ fn libc_ioctl(fd: i32, func: u64, payload: &mut [u8]) -> Result<usize, syscall::
         // does not have there; it has 4 at 44 instead.
         0x47 => (80, 44, 4, false),
         0x09 => (payload.len(), 0, 0, false),
+        // VERSION: three length/pointer pairs; GET_UNIQUE: one.
+        0x00 => (40, 0, 0, true),
+        0x01 => (8, 0, 0, true),
         _ => (payload.len(), 0, 0, true),
     };
     let handles = payload.get(fixed..).unwrap_or(&[]).as_ptr() as u64;
@@ -62,6 +66,22 @@ fn libc_ioctl(fd: i32, func: u64, payload: &mut [u8]) -> Result<usize, syscall::
             linux.extend_from_slice(&payload[at..60]);
             linux.extend_from_slice(&payload[64..fixed]);
         }
+        0x00 => {
+            let len = |at: usize| u64::from_ne_bytes(payload[at..at + 8].try_into().unwrap());
+            let (name, date, desc) = (len(16), len(24), len(32));
+            let base = payload[fixed..].as_ptr() as u64;
+            linux.extend_from_slice(&payload[..16]);
+            linux.extend_from_slice(&name.to_ne_bytes());
+            linux.extend_from_slice(&base.to_ne_bytes());
+            linux.extend_from_slice(&date.to_ne_bytes());
+            linux.extend_from_slice(&(base + name).to_ne_bytes());
+            linux.extend_from_slice(&desc.to_ne_bytes());
+            linux.extend_from_slice(&(base + name + date).to_ne_bytes());
+        }
+        0x01 => {
+            linux.extend_from_slice(&payload[..8]);
+            linux.extend_from_slice(&handles.to_ne_bytes());
+        }
         // The handles pointer comes first.
         0xC3 | 0xC4 | 0xC5 => {
             linux.extend_from_slice(&handles.to_ne_bytes());
@@ -76,6 +96,13 @@ fn libc_ioctl(fd: i32, func: u64, payload: &mut [u8]) -> Result<usize, syscall::
     }
     match func {
         0x40 | 0x47 => {}
+        0x00 => {
+            payload[..16].copy_from_slice(&linux[..16]);
+            for (wire, linux_at) in [(16, 16), (24, 32), (32, 48)] {
+                payload[wire..wire + 8].copy_from_slice(&linux[linux_at..linux_at + 8]);
+            }
+        }
+        0x01 => payload[..8].copy_from_slice(&linux[..8]),
         0xC3 | 0xC4 | 0xC5 => payload[..fixed].copy_from_slice(&linux[8..]),
         _ => payload.copy_from_slice(&linux),
     }
@@ -109,7 +136,7 @@ impl Client {
         OpenOptions::new()
             .read(true)
             .write(true)
-            .open("/scheme/v3d")
+            .open(if LIBC.load(Ordering::Relaxed) { "/dev/dri/renderD128" } else { "/scheme/v3d" })
             .map(|file| Client { file, maps: BTreeMap::new() })
             .map_err(|err| format!("/scheme/v3d: {err} (v3dd not running?)"))
     }
