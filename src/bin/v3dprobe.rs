@@ -19,10 +19,12 @@
 // v3dprobe [--csd] [--render [--triangle | --triangle-math] [--show SECONDS]]
 //          [--off] [--no-watchdog]
 // v3dprobe --via-v3dd [--loops N] [--render [--triangle | --triangle-math] | --faults
-//          | --queue [--clients C] | --ioctl] [--mapped]
+//          | --queue [--clients C] | --ioctl [--libc]] [--mapped]
 //   --ioctl: v3dd's binary interface (G2 step 3, redox-rpi#668), Linux's
 //     V3D ioctls as scheme calls: N compute jobs by SUBMIT_CSD and WAIT_BO,
 //     wrong arguments, an endless job (WAIT_BO: ETIME, then EIO)
+//   --libc: the same through relibc's ioctl() with Linux's request numbers
+//     and structs, the path of Mesa and libdrm (G3, redox-rpi#669)
 //   --queue: v3dd's job queue (G2, redox-rpi#668): C clients (4) at once,
 //     each with N jobs (at most 64) in flight; an endless job in the middle
 //     of a queue; a client that closes with jobs in flight; a client's job
@@ -521,6 +523,9 @@ fn main() {
     // Step 3 (redox-rpi#598): the CSD job through v3dd, no register access.
     if args.iter().any(|a| a == "--via-v3dd") {
         let mapped = args.iter().any(|a| a == "--mapped");
+        if args.iter().any(|a| a == "--libc") {
+            client::LIBC.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if mapped {
             client::MAPPED.store(true, std::sync::atomic::Ordering::Relaxed);
             match mapped_check() {
