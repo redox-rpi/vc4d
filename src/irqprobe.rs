@@ -20,6 +20,7 @@ use fdt::Fdt;
 
 const SCALER_DISPCTRL: usize = 0x00;
 const SCALER_DISPSTAT: usize = 0x04;
+const PV_CONTROL: usize = 0x00;
 const PV_INTEN: usize = 0x24;
 const PV_INTSTAT: usize = 0x28;
 
@@ -33,7 +34,7 @@ fn cells(raw: &[u8]) -> Vec<u32> {
 /// The register base (CPU physical) and the /scheme/irq path of the first
 /// node with `compatible`. The firmware's devicetree has these nodes, with
 /// status "disabled".
-fn node(fdt: &Fdt, compatible: &str) -> Option<(usize, String)> {
+pub fn node(fdt: &Fdt, compatible: &str) -> Option<(usize, String)> {
     let node = fdt.find_compatible(&[compatible])?;
     let bus = node.reg()?.next()?.starting_address as usize;
     let parent = [Some(node), fdt.find_node("/soc"), fdt.find_node("/")]
@@ -61,6 +62,8 @@ fn count(path: &str) -> Result<u32, String> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
+        // /scheme/irq/phandle-... opens only with O_CREAT (Pi test 606).
+        .create(true)
         .custom_flags(syscall::O_NONBLOCK as i32)
         .open(path)
         .map_err(|err| format!("{path}: {err}"))?;
@@ -79,8 +82,8 @@ fn count(path: &str) -> Result<u32, String> {
 
 pub fn run(fdt: &Fdt) {
     for (name, compatible, offsets, what) in [
-        ("hvs", "brcm,bcm2711-hvs", [SCALER_DISPCTRL, SCALER_DISPSTAT], "DISPCTRL DISPSTAT"),
-        ("pv2", "brcm,bcm2711-pixelvalve2", [PV_INTEN, PV_INTSTAT], "INTEN INTSTAT"),
+        ("hvs", "brcm,bcm2711-hvs", [SCALER_DISPCTRL, SCALER_DISPSTAT, SCALER_DISPSTAT], "DISPCTRL DISPSTAT DISPSTAT"),
+        ("pv2", "brcm,bcm2711-pixelvalve2", [PV_CONTROL, PV_INTEN, PV_INTSTAT], "CONTROL INTEN INTSTAT"),
     ] {
         let Some((phys, path)) = node(fdt, compatible) else {
             println!("vc4d: irq probe: {name}: no {compatible} node with interrupts");

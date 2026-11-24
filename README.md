@@ -37,6 +37,15 @@ one HVS channel running. vc4d takes that channel over:
   frame, newer damage is merged into the waiting frame, and a 4 ms timer
   shows it once the HVS has taken the last list. `VC4D_FLIP=off` or
   `/etc/vc4d-flip-off` scans the client buffer out directly instead.
+- **Vertical blank** (Pi 4 and 400). A waiting flip is shown on pixel
+  valve 2's vertical front porch interrupt (HDMI 0), as Linux
+  `vc4_crtc.c` does for vblank, instead of the 4 ms timer. The interrupt is
+  on only while a flip waits. The firmware leaves pixel valve 2's
+  interrupts alone, but it takes the HVS interrupts, so those stay its
+  own. A 20 ms timer catches a missed frame. The log counts flips shown on
+  the interrupt and on the timer. At start, `vc4d: irq probe:` lines show
+  the HVS and pixel valve 2 interrupt registers and how many interrupts
+  reach the GIC in one second.
 - **Scaled modes.** With `/etc/vc4d-mode` (for example `1280x720`), clients
   see only that mode, and the HVS scales every plane to the firmware's mode
   (the PPF and TPZ scalers and the Mitchell/Netravali kernel of Linux
@@ -76,6 +85,8 @@ Environment (set by the bootloader) and files:
 | `VC4D_EDID=off` | no EDID read |
 | `VC4D_CHECK=off` | no check before the handover |
 | `VC4D_TRACE=<file>`, `/etc/vc4d-trace` | CSV trace |
+| `VC4D_VBLANK=off` | flips on the 4 ms timer instead of the vertical blank (Pi 4 and 400) |
+| `VC4D_IRQ_PROBE=off` | no interrupt probe at start (Pi 4 and 400) |
 | `/etc/vc4d-mode` | the clients' mode, scaled by the HVS |
 
 ### vc4shot
@@ -151,7 +162,7 @@ their own page table.
 
 - Display: modes the firmware did not pick (the PLLH divider and the HDMI
   PHY; branch `mode-switch` has a first try), EDID and mode registers on
-  the BCM2711, vertical blank interrupts instead of the flush timer.
+  the BCM2711 (redox-rpi#671), the vertical blank on the BCM2837.
 - Orbital: windows on overlay planes (redox-rpi experiment
   `orbital-planes`).
 - V3D (#598 and later): mapping BOs into
