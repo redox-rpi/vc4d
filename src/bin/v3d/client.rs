@@ -193,6 +193,19 @@ impl Client {
         result
     }
 
+    /// "submit csd ..." or "submit cl ...": the job number, answered at once
+    /// (G2, redox-rpi#668).
+    pub fn submit(&mut self, job: &str) -> Result<u64, String> {
+        let reply = self.ask(&format!("submit {job}"))?;
+        reply.strip_prefix("job ").and_then(|n| n.parse().ok()).ok_or_else(|| format!("submit: bad reply {reply}"))
+    }
+
+    /// Waits for a submitted job: its "done ..." line, or Err with v3dd's
+    /// "error ..." line.
+    pub fn wait(&mut self, job: u64) -> Result<String, String> {
+        self.ask(&format!("wait {job}"))
+    }
+
     /// "done US": the job's time in microseconds.
     pub fn job(&mut self, line: &str) -> Result<u128, String> {
         let done = self.ask(line)?;

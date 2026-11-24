@@ -291,6 +291,40 @@ pub fn run(hub: &Regs, core: &Regs) -> bool {
     }
 }
 
+/// The step 1 job for v3dd's queue test (G2, redox-rpi#668): the shader's
+/// words for the code BO ...
+pub fn shader_words() -> Vec<u32> {
+    SHADER.iter().flat_map(|w| [*w as u32, (*w >> 32) as u32]).collect()
+}
+
+/// ... the "csd ..." command for code and uniforms (the uniforms: the
+/// result BO's address, then the constant) ...
+pub fn job_line(code_va: u32, unif_va: u32) -> String {
+    let wg_size: u32 = 16;
+    let wgs_per_sg: u32 = 16;
+    let cfg = [
+        1 << 16,
+        1 << 16,
+        1 << 16,
+        ((wgs_per_sg * wg_size).div_ceil(16) - 1) << 12 | wgs_per_sg << 8 | (wg_size & 0xff),
+        0,
+        code_va,
+        unif_va,
+    ];
+    let cfg: Vec<String> = cfg.iter().map(|w| format!("{w:#x}")).collect();
+    format!("csd {}", cfg.join(" "))
+}
+
+/// ... and the result it should leave: lane + constant in each lane, the
+/// constant offset from the usual one by `delta`.
+pub fn constant(delta: u32) -> u32 {
+    CONSTANT.wrapping_add(delta)
+}
+
+pub fn want(constant: u32) -> Vec<u32> {
+    (0..LANES as u32).map(|lane| constant + lane).collect()
+}
+
 /// Step 3 (redox-rpi#598): the same job through v3dd and /scheme/v3d,
 /// `loops` times, with a new constant each time. Every tenth loop frees the
 /// result BO and takes a new one, so the MMU mappings change under the

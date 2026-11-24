@@ -12,17 +12,30 @@
 //   put ID WORD HEX...        -> ok            writes 32-bit words from word WORD
 //   get ID WORD COUNT         -> HEX...        reads COUNT words from word WORD
 //   fill ID WORD COUNT HEX    -> ok            sets COUNT words to HEX
-//   free ID                   -> ok
-//   csd CFG0 CFG1 ... CFG6    -> done US       runs one CSD job, waits for it
-//   cl BCL END RCL END QMA QMS QTS
-//                             -> done US bin US render US
-//                                              one bin job, then one render
-//                                              job (all V3D addresses: the
-//                                              control lists, the tile
+//   free ID                   -> ok            (V3D keeps it until the
+//                                              client's pending jobs are done)
+//   submit csd CFG0 ... CFG6  -> job N         queues one CSD job
+//   submit cl BCL END RCL END QMA QMS QTS
+//                             -> job N         queues one bin job, then one
+//                                              render job (all V3D addresses:
+//                                              the control lists, the tile
 //                                              allocation memory and its size,
 //                                              the tile state)
+//   wait N                    -> done US       the read waits until job N is
+//                                (csd), or     done; a job's answer is given
+//                                done US bin US render US (cl)
+//                                              once, to wait or poll
+//   poll N                    -> queued, running, or the answer as wait
+//   csd CFG0 ... CFG6         -> as submit csd, then wait
+//   cl BCL END RCL END QMA QMS QTS -> as submit cl, then wait
 //   stats                     -> one line of counters
 //
+// Jobs (G2, redox-rpi#668) go into one queue for all clients and run in
+// order on the job thread, one at a time; the request loop goes on
+// meanwhile, so other clients' commands and BOs do not wait for a job.
+// A read that waits for a job is held and answered by the job thread when
+// the job is done. While a client waits, its next write fails with EBUSY.
+
 // A client maps a BO into its own memory with fmap on the same handle
 // (step 3e, redox-rpi#666): offset (ID << 32) + BYTE, BYTE a multiple of
 // the page size, MAP_SHARED. The mapping is the BO's own memory, with the
@@ -33,8 +46,9 @@
 // but V3D no longer sees it.
 //
 // Numbers are decimal or 0x hex. A failed command answers "error ...". BOs
-// belong to the open file and are freed when it is closed. Jobs run one at
-// a time, synchronously, with the caches handled as Linux's v3d driver does
+// belong to the open file and are freed when it is closed; the client's
+// queued jobs go then, and a running one ends first. Jobs run one at a
+// time, with the caches handled as Linux's v3d driver does
 // (v3d_gem.c v3d_invalidate_caches(), v3d_clean_caches(); v3d_sched.c
 // v3d_csd_job_run()).
 //
@@ -44,16 +58,18 @@
 // v3d_hub_irq() logs it. A job that does not end within 1 s is stopped by
 // a reset of V3D (Linux v3d_reset(): on the BCM2711 the PM reset line
 // with the bridges closed, then the MMU set up again) and comes back as
-// "error timeout ...". The daemon goes on in both cases.
+// "error timeout ...". The daemon goes on in both cases, with the next job
+// in the queue: only the job that ran fails, the queued ones never reached
+// V3D.
 //
 // Interrupt (step 3d): v3dd waits for a job on the V3D interrupt (the
 // devicetree's v3d node, GIC SPI 74 on the BCM2711, through /scheme/irq),
 // as Linux's v3d_irq.c: FLDONE, FRDONE, CSDDONE and OUTOMEM from the core,
 // the MMU faults from the hub. A 5 ms timer stays as a fallback, and
-// without an interrupt v3dd polls as before. Jobs still run one at a time,
-// and a client's write waits for its job.
+// without an interrupt v3dd polls as before.
 //
-// Not yet: asynchronous jobs, one address space per client.
+// Not yet: one address space per client, a binary interface (G2 steps 2
+// and 3).
 //
 // The binner's overflow memory belongs to v3dd: 512 KiB at the start of
 // every bin job, and another 512 KiB chunk each time the binner reports
@@ -63,21 +79,22 @@
 // each job, as in v3dprobe: the Pi 400 in the lab has no remote power
 // switch, and a GPU access that hangs the bus resets the SoC.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write as _};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::process;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use common::dma::Dma;
 use event::{EventQueue, user_data};
-use redox_scheme::scheme::SchemeSync;
-use redox_scheme::{CallerCtx, OpenResult, Socket};
-use scheme_utils::{Blocking, FpathWriter, HandleMap};
-use syscall::error::{EACCES, EBADF, EINVAL, ENOENT, Error, Result};
+use redox_scheme::scheme::{IntoTag as _, Op, SchemeState, SchemeSync};
+use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
+use scheme_utils::{FpathWriter, HandleMap};
+use syscall::error::{EACCES, EBADF, EBUSY, EINTR, EINVAL, ENOENT, ENOSYS, Error, Result};
 use syscall::flag::{MapFlags, MunmapFlags};
 use syscall::schemev2::NewFdFlags;
 
@@ -196,6 +213,10 @@ const V3D_POWER: &str = "/scheme/rpi-firmware/v3d_power";
 pub struct Regs {
     base: *mut u32,
 }
+
+// Device memory, mapped for the life of the daemon; the threads that share
+// a Regs take turns through the locks around V3d and Mmu.
+unsafe impl Send for Regs {}
 
 impl Regs {
     fn map(phys: usize, size: usize, name: &str) -> Regs {
@@ -400,6 +421,28 @@ struct Stats {
     timer_wakeups: u64,
     maps: u64,
     unmaps: u64,
+    overflow_chunks: usize,
+    /// The interrupt path, or "off" while v3dd polls.
+    irq: String,
+}
+
+/// Locks a mutex; a thread that panicked with it held does not stop v3dd.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The V3D page table and its address space. A lock of its own: the request
+/// loop maps and unmaps BOs while a job runs on the job thread, as Linux's
+/// v3d_mmu.c inserts PTEs while jobs run. A reset holds it throughout, so
+/// no MMU flush meets V3D in reset.
+struct Mmu {
+    hub: Regs,
+    pt: Dma<[u32]>,
+    scratch_phys: usize,
+    /// Free V3D address ranges (VA, pages), first fit.
+    free_va: Vec<(u32, usize)>,
+    next_va: u32,
+    stats: Arc<Mutex<Stats>>,
 }
 
 struct V3d {
@@ -407,12 +450,8 @@ struct V3d {
     core: Regs,
     pm: Regs,
     asb: Regs,
-    pt: Dma<[u32]>,
-    scratch_phys: usize,
-    /// Free V3D address ranges (VA, pages), first fit.
-    free_va: Vec<(u32, usize)>,
-    next_va: u32,
-    stats: Stats,
+    mmu: Arc<Mutex<Mmu>>,
+    stats: Arc<Mutex<Stats>>,
     /// None: v3dd polls.
     irq: Option<Irq>,
     /// Interrupt bits the handler took and cleared, for the waiting code.
@@ -423,47 +462,7 @@ struct V3d {
     overflow: Vec<Bo>,
 }
 
-impl V3d {
-    fn new(hub: Regs, core: Regs, pm: Regs, asb: Regs, irq: Option<Irq>) -> V3d {
-        let pt = match Dma::<[u32]>::zeroed_slice(PT_ENTRIES) {
-            Ok(dma) => unsafe { dma.assume_init() },
-            Err(err) => fail(&format!("no 4 MiB of contiguous memory for the page table: {err:?}")),
-        };
-        // The MMU sends illegal accesses here.
-        let scratch = match Dma::<[u32]>::zeroed_slice(PAGE / 4) {
-            Ok(dma) => unsafe { dma.assume_init() },
-            Err(err) => fail(&format!("no scratch page: {err:?}")),
-        };
-        let pt_phys = pt.physical();
-        let scratch_phys = scratch.physical();
-        // The scratch page lives as long as the daemon.
-        std::mem::forget(scratch);
-        let mut v3d = V3d {
-            hub,
-            core,
-            pm,
-            asb,
-            pt,
-            scratch_phys,
-            free_va: Vec::new(),
-            next_va: VA_START,
-            stats: Stats::default(),
-            irq,
-            core_seen: 0,
-            hub_seen: 0,
-            overflow: Vec::new(),
-        };
-        if !v3d.hw_setup() {
-            fail("MMU flush did not finish");
-        }
-        say(&format!("MMU on: page table at {pt_phys:#x}, scratch page at {scratch_phys:#x}"));
-        match v3d.new_bo(OVERFLOW_SIZE) {
-            Ok(bo) => v3d.overflow.push(bo),
-            Err(err) => fail(&format!("no binner overflow memory: {err}")),
-        }
-        v3d
-    }
-
+impl Mmu {
     fn alloc_va(&mut self, pages: usize) -> Option<u32> {
         if let Some(i) = self.free_va.iter().position(|&(_, n)| n >= pages) {
             let (va, n) = self.free_va[i];
@@ -500,7 +499,7 @@ impl V3d {
         if !csd::mmu_flush(&self.hub) {
             return Err("MMU flush did not finish".into());
         }
-        self.stats.bos += 1;
+        lock(&self.stats).bos += 1;
         Ok(Bo { mem, va, pages })
     }
 
@@ -510,18 +509,71 @@ impl V3d {
         }
         csd::mmu_flush(&self.hub);
         release_va(&mut self.free_va, &mut self.next_va, bo.va, bo.pages);
-        self.stats.frees += 1;
+        lock(&self.stats).frees += 1;
         // bo.mem is freed here, after the MMU no longer maps it.
+    }
+}
+
+impl V3d {
+    fn new(hub: Regs, core: Regs, pm: Regs, asb: Regs, irq: Option<Irq>) -> V3d {
+        let pt = match Dma::<[u32]>::zeroed_slice(PT_ENTRIES) {
+            Ok(dma) => unsafe { dma.assume_init() },
+            Err(err) => fail(&format!("no 4 MiB of contiguous memory for the page table: {err:?}")),
+        };
+        // The MMU sends illegal accesses here.
+        let scratch = match Dma::<[u32]>::zeroed_slice(PAGE / 4) {
+            Ok(dma) => unsafe { dma.assume_init() },
+            Err(err) => fail(&format!("no scratch page: {err:?}")),
+        };
+        let pt_phys = pt.physical();
+        let scratch_phys = scratch.physical();
+        // The scratch page lives as long as the daemon.
+        std::mem::forget(scratch);
+        let stats = Arc::new(Mutex::new(Stats {
+            irq: irq.as_ref().map(|irq| irq.path.clone()).unwrap_or_else(|| "off".into()),
+            ..Stats::default()
+        }));
+        let mmu = Mmu {
+            hub: Regs { base: hub.base },
+            pt,
+            scratch_phys,
+            free_va: Vec::new(),
+            next_va: VA_START,
+            stats: stats.clone(),
+        };
+        let mut v3d = V3d {
+            hub,
+            core,
+            pm,
+            asb,
+            mmu: Arc::new(Mutex::new(mmu)),
+            stats,
+            irq,
+            core_seen: 0,
+            hub_seen: 0,
+            overflow: Vec::new(),
+        };
+        if !v3d.hw_setup(&lock(&v3d.mmu)) {
+            fail("MMU flush did not finish");
+        }
+        say(&format!("MMU on: page table at {pt_phys:#x}, scratch page at {scratch_phys:#x}"));
+        let overflow = lock(&v3d.mmu).new_bo(OVERFLOW_SIZE);
+        match overflow {
+            Ok(bo) => v3d.overflow.push(bo),
+            Err(err) => fail(&format!("no binner overflow memory: {err}")),
+        }
+        lock(&v3d.stats).overflow_chunks = v3d.overflow.len();
+        v3d
     }
 
     /// v3d_init_core() and v3d_mmu_set_page_table(): after power-up and
     /// after every reset.
-    fn hw_setup(&self) -> bool {
+    fn hw_setup(&self, mmu: &Mmu) -> bool {
         self.core.write(V3D_CTL_L2TFLSTA, 0);
         self.core.write(V3D_CTL_L2TFLEND, !0);
-        self.hub.write(V3D_MMU_PT_PA_BASE, (self.pt.physical() / PAGE) as u32);
+        self.hub.write(V3D_MMU_PT_PA_BASE, (mmu.pt.physical() / PAGE) as u32);
         self.hub.write(V3D_MMU_CTL, V3D_MMU_CTL_ENABLES);
-        self.hub.write(V3D_MMU_ILLEGAL_ADDR, (self.scratch_phys / PAGE) as u32 | V3D_MMU_ILLEGAL_ADDR_ENABLE);
+        self.hub.write(V3D_MMU_ILLEGAL_ADDR, (mmu.scratch_phys / PAGE) as u32 | V3D_MMU_ILLEGAL_ADDR_ENABLE);
         self.hub.write(V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_ENABLE);
         if self.irq.is_some() {
             // v3d_irq_enable(): ours unmasked, all others masked.
@@ -552,7 +604,7 @@ impl V3d {
         self.hub.write(V3D_HUB_INT_CLR, hub);
         self.core_seen |= core;
         self.hub_seen |= hub;
-        self.stats.irqs += 1;
+        lock(&self.stats).irqs += 1;
         let _ = irq.file.write(&token);
         true
     }
@@ -577,22 +629,26 @@ impl V3d {
             match irq.queue.next() {
                 Some(Ok(event)) => match event.user_data {
                     IrqSource::Irq => {
-                        self.stats.irq_wakeups += 1;
+                        lock(&self.stats).irq_wakeups += 1;
                         self.handle_irq();
                     }
                     IrqSource::Time => {
                         irq.armed = false;
                         let mut time = syscall::TimeSpec::default();
                         let _ = irq.timer.read(&mut time);
-                        self.stats.timer_wakeups += 1;
+                        lock(&self.stats).timer_wakeups += 1;
                     }
                 },
                 Some(Err(err)) if err.is_interrupt() => {}
                 Some(Err(err)) => {
                     say(&format!("interrupt: event queue failed ({err}): polling from now on"));
                     self.irq = None;
+                    lock(&self.stats).irq = "off".into();
                 }
-                None => self.irq = None,
+                None => {
+                    self.irq = None;
+                    lock(&self.stats).irq = "off".into();
+                }
             }
         }
     }
@@ -602,6 +658,8 @@ impl V3d {
     /// asserted, then released and the bridges opened, master first), then
     /// the core and the MMU set up again. The jobs in flight are lost.
     fn reset(&mut self) {
+        let mmu = self.mmu.clone();
+        let mmu = lock(&mmu);
         let (pm, asb) = (&self.pm, &self.asb);
         say(&format!("reset: V3D_ERR_STAT {:#x}", self.core.read(V3D_ERR_STAT)));
         let bridge = |reg: usize, stop: bool| -> bool {
@@ -634,14 +692,14 @@ impl V3d {
                 open = false;
             }
         }
-        let setup = open && self.hw_setup();
-        self.stats.resets += 1;
+        let setup = open && self.hw_setup(&mmu);
+        lock(&self.stats).resets += 1;
         self.core_seen = 0;
         self.hub_seen = 0;
         say(&format!(
             "reset: {} (resets so far: {})",
             if setup { "done, MMU set up again" } else { "FAILED: V3D is not usable" },
-            self.stats.resets
+            lock(&self.stats).resets
         ));
     }
 
@@ -673,7 +731,7 @@ impl V3d {
         // The status bits in MMU_CTL are write-1-to-clear (v3d_hub_irq()).
         hub.write(V3D_MMU_CTL, ctl);
         hub.write(V3D_HUB_INT_CLR, V3D_HUB_INT_MMU);
-        self.stats.mmu_faults += 1;
+        lock(&self.stats).mmu_faults += 1;
         Some(format!("{} va {addr:#x} unit {unit}", kinds.join(",")))
     }
 
@@ -685,7 +743,7 @@ impl V3d {
         watchdog.arm();
         if let Some(old) = self.mmu_fault() {
             say(&format!("stale MMU fault before a job, cleared: {old}"));
-            self.stats.mmu_faults -= 1;
+            lock(&self.stats).mmu_faults -= 1;
         }
         let result = run(self);
         // A job that was done before v3dd waited leaves its interrupt
@@ -700,21 +758,21 @@ impl V3d {
             self.reset();
         }
         watchdog.stop();
-        self.stats.jobs += 1;
+        lock(&self.stats).jobs += 1;
         match (result, fault) {
             (Ok(value), None) => Ok(value),
             (Ok(_), Some(fault)) => {
-                self.stats.failed_jobs += 1;
+                lock(&self.stats).failed_jobs += 1;
                 say(&format!("job ended with an MMU fault: {fault}"));
                 Err(format!("mmu-fault {fault}"))
             }
             (Err(err), None) => {
-                self.stats.failed_jobs += 1;
+                lock(&self.stats).failed_jobs += 1;
                 say(&format!("job failed: {err}; V3D reset"));
                 Err(format!("{err}; V3D reset"))
             }
             (Err(err), Some(fault)) => {
-                self.stats.failed_jobs += 1;
+                lock(&self.stats).failed_jobs += 1;
                 say(&format!("job failed: {err}, MMU fault {fault}; V3D reset"));
                 Err(format!("mmu-fault {fault}; {err}; V3D reset"))
             }
@@ -774,7 +832,10 @@ impl V3d {
             v3d.clean_caches();
             Ok(us)
         })?;
-        self.stats.job_us_max = self.stats.job_us_max.max(us);
+        {
+            let mut stats = lock(&self.stats);
+            stats.job_us_max = stats.job_us_max.max(us);
+        }
         Ok(us)
     }
 
@@ -783,9 +844,12 @@ impl V3d {
     /// (v3d_render_job_run()). Times in microseconds.
     fn bin_render(&mut self, bcl: (u32, u32), rcl: (u32, u32), qma: u32, qms: u32, qts: u32)
         -> std::result::Result<(u128, u128), String> {
-        self.stats.cl_jobs += 1;
+        lock(&self.stats).cl_jobs += 1;
         let (bin, render) = self.job(|v3d| v3d.bin_render_armed(bcl, rcl, qma, qms, qts))?;
-        self.stats.job_us_max = self.stats.job_us_max.max(bin + render);
+        {
+            let mut stats = lock(&self.stats);
+            stats.job_us_max = stats.job_us_max.max(bin + render);
+        }
         Ok((bin, render))
     }
 
@@ -826,13 +890,15 @@ impl V3d {
                     if next == OVERFLOW_CHUNKS_MAX {
                         return Err(format!("bin job: out of memory after {next} overflow chunks"));
                     }
-                    let bo = self.new_bo(OVERFLOW_SIZE).map_err(|err| format!("bin job: overflow memory: {err}"))?;
+                    let bo = lock(&self.mmu).new_bo(OVERFLOW_SIZE);
+                    let bo = bo.map_err(|err| format!("bin job: overflow memory: {err}"))?;
                     self.overflow.push(bo);
+                    lock(&self.stats).overflow_chunks = self.overflow.len();
                 }
                 self.core.write(V3D_PTB_BPOA, self.overflow[next].va);
                 self.core.write(V3D_PTB_BPOS, OVERFLOW_SIZE as u32);
                 next += 1;
-                self.stats.outomem += 1;
+                lock(&self.stats).outomem += 1;
             }
         }
         self.core_seen &= !V3D_INT_FLDONE;
@@ -855,14 +921,155 @@ impl V3d {
     }
 }
 
+/// A job in the queue. Job numbers count up from 1 over all clients; the
+/// queue runs in that order, so job N is done once `done_through` >= N.
+struct Job {
+    id: u64,
+    client: usize,
+    kind: JobKind,
+}
+
+enum JobKind {
+    Csd([u32; 7]),
+    Cl([u32; 7]),
+}
+
+/// A read the request loop held back until a job is done. The Op points
+/// into the client's buffer, which the kernel keeps until the answer.
+struct HeldRead {
+    caller: CallerCtx,
+    op: Op,
+}
+
+// The job thread answers the read; the Op is not used anywhere else.
+unsafe impl Send for HeldRead {}
+
+/// Results kept for a client that has not asked for them yet; older ones go.
+const RESULTS_MAX: usize = 256;
+
+struct Client {
+    reply: Vec<u8>,
+    bos: BTreeMap<u32, Bo>,
+    next_id: u32,
+    /// The client's jobs not yet done (queued or running).
+    pending: BTreeSet<u64>,
+    /// Answers of done jobs nobody asked for yet.
+    results: BTreeMap<u64, String>,
+    /// The job the next read waits for (wait, or the old csd/cl).
+    waiting: Option<u64>,
+    held: Option<HeldRead>,
+}
+
 enum Handle {
     Root,
-    Client { reply: Vec<u8>, bos: BTreeMap<u32, Bo>, next_id: u32 },
+    Client(Client),
+}
+
+struct State {
+    handles: HandleMap<Handle>,
+    queue: VecDeque<Job>,
+    next_job: u64,
+    running: Option<u64>,
+    done_through: u64,
+    /// BOs freed (or closed) while jobs of their client were pending, with
+    /// the last such job: freed once it is done.
+    zombies: Vec<(u64, Bo)>,
+}
+
+struct Shared {
+    v3d: Mutex<V3d>,
+    mmu: Arc<Mutex<Mmu>>,
+    stats: Arc<Mutex<Stats>>,
+    state: Mutex<State>,
+    work: Condvar,
+    socket: Socket,
+}
+
+impl Shared {
+    /// Frees the zombies whose jobs are done. Lock order: state, then mmu.
+    fn reap(&self, state: &mut State) {
+        let done = state.done_through;
+        let mut mmu = None;
+        let mut i = 0;
+        while i < state.zombies.len() {
+            if state.zombies[i].0 <= done {
+                let (_, bo) = state.zombies.swap_remove(i);
+                mmu.get_or_insert_with(|| lock(&self.mmu)).free_bo(bo);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Frees a BO now, or after the client's last pending job.
+    fn release(&self, state: &mut State, last_pending: Option<u64>, bo: Bo) {
+        match last_pending {
+            Some(job) => state.zombies.push((job, bo)),
+            None => lock(&self.mmu).free_bo(bo),
+        }
+    }
+
+    /// The job thread: runs the queue in order, one job at a time.
+    fn run_jobs(self: Arc<Shared>) -> ! {
+        let mut scheme = V3dScheme { shared: self.clone() };
+        let mut scheme_state = SchemeState::new();
+        loop {
+            let job = {
+                let mut state = lock(&self.state);
+                loop {
+                    if let Some(job) = state.queue.pop_front() {
+                        state.running = Some(job.id);
+                        break job;
+                    }
+                    state = self.work.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            };
+            let answer = {
+                let mut v3d = lock(&self.v3d);
+                match job.kind {
+                    JobKind::Csd(cfg) => v3d.csd(cfg).map(|us| format!("done {us}")),
+                    JobKind::Cl(a) => v3d
+                        .bin_render((a[0], a[1]), (a[2], a[3]), a[4], a[5], a[6])
+                        .map(|(bin, render)| format!("done {} bin {bin} render {render}", bin + render)),
+                }
+            };
+            let answer = answer.unwrap_or_else(|err| format!("error {err}"));
+            let held = {
+                let mut state = lock(&self.state);
+                state.running = None;
+                state.done_through = job.id;
+                let held = match state.handles.get_mut(job.client) {
+                    Ok(Handle::Client(client)) => {
+                        client.pending.remove(&job.id);
+                        if client.waiting == Some(job.id) {
+                            client.waiting = None;
+                            client.reply = format!("{answer}\n").into_bytes();
+                            client.held.take()
+                        } else {
+                            client.results.insert(job.id, answer);
+                            while client.results.len() > RESULTS_MAX {
+                                client.results.pop_first();
+                            }
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                self.reap(&mut state);
+                held
+            };
+            if let Some(HeldRead { caller, op }) = held {
+                let response = op.handle_sync(caller, &mut scheme, &mut scheme_state);
+                if let Err(err) = self.socket.write_response(response, SignalBehavior::Restart) {
+                    say(&format!("answer to a held read failed: {err}"));
+                }
+            }
+        }
+    }
 }
 
 struct V3dScheme {
-    v3d: V3d,
-    handles: HandleMap<Handle>,
+    shared: Arc<Shared>,
 }
 
 fn number(s: &str) -> std::result::Result<u64, String> {
@@ -873,26 +1080,49 @@ fn number(s: &str) -> std::result::Result<u64, String> {
     r.map_err(|_| format!("not a number: {s}"))
 }
 
+/// The answer of a write: a line now, or none yet (the read waits for a job).
+enum Answer {
+    Now(String),
+    Later,
+}
+
 impl V3dScheme {
-    fn command(&mut self, id: usize, line: &str) -> std::result::Result<String, String> {
-        let Ok(Handle::Client { bos, next_id, .. }) = self.handles.get_mut(id) else {
+    fn command(&mut self, state: &mut State, id: usize, line: &str) -> std::result::Result<Answer, String> {
+        let shared = self.shared.clone();
+        let State { handles, queue, next_job, running, done_through, zombies } = state;
+        let Ok(Handle::Client(client)) = handles.get_mut(id) else {
             return Err("not a client handle".into());
         };
         let words: Vec<&str> = line.split_whitespace().collect();
         let arg = |i: usize| -> std::result::Result<u64, String> {
             number(words.get(i).ok_or_else(|| format!("{}: missing argument {i}", words[0]))?)
         };
+        let args7 = |from: usize| -> std::result::Result<[u32; 7], String> {
+            let mut a = [0u32; 7];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = arg(from + i)? as u32;
+            }
+            Ok(a)
+        };
+        let mut submit = |client: &mut Client, kind: JobKind| -> u64 {
+            *next_job += 1;
+            let job = *next_job;
+            client.pending.insert(job);
+            queue.push_back(Job { id: job, client: id, kind });
+            shared.work.notify_one();
+            job
+        };
         match words.first().copied() {
             Some("bo") => {
-                let bo = self.v3d.new_bo(arg(1)? as usize)?;
+                let bo = lock(&shared.mmu).new_bo(arg(1)? as usize)?;
                 let va = bo.va;
-                let bo_id = *next_id;
-                *next_id += 1;
-                bos.insert(bo_id, bo);
-                Ok(format!("{bo_id} {va:#x}"))
+                let bo_id = client.next_id;
+                client.next_id += 1;
+                client.bos.insert(bo_id, bo);
+                Ok(Answer::Now(format!("{bo_id} {va:#x}")))
             }
             Some("put") => {
-                let bo = bos.get_mut(&(arg(1)? as u32)).ok_or("no such BO")?;
+                let bo = client.bos.get_mut(&(arg(1)? as u32)).ok_or("no such BO")?;
                 let first = arg(2)? as usize;
                 let values: Vec<u32> =
                     words[3..].iter().map(|w| number(w).map(|v| v as u32)).collect::<std::result::Result<_, _>>()?;
@@ -900,50 +1130,74 @@ impl V3dScheme {
                     return Err("past the end of the BO".into());
                 }
                 bo.mem[first..first + values.len()].copy_from_slice(&values);
-                Ok("ok".into())
+                Ok(Answer::Now("ok".into()))
             }
             Some("get") => {
-                let bo = bos.get(&(arg(1)? as u32)).ok_or("no such BO")?;
+                let bo = client.bos.get(&(arg(1)? as u32)).ok_or("no such BO")?;
                 let (first, count) = (arg(2)? as usize, arg(3)? as usize);
                 if first + count > bo.mem.len() {
                     return Err("past the end of the BO".into());
                 }
-                Ok(bo.mem[first..first + count].iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>().join(" "))
+                Ok(Answer::Now(bo.mem[first..first + count].iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>().join(" ")))
             }
             Some("fill") => {
-                let bo = bos.get_mut(&(arg(1)? as u32)).ok_or("no such BO")?;
+                let bo = client.bos.get_mut(&(arg(1)? as u32)).ok_or("no such BO")?;
                 let (first, count, value) = (arg(2)? as usize, arg(3)? as usize, arg(4)? as u32);
                 if first + count > bo.mem.len() {
                     return Err("past the end of the BO".into());
                 }
                 bo.mem[first..first + count].fill(value);
-                Ok("ok".into())
-            }
-            Some("cl") => {
-                let mut a = [0u32; 7];
-                for (i, v) in a.iter_mut().enumerate() {
-                    *v = arg(i + 1)? as u32;
-                }
-                let (bin, render) = self.v3d.bin_render((a[0], a[1]), (a[2], a[3]), a[4], a[5], a[6])?;
-                Ok(format!("done {} bin {bin} render {render}", bin + render))
+                Ok(Answer::Now("ok".into()))
             }
             Some("free") => {
-                let bo = bos.remove(&(arg(1)? as u32)).ok_or("no such BO")?;
-                self.v3d.free_bo(bo);
-                Ok("ok".into())
-            }
-            Some("csd") => {
-                let mut cfg = [0u32; 7];
-                for (i, c) in cfg.iter_mut().enumerate() {
-                    *c = arg(i + 1)? as u32;
+                let bo = client.bos.remove(&(arg(1)? as u32)).ok_or("no such BO")?;
+                let last = client.pending.last().copied();
+                match last {
+                    Some(job) => zombies.push((job, bo)),
+                    None => lock(&shared.mmu).free_bo(bo),
                 }
-                let us = self.v3d.csd(cfg)?;
-                Ok(format!("done {us}"))
+                Ok(Answer::Now("ok".into()))
+            }
+            // The old blocking forms: submit, then the read waits.
+            Some("csd") => {
+                let job = submit(client, JobKind::Csd(args7(1)?));
+                client.waiting = Some(job);
+                Ok(Answer::Later)
+            }
+            Some("cl") => {
+                let job = submit(client, JobKind::Cl(args7(1)?));
+                client.waiting = Some(job);
+                Ok(Answer::Later)
+            }
+            Some("submit") => {
+                let kind = match words.get(1).copied() {
+                    Some("csd") => JobKind::Csd(args7(2)?),
+                    Some("cl") => JobKind::Cl(args7(2)?),
+                    _ => return Err("submit: csd or cl".into()),
+                };
+                Ok(Answer::Now(format!("job {}", submit(client, kind))))
+            }
+            Some(cmd @ ("wait" | "poll")) => {
+                let job = arg(1)?;
+                if let Some(answer) = client.results.remove(&job) {
+                    Ok(Answer::Now(answer))
+                } else if !client.pending.contains(&job) {
+                    Err(format!("no job {job} of this client (done ones answer once)"))
+                } else if cmd == "poll" {
+                    Ok(Answer::Now(if *running == Some(job) { "running".into() } else { "queued".into() }))
+                } else {
+                    client.waiting = Some(job);
+                    Ok(Answer::Later)
+                }
             }
             Some("stats") => {
-                let s = &self.v3d.stats;
-                Ok(format!(
-                    "bos {} frees {} jobs {} cl_jobs {} failed {} mmu_faults {} resets {} job_us_max {} outomem {} overflow_chunks {} va_next {:#x} va_free_ranges {} irq {} irqs {} irq_wakeups {} timer_wakeups {} maps {} unmaps {}",
+                let (va_next, va_free_ranges) = {
+                    let mmu = lock(&shared.mmu);
+                    (mmu.next_va, mmu.free_va.len())
+                };
+                let s = lock(&shared.stats);
+                Ok(Answer::Now(format!(
+                    "bos {} frees {} jobs {} cl_jobs {} failed {} mmu_faults {} resets {} job_us_max {} outomem {} overflow_chunks {} va_next {:#x} va_free_ranges {} irq {} irqs {} irq_wakeups {} timer_wakeups {} maps {} unmaps {} live_bos {} submitted {} done_through {} queued {} running {} zombies {}",
                     s.bos,
                     s.frees,
                     s.jobs,
@@ -953,16 +1207,23 @@ impl V3dScheme {
                     s.resets,
                     s.job_us_max,
                     s.outomem,
-                    self.v3d.overflow.len(),
-                    self.v3d.next_va,
-                    self.v3d.free_va.len(),
-                    self.v3d.irq.as_ref().map(|irq| irq.path.as_str()).unwrap_or("off"),
+                    s.overflow_chunks,
+                    va_next,
+                    va_free_ranges,
+                    s.irq,
                     s.irqs,
                     s.irq_wakeups,
                     s.timer_wakeups,
                     s.maps,
-                    s.unmaps
-                ))
+                    s.unmaps,
+                    // Client BOs, held or zombie: the overflow chunks are v3dd's.
+                    s.bos - s.frees - s.overflow_chunks as u64,
+                    *next_job,
+                    *done_through,
+                    queue.len(),
+                    running.map_or("-".into(), |job| job.to_string()),
+                    zombies.len()
+                )))
             }
             _ => Err(format!("unknown command: {line}")),
         }
@@ -971,7 +1232,7 @@ impl V3dScheme {
 
 impl SchemeSync for V3dScheme {
     fn scheme_root(&mut self) -> Result<usize> {
-        Ok(self.handles.insert(Handle::Root))
+        Ok(lock(&self.shared.state).handles.insert(Handle::Root))
     }
 
     fn openat(
@@ -982,7 +1243,8 @@ impl SchemeSync for V3dScheme {
         _fcntl_flags: u32,
         ctx: &CallerCtx,
     ) -> Result<OpenResult> {
-        if !matches!(self.handles.get(dirfd)?, Handle::Root) {
+        let mut state = lock(&self.shared.state);
+        if !matches!(state.handles.get(dirfd)?, Handle::Root) {
             return Err(Error::new(EACCES));
         }
         // GPU jobs can read and write any memory mapped for them: root only
@@ -990,12 +1252,21 @@ impl SchemeSync for V3dScheme {
         if ctx.uid != 0 || !path.trim_matches('/').is_empty() {
             return Err(Error::new(EACCES));
         }
-        let handle = Handle::Client { reply: Vec::new(), bos: BTreeMap::new(), next_id: 1 };
-        Ok(OpenResult::ThisScheme { number: self.handles.insert(handle), flags: NewFdFlags::empty() })
+        let handle = Handle::Client(Client {
+            reply: Vec::new(),
+            bos: BTreeMap::new(),
+            next_id: 1,
+            pending: BTreeSet::new(),
+            results: BTreeMap::new(),
+            waiting: None,
+            held: None,
+        });
+        Ok(OpenResult::ThisScheme { number: state.handles.insert(handle), flags: NewFdFlags::empty() })
     }
 
     fn read(&mut self, id: usize, buf: &mut [u8], _offset: u64, _fcntl_flags: u32, _ctx: &CallerCtx) -> Result<usize> {
-        let Handle::Client { reply, .. } = self.handles.get_mut(id)? else {
+        let mut state = lock(&self.shared.state);
+        let Handle::Client(Client { reply, .. }) = state.handles.get_mut(id)? else {
             return Err(Error::new(EBADF));
         };
         let len = buf.len().min(reply.len());
@@ -1005,16 +1276,22 @@ impl SchemeSync for V3dScheme {
     }
 
     fn write(&mut self, id: usize, buf: &[u8], _offset: u64, _fcntl_flags: u32, _ctx: &CallerCtx) -> Result<usize> {
-        if !matches!(self.handles.get(id)?, Handle::Client { .. }) {
-            return Err(Error::new(EBADF));
+        let shared = self.shared.clone();
+        let mut state = lock(&shared.state);
+        match state.handles.get(id)? {
+            // One command at a time: the answer to the last is still owed.
+            Handle::Client(client) if client.waiting.is_some() => return Err(Error::new(EBUSY)),
+            Handle::Client(_) => {}
+            Handle::Root => return Err(Error::new(EBADF)),
         }
         let line = std::str::from_utf8(buf).map_err(|_| Error::new(EINVAL))?.trim();
-        let answer = match self.command(id, line) {
-            Ok(answer) => answer,
-            Err(err) => format!("error {err}"),
+        let reply = match self.command(&mut state, id, line) {
+            Ok(Answer::Now(answer)) => Some(answer),
+            Ok(Answer::Later) => None,
+            Err(err) => Some(format!("error {err}")),
         };
-        if let Ok(Handle::Client { reply, .. }) = self.handles.get_mut(id) {
-            *reply = format!("{answer}\n").into_bytes();
+        if let Ok(Handle::Client(client)) = state.handles.get_mut(id) {
+            client.reply = reply.map(|answer| format!("{answer}\n").into_bytes()).unwrap_or_default();
         }
         Ok(buf.len())
     }
@@ -1022,7 +1299,8 @@ impl SchemeSync for V3dScheme {
     /// fmap of a BO (see the top of the file). Returns where the BO lies in
     /// v3dd: the kernel maps the same pages into the client.
     fn mmap_prep(&mut self, id: usize, offset: u64, size: usize, flags: MapFlags, _ctx: &CallerCtx) -> Result<usize> {
-        let Handle::Client { bos, .. } = self.handles.get(id)? else {
+        let state = lock(&self.shared.state);
+        let Handle::Client(Client { bos, .. }) = state.handles.get(id)? else {
             return Err(Error::new(EBADF));
         };
         // A private (copy-on-write) mapping would also make v3dd's own
@@ -1035,33 +1313,122 @@ impl SchemeSync for V3dScheme {
         if at % PAGE != 0 || size == 0 || at.checked_add(size).is_none_or(|end| end > bo.pages * PAGE) {
             return Err(Error::new(EINVAL));
         }
-        self.v3d.stats.maps += 1;
+        lock(&self.shared.stats).maps += 1;
         Ok(bo.mem.as_ptr() as usize + at)
     }
 
     /// The client unmapped (part of) a BO. The kernel keeps the pages
     /// until the last mapping goes, so there is nothing to free here.
     fn munmap(&mut self, _id: usize, _offset: u64, _size: usize, _flags: MunmapFlags, _ctx: &CallerCtx) -> Result<()> {
-        self.v3d.stats.unmaps += 1;
+        lock(&self.shared.stats).unmaps += 1;
         Ok(())
     }
 
     fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
-        self.handles.get(id).map_err(|_| Error::new(EBADF))?;
+        lock(&self.shared.state).handles.get(id).map_err(|_| Error::new(EBADF))?;
         FpathWriter::with(buf, "v3d", |_| Ok(()))
     }
 
+    /// The client's queued jobs go; a running one ends first, and its BOs
+    /// stay until then.
     fn on_close(&mut self, id: usize) {
-        if let Some(Handle::Client { bos, .. }) = self.handles.remove(id) {
-            for bo in bos.into_values() {
-                self.v3d.free_bo(bo);
-            }
+        let shared = self.shared.clone();
+        let mut state = lock(&shared.state);
+        let Some(Handle::Client(client)) = state.handles.remove(id) else {
+            return;
+        };
+        state.queue.retain(|job| job.client != id);
+        let last = state.running.filter(|job| client.pending.contains(job));
+        for bo in client.bos.into_values() {
+            shared.release(&mut state, last, bo);
         }
+        // A held read goes with the file: the kernel cancelled it.
+        drop(client.held);
     }
 }
 
 fn main() {
     daemon::SchemeDaemon::new(daemon);
+}
+
+/// Hands a read on a client that waits for a job to the job thread.
+/// Returns the Op back if the read can be answered now.
+fn hold_read(shared: &Shared, caller: CallerCtx, op: Op) -> Option<(CallerCtx, Op)> {
+    let Op::Read(read) = &op else { return Some((caller, op)) };
+    let fd = read.fd;
+    let mut state = lock(&shared.state);
+    match state.handles.get_mut(fd) {
+        Ok(Handle::Client(client)) if client.waiting.is_some() && client.held.is_none() => {
+            client.held = Some(HeldRead { caller, op });
+            None
+        }
+        _ => Some((caller, op)),
+    }
+}
+
+/// The request loop. A read that waits for a job is held, and the job
+/// thread answers it; every other request is answered here at once.
+fn serve(shared: Arc<Shared>) -> ! {
+    let mut scheme = V3dScheme { shared: shared.clone() };
+    let mut scheme_state = SchemeState::new();
+    loop {
+        let request = match shared.socket.next_request(SignalBehavior::Restart) {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                say("scheme socket closed");
+                process::exit(0);
+            }
+            Err(err) => fail(&format!("reading requests: {err}")),
+        };
+        let response = match request.kind() {
+            RequestKind::Call(call) => {
+                let caller = call.caller();
+                match call.op() {
+                    Ok(op) => match hold_read(&shared, caller, op) {
+                        Some((caller, op)) => op.handle_sync(caller, &mut scheme, &mut scheme_state),
+                        None => continue,
+                    },
+                    Err(call) => Response::new(Err(Error::new(ENOSYS)), call),
+                }
+            }
+            RequestKind::Cancellation(cancel) => {
+                // A held read whose caller gave up (a signal): answer EINTR.
+                let held = {
+                    let mut state = lock(&shared.state);
+                    let mut found = None;
+                    for (_, handle) in state.handles.iter_mut() {
+                        if let Handle::Client(client) = handle
+                            && client.held.as_ref().is_some_and(|held| held.op.req_id() == cancel.id)
+                        {
+                            found = client.held.take();
+                            break;
+                        }
+                    }
+                    found
+                };
+                match held {
+                    Some(held) => Response::new(Err(Error::new(EINTR)), held.op),
+                    None => continue,
+                }
+            }
+            RequestKind::OnClose { id } => {
+                scheme.on_close(id);
+                continue;
+            }
+            RequestKind::SendFd(req) => {
+                let result = scheme.on_sendfd(&req);
+                Response::new(result, req)
+            }
+            RequestKind::RecvFd(req) => {
+                let result = scheme.on_recvfd(&req);
+                Response::open_dup_like(result, req)
+            }
+            _ => continue,
+        };
+        if let Err(err) = shared.socket.write_response(response, SignalBehavior::Restart) {
+            fail(&format!("writing a response: {err}"));
+        }
+    }
 }
 
 fn daemon(daemon: daemon::SchemeDaemon) -> ! {
@@ -1105,11 +1472,29 @@ fn daemon(daemon: daemon::SchemeDaemon) -> ! {
         }
     };
     let v3d = V3d::new(hub, core, pm, asb, irq);
-    let mut scheme = V3dScheme { v3d, handles: HandleMap::new() };
-
     let socket = Socket::create().expect("v3dd: failed to create the v3d scheme");
-    let handler = Blocking::new(Box::new(socket), 16);
-    let _ = daemon.ready_sync_scheme(handler.socket(), &mut scheme);
+    let shared = Arc::new(Shared {
+        mmu: v3d.mmu.clone(),
+        stats: v3d.stats.clone(),
+        v3d: Mutex::new(v3d),
+        state: Mutex::new(State {
+            handles: HandleMap::new(),
+            queue: VecDeque::new(),
+            next_job: 0,
+            running: None,
+            done_through: 0,
+            zombies: Vec::new(),
+        }),
+        work: Condvar::new(),
+        socket,
+    });
+    let mut scheme = V3dScheme { shared: shared.clone() };
+    let _ = daemon.ready_sync_scheme(&shared.socket, &mut scheme);
+    let jobs = shared.clone();
+    thread::Builder::new()
+        .name("v3d-jobs".into())
+        .spawn(move || jobs.run_jobs())
+        .unwrap_or_else(|err| fail(&format!("no job thread: {err}")));
     say("ready: /scheme/v3d");
-    handler.process_requests_blocking(scheme).expect("v3dd: failed to process requests");
+    serve(shared)
 }
