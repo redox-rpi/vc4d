@@ -34,7 +34,9 @@
 // order on the job thread, one at a time; the request loop goes on
 // meanwhile, so other clients' commands and BOs do not wait for a job.
 // A read that waits for a job is held and answered by the job thread when
-// the job is done. While a client waits, its next write fails with EBUSY.
+// the job is done. If that read is cancelled (a signal), it answers EINTR
+// and the next read waits again. If the client writes a new command
+// instead, the wait ends and the job's answer stays for wait or poll.
 
 // A client maps a BO into its own memory with fmap on the same handle
 // (step 3e, redox-rpi#666): offset (ID << 32) + BYTE, BYTE a multiple of
@@ -94,7 +96,7 @@ use event::{EventQueue, user_data};
 use redox_scheme::scheme::{IntoTag as _, Op, SchemeState, SchemeSync};
 use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
 use scheme_utils::{FpathWriter, HandleMap};
-use syscall::error::{EACCES, EBADF, EBUSY, EINTR, EINVAL, ENOENT, ENOSYS, Error, Result};
+use syscall::error::{EACCES, EBADF, EINTR, EINVAL, ENOENT, ENOSYS, Error, Result};
 use syscall::flag::{MapFlags, MunmapFlags};
 use syscall::schemev2::NewFdFlags;
 
@@ -1278,10 +1280,15 @@ impl SchemeSync for V3dScheme {
     fn write(&mut self, id: usize, buf: &[u8], _offset: u64, _fcntl_flags: u32, _ctx: &CallerCtx) -> Result<usize> {
         let shared = self.shared.clone();
         let mut state = lock(&shared.state);
-        match state.handles.get(id)? {
-            // One command at a time: the answer to the last is still owed.
-            Handle::Client(client) if client.waiting.is_some() => return Err(Error::new(EBUSY)),
-            Handle::Client(_) => {}
+        match state.handles.get_mut(id)? {
+            // A new command while a wait is open (its read was cancelled,
+            // or never came): the wait ends, and the job's answer stays for
+            // wait or poll.
+            Handle::Client(client) => {
+                if let Some(job) = client.waiting.take() {
+                    say(&format!("client {id}: new command while waiting for job {job}: the answer stays for wait {job}"));
+                }
+            }
             Handle::Root => return Err(Error::new(EBADF)),
         }
         let line = std::str::from_utf8(buf).map_err(|_| Error::new(EINVAL))?.trim();
@@ -1362,6 +1369,10 @@ fn hold_read(shared: &Shared, caller: CallerCtx, op: Op) -> Option<(CallerCtx, O
             client.held = Some(HeldRead { caller, op });
             None
         }
+        Ok(Handle::Client(client)) if client.waiting.is_some() => {
+            say(&format!("client {fd}: a second read while one waits: answered now, empty"));
+            Some((caller, op))
+        }
         _ => Some((caller, op)),
     }
 }
@@ -1393,13 +1404,17 @@ fn serve(shared: Arc<Shared>) -> ! {
             }
             RequestKind::Cancellation(cancel) => {
                 // A held read whose caller gave up (a signal): answer EINTR.
+                // The wait stays open: a read again is held again, a new
+                // command ends it.
                 let held = {
                     let mut state = lock(&shared.state);
                     let mut found = None;
-                    for (_, handle) in state.handles.iter_mut() {
+                    for (&id, handle) in state.handles.iter_mut() {
                         if let Handle::Client(client) = handle
                             && client.held.as_ref().is_some_and(|held| held.op.req_id() == cancel.id)
                         {
+                            let job = client.waiting.unwrap_or(0);
+                            say(&format!("client {id}: read cancelled while waiting for job {job}"));
                             found = client.held.take();
                             break;
                         }

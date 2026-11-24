@@ -55,7 +55,16 @@ impl Client {
         let mut reply = Vec::new();
         let mut buf = [0u8; 8192];
         while !reply.ends_with(b"\n") {
-            let n = self.file.read(&mut buf).map_err(|err| format!("{what}: read: {err}"))?;
+            // A signal ends v3dd's held read with EINTR; v3dd keeps the
+            // wait open, so reading again waits for the same answer.
+            let n = match self.file.read(&mut buf) {
+                Ok(n) => n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    eprintln!("v3dprobe: {what}: read interrupted, reading again");
+                    continue;
+                }
+                Err(err) => return Err(format!("{what}: read: {err}")),
+            };
             if n == 0 {
                 break;
             }
