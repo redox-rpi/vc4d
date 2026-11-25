@@ -20,6 +20,9 @@ pub const GET_UNIQUE: u64 = 0x01;
 pub const SET_VERSION: u64 = 0x07;
 pub const GET_CAP: u64 = 0x0C;
 pub const GEM_CLOSE: u64 = 0x09;
+/// PRIME_FD_TO_HANDLE: with no payload, the handle of the last fd sent
+/// (v3dd's on_sendfd).
+pub const PRIME_FD_TO_HANDLE: u64 = 0x2E;
 pub const SUBMIT_CL: u64 = 0x40;
 pub const WAIT_BO: u64 = 0x41;
 pub const CREATE_BO: u64 = 0x42;

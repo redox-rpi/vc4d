@@ -1175,6 +1175,11 @@ struct Client {
     /// once).
     syncobjs: BTreeMap<u32, Option<u64>>,
     next_syncobj: u32,
+    /// The BO of the last imported PRIME fd, until PRIME_FD_TO_HANDLE
+    /// takes it: the kernel answers an fd-passing call with the number of
+    /// fds, not with the scheme's answer, so relibc asks for the handle
+    /// with a second call.
+    prime_import: Option<u32>,
 }
 
 /// A held binary-interface call and how to answer it.
@@ -1670,6 +1675,11 @@ impl V3dScheme {
                 uapi::write(payload, &arg);
                 Ok(0)
             }
+            // After an fd-passing call (on_sendfd): the handle of the BO
+            // it imported.
+            uapi::PRIME_FD_TO_HANDLE if payload.is_empty() => {
+                client.prime_import.take().map(|handle| handle as usize).ok_or(Error::new(ENOENT))
+            }
             uapi::GET_CAP => {
                 let (mut arg, _) = uapi::read::<uapi::GetCap>(payload).ok_or_else(einval)?;
                 arg.value = match arg.capability {
@@ -1871,6 +1881,7 @@ impl SchemeSync for V3dScheme {
             held_calls: Vec::new(),
             syncobjs: BTreeMap::new(),
             next_syncobj: 0,
+            prime_import: None,
         });
         Ok(OpenResult::ThisScheme { number: state.handles.insert(handle), flags: NewFdFlags::empty() })
     }
@@ -1963,19 +1974,24 @@ impl SchemeSync for V3dScheme {
         if req.num_fds() != 1 {
             return Err(Error::new(EINVAL));
         }
+        let id = req.id();
         let mut fds = [usize::MAX];
-        req.obtain_fd(&self.shared.socket, syscall::flag::FobtainFdFlags::empty(), &mut fds)?;
+        req.obtain_fd(&self.shared.socket, syscall::flag::FobtainFdFlags::empty(), &mut fds).map_err(|err| {
+            say(&format!("client {id}: PRIME fd: obtaining it failed: {err}"));
+            err
+        })?;
         let file = unsafe { <File as std::os::unix::io::FromRawFd>::from_raw_fd(fds[0] as i32) };
         let shared = self.shared.clone();
         let mut state = lock(&shared.state);
-        let id = req.id();
-        let Handle::Client(client) = state.handles.get_mut(id).map_err(|_| Error::new(EBADF))? else {
+        let Ok(Handle::Client(client)) = state.handles.get_mut(id) else {
+            say(&format!("client {id}: PRIME fd sent to a handle that is not a client"));
             return Err(Error::new(EBADF));
         };
         let (handle, _) = client_import(&shared, client, file).map_err(|err| {
             say(&format!("client {id}: PRIME import: {err}"));
             Error::new(EINVAL)
         })?;
+        client.prime_import = Some(handle);
         Ok(handle as usize)
     }
 
