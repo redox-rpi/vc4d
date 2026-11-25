@@ -640,6 +640,14 @@ impl Vc4Buffer {
         let len = width * height;
         let layout = Self::layout(len);
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        // Back every page now: the buffer can be shared (a PRIME fd for the
+        // V3D, a client's mapping), and pages nobody touched yet could end
+        // up as different frames in different mappings (G4, pi-tests Test 642).
+        if !ptr.is_null() {
+            for page in (0..layout.size()).step_by(PAGE_SIZE) {
+                unsafe { ptr.add(page).write_volatile(0) };
+            }
+        }
         let ptr = ptr::slice_from_raw_parts_mut(ptr.cast(), len);
         let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
         Vc4Buffer { width, height, ptr, dma: None }

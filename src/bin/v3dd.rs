@@ -89,6 +89,24 @@
 // not signalled), TFU jobs, a render job without a bin job, perfmon. Both
 // interfaces work on the same handle.
 //
+// Display buffers (G4, redox-rpi#670): a client can hand v3dd a PRIME fd
+// of a vc4d dumb buffer (relibc sends it when PRIME_FD_TO_HANDLE names
+// another driver's fd); v3dd checks that it is one (check_prime_fd), maps
+// its pages into the client's address space as a BO, and the V3D draws
+// straight into memory the display shows. Three design choices:
+// - Memory: vc4d's screen-sized buffers stay normal, cached memory,
+//   because the CPU draws into them too (fbcond, Orbital) and reading
+//   uncached memory is slow. v3dd cleans and invalidates the CPU caches
+//   over a job's imported buffers before and after the job.
+// - Sync: no sync files (Redox has none). Jobs run in order, Mesa waits on
+//   the job's syncobj in glFinish, and a client finishes its frame before
+//   it shows the buffer. vc4d never waits for the V3D.
+// - Lifetime: v3dd keeps the fd and its mapping until the BO is freed, so
+//   the buffer stays even if the client destroys it on the display side
+//   or vc4d restarts (the kernel counts references to the pages); the V3D
+//   then draws into memory nobody shows, and the client opens the display
+//   again. A new import checks against the running vc4d.
+//
 // The binner's overflow memory belongs to v3dd: 512 KiB at the start of
 // every bin job, and another 512 KiB chunk each time the binner reports
 // it is out of memory (OUTOMEM), as Linux's v3d_overflow_mem_work().
@@ -420,8 +438,116 @@ impl Irq {
 /// fmap offsets: the BO ID above this bit, the byte in the BO below.
 const MAP_ID_SHIFT: u32 = 32;
 
+/// A BO's memory: v3dd's own contiguous pages, or another driver's buffer
+/// imported through its PRIME fd (G4, redox-rpi#670).
+enum Mem {
+    Own(Dma<[u32]>),
+    Imported(Imported),
+}
+
+/// Another driver's buffer (vc4d's scanout buffer), imported through the
+/// PRIME fd a client sent (sendfd): v3dd keeps the fd and its own mapping
+/// of it, so the buffer stays while the BO exists. The physical pages come
+/// from the kernel for that mapping, never from a client.
+struct Imported {
+    /// Held open: the PRIME fd keeps the other driver's buffer alive.
+    _file: File,
+    addr: usize,
+    bytes: usize,
+}
+
+/// Cleans and invalidates the CPU's data cache over a range (to the point
+/// of coherency, for every core): an imported buffer can be normal, cached
+/// memory (vc4d's screen-sized buffers are), which the V3D reads and writes
+/// past the cache. Before a job, so the V3D sees what the CPU wrote; after
+/// it, so no CPU reads stale lines. User space may do this here: the
+/// bootloader sets SCTLR_EL1.UCI.
+fn clean_invalidate(addr: usize, bytes: usize) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let ctr: u64;
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr);
+        let line = 4usize << ((ctr >> 16) & 0xf);
+        let mut at = addr & !(line - 1);
+        while at < addr + bytes {
+            core::arch::asm!("dc civac, {}", in(reg) at);
+            at += line;
+        }
+        core::arch::asm!("dsb sy");
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (addr, bytes);
+}
+
+impl Drop for Imported {
+    fn drop(&mut self) {
+        // The MMU no longer maps the pages (free_bo); the file closes after.
+        let _ = unsafe { syscall::funmap(self.addr, self.bytes) };
+    }
+}
+
+impl std::ops::Deref for Mem {
+    type Target = [u32];
+    fn deref(&self) -> &[u32] {
+        match self {
+            Mem::Own(dma) => dma,
+            Mem::Imported(imp) => unsafe { std::slice::from_raw_parts(imp.addr as *const u32, imp.bytes / 4) },
+        }
+    }
+}
+
+impl std::ops::DerefMut for Mem {
+    fn deref_mut(&mut self) -> &mut [u32] {
+        match self {
+            Mem::Own(dma) => dma,
+            Mem::Imported(imp) => unsafe { std::slice::from_raw_parts_mut(imp.addr as *mut u32, imp.bytes / 4) },
+        }
+    }
+}
+
+/// The largest buffer v3dd imports: a 3840x2160 XRGB8888 scanout buffer.
+const IMPORT_MAX: usize = 64 << 20;
+
+/// The display schemes whose buffers v3dd imports (redox-rpi#670).
+const IMPORT_SCHEMES: &[&str] = &["/scheme/display.vc4"];
+
+/// The VT v3dd opens on a display scheme to check a PRIME fd. Opening a VT
+/// only creates its state in driver-graphics; v3dd never sets a mode on it,
+/// and no console has a VT number this high.
+const CHECK_VT: usize = 0xFFFF;
+
+/// Checks that a PRIME fd really is a buffer of one of IMPORT_SCHEMES
+/// before v3dd maps it into a client's V3D address space. The fd's own
+/// answers (fpath, fstat) come from whichever scheme owns it and prove
+/// nothing. Instead, v3dd opens the display scheme itself, in its own
+/// namespace, and asks it to import the fd (PRIME_FD_TO_HANDLE with both
+/// fds in one call). The kernel lets one call name several fds only when
+/// they belong to the same scheme (EXDEV otherwise), and driver-graphics
+/// answers EINVAL unless the fd is one of its buffers (PRIME_HANDLE_TO_FD
+/// exports). The handle it gives back goes when v3dd closes its own fd.
+/// Which scheme owns the fd, or why it is refused.
+fn check_prime_fd(file: &File) -> std::result::Result<&'static str, String> {
+    let mut refused = Vec::new();
+    for &scheme in IMPORT_SCHEMES {
+        let display = match OpenOptions::new().read(true).write(true).open(format!("{scheme}/{CHECK_VT}")) {
+            Ok(display) => display,
+            Err(err) => {
+                refused.push(format!("{scheme}: open: {err}"));
+                continue;
+            }
+        };
+        let fds = [display.as_raw_fd() as usize, file.as_raw_fd() as usize];
+        match syscall::call_wo(&fds[..], &[], syscall::CallFlags::empty(), &[uapi::PRIME_FD_TO_HANDLE]) {
+            Ok(_) => return Ok(scheme),
+            Err(err) if err.errno == syscall::error::EXDEV => refused.push(format!("the fd is not {scheme}'s")),
+            Err(err) => refused.push(format!("the fd is {scheme}'s but no buffer ({err})")),
+        }
+    }
+    Err(refused.join("; "))
+}
+
 struct Bo {
-    mem: Dma<[u32]>,
+    mem: Mem,
     va: u32,
     pages: usize,
     /// The address space it is mapped in (OVERFLOW_SPACES: all of them).
@@ -544,6 +670,13 @@ impl Space {
         }
     }
 
+    /// Maps pages that need not be contiguous (an imported buffer).
+    fn map_pages(&mut self, va: u32, phys: &[usize]) {
+        for (page, &addr) in phys.iter().enumerate() {
+            self.pt[va as usize / PAGE + page] = V3D_PTE_WRITEABLE | V3D_PTE_VALID | ((addr / PAGE) as u32);
+        }
+    }
+
     fn unmap(&mut self, va: u32, pages: usize) {
         self.pt[va as usize / PAGE..va as usize / PAGE + pages].fill(0);
     }
@@ -613,7 +746,22 @@ impl Mmu {
         let va = table.alloc_va(pages).ok_or("V3D address space full")?;
         table.map(va, mem.physical(), pages);
         lock(&self.stats).bos += 1;
-        let bo = Bo { mem, va, pages, space };
+        let bo = Bo { mem: Mem::Own(mem), va, pages, space };
+        if !self.flush_if_loaded(space) {
+            self.free_bo(bo);
+            return Err("MMU flush did not finish".into());
+        }
+        Ok(bo)
+    }
+
+    /// A BO over an imported buffer's pages, in a client's space.
+    fn import_bo(&mut self, space: u32, imported: Imported, phys: &[usize]) -> std::result::Result<Bo, String> {
+        let pages = phys.len();
+        let table = self.spaces.get_mut(&space).ok_or_else(|| format!("no address space {space}"))?;
+        let va = table.alloc_va(pages).ok_or("V3D address space full")?;
+        table.map_pages(va, phys);
+        lock(&self.stats).bos += 1;
+        let bo = Bo { mem: Mem::Imported(imported), va, pages, space };
         if !self.flush_if_loaded(space) {
             self.free_bo(bo);
             return Err("MMU flush did not finish".into());
@@ -647,7 +795,7 @@ impl Mmu {
         if !csd::mmu_flush(&self.hub) {
             return Err("MMU flush did not finish".into());
         }
-        Ok(Bo { mem, va, pages, space: OVERFLOW_SPACES })
+        Ok(Bo { mem: Mem::Own(mem), va, pages, space: OVERFLOW_SPACES })
     }
 }
 
@@ -1064,6 +1212,10 @@ struct Job {
     /// The client's address space, loaded before the job runs.
     space: u32,
     kind: JobKind,
+    /// The client's imported buffers (address and size in v3dd's mapping),
+    /// whose caches are cleaned before and after the job. Zombies keep
+    /// the mappings until the job is done.
+    imported: Vec<(usize, usize)>,
 }
 
 enum JobKind {
@@ -1106,6 +1258,11 @@ struct Client {
     /// once).
     syncobjs: BTreeMap<u32, Option<u64>>,
     next_syncobj: u32,
+    /// The BO of the last imported PRIME fd, until PRIME_FD_TO_HANDLE
+    /// takes it: the kernel answers an fd-passing call with the number of
+    /// fds, not with the scheme's answer, so relibc asks for the handle
+    /// with a second call.
+    prime_import: Option<u32>,
 }
 
 /// A held binary-interface call and how to answer it.
@@ -1193,6 +1350,55 @@ fn client_bo(shared: &Shared, client: &mut Client, bytes: usize) -> std::result:
     Ok((bo_id, va))
 }
 
+/// Imports another driver's buffer from the PRIME fd a client sent
+/// (PRIME_FD_TO_HANDLE across drivers, see relibc), already checked to be
+/// a buffer of `scheme` (check_prime_fd): maps the fd into
+/// v3dd, looks up the physical pages of that mapping and maps them into the
+/// client's V3D address space. The new BO's handle.
+fn client_import(shared: &Shared, client: &mut Client, file: File, scheme: &str) -> std::result::Result<(u32, usize), String> {
+    use std::io::{Seek as _, SeekFrom};
+    let mut file = file;
+    let bytes = file.seek(SeekFrom::End(0)).map_err(|err| format!("size of the PRIME fd: {err}"))? as usize;
+    if bytes == 0 || bytes > IMPORT_MAX || bytes % PAGE != 0 {
+        return Err(format!("buffer of {bytes} bytes (1..={IMPORT_MAX}, whole pages)"));
+    }
+    let map = syscall::Map {
+        offset: 0,
+        size: bytes,
+        flags: MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::MAP_SHARED,
+        ..Default::default()
+    };
+    let addr = unsafe { syscall::fmap(file.as_raw_fd() as usize, &map) }.map_err(|err| format!("fmap: {err}"))?;
+    let imported = Imported { _file: file, addr, bytes };
+    let translate = common::VirtaddrTranslationHandle::new().map_err(|err| format!("translation handle: {err}"))?;
+    let phys = (0..bytes / PAGE)
+        .map(|page| translate.translate(addr + page * PAGE).map_err(|err| format!("page {page}: {err}")))
+        .collect::<std::result::Result<Vec<usize>, String>>()?;
+    let contiguous = phys.windows(2).all(|w| w[1] == w[0] + PAGE);
+    let bo = {
+        let mut mmu = lock(&shared.mmu);
+        let space = match client.space {
+            Some(space) => space,
+            None => {
+                let space = mmu.new_space()?;
+                client.space = Some(space);
+                space
+            }
+        };
+        mmu.import_bo(space, imported, &phys)?
+    };
+    let bo_id = client.next_id;
+    client.next_id += 1;
+    say(&format!(
+        "imported a buffer of {scheme} of {bytes} bytes as BO {bo_id} at V3D {:#x} ({} pages, {})",
+        bo.va,
+        phys.len(),
+        if contiguous { "contiguous" } else { "scattered" }
+    ));
+    client.bos.insert(bo_id, bo);
+    Ok((bo_id, bytes))
+}
+
 /// Frees a client's BO now, or after the client's last pending job.
 fn client_free(shared: &Shared, zombies: &mut Vec<(u64, Zombie)>, client: &mut Client, bo_id: u32) -> bool {
     let Some(bo) = client.bos.remove(&bo_id) else { return false };
@@ -1210,7 +1416,15 @@ fn submit_job(shared: &Shared, queue: &mut VecDeque<Job>, next_job: &mut u64, id
     let job = *next_job;
     client.pending.insert(job);
     let space = client.space.unwrap_or(DAEMON_SPACE);
-    queue.push_back(Job { id: job, client: id, space, kind });
+    let imported = client
+        .bos
+        .values()
+        .filter_map(|bo| match &bo.mem {
+            Mem::Imported(imp) => Some((imp.addr, imp.bytes)),
+            Mem::Own(_) => None,
+        })
+        .collect();
+    queue.push_back(Job { id: job, client: id, space, kind, imported });
     shared.work.notify_one();
     job
 }
@@ -1286,6 +1500,9 @@ impl Shared {
                     state = self.work.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
             };
+            for &(addr, bytes) in &job.imported {
+                clean_invalidate(addr, bytes);
+            }
             let answer = {
                 let mut v3d = lock(&self.v3d);
                 let loaded = lock(&self.mmu).load(job.space);
@@ -1300,6 +1517,9 @@ impl Shared {
                     }
                 }
             };
+            for &(addr, bytes) in &job.imported {
+                clean_invalidate(addr, bytes);
+            }
             let answer = answer.unwrap_or_else(|err| format!("error {err}"));
             let failed = answer.starts_with("error");
             let mut calls = Vec::new();
@@ -1553,11 +1773,19 @@ impl V3dScheme {
                 uapi::write(payload, &arg);
                 Ok(0)
             }
+            // After an fd-passing call (on_sendfd): the handle of the BO
+            // it imported.
+            uapi::PRIME_FD_TO_HANDLE if payload.is_empty() => {
+                client.prime_import.take().map(|handle| handle as usize).ok_or(Error::new(ENOENT))
+            }
             uapi::GET_CAP => {
                 let (mut arg, _) = uapi::read::<uapi::GetCap>(payload).ok_or_else(einval)?;
                 arg.value = match arg.capability {
                     uapi::CAP_SYNCOBJ => 1,
-                    // No dumb buffers, PRIME, timelines or the rest.
+                    // PRIME: import of other drivers' buffers (G4 step 2),
+                    // no export.
+                    uapi::CAP_PRIME => uapi::PRIME_CAP_IMPORT,
+                    // No dumb buffers, timelines or the rest.
                     1..=uapi::CAP_SYNCOBJ_TIMELINE => 0,
                     _ => return Err(einval()),
                 };
@@ -1751,6 +1979,7 @@ impl SchemeSync for V3dScheme {
             held_calls: Vec::new(),
             syncobjs: BTreeMap::new(),
             next_syncobj: 0,
+            prime_import: None,
         });
         Ok(OpenResult::ThisScheme { number: state.handles.insert(handle), flags: NewFdFlags::empty() })
     }
@@ -1833,6 +2062,41 @@ impl SchemeSync for V3dScheme {
     fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
         lock(&self.shared.state).handles.get(id).map_err(|_| Error::new(EBADF))?;
         FpathWriter::with(buf, "v3d", |_| Ok(()))
+    }
+
+    /// A client sent a PRIME fd of another driver (relibc's
+    /// PRIME_FD_TO_HANDLE when the fd is not v3dd's): if it is a display
+    /// buffer (check_prime_fd), import it as a BO and answer its handle;
+    /// anything else answers EINVAL. The fd is taken in any case, so a
+    /// refused import leaves nothing behind.
+    fn on_sendfd(&mut self, req: &redox_scheme::SendFdRequest) -> Result<usize> {
+        if req.num_fds() != 1 {
+            return Err(Error::new(EINVAL));
+        }
+        let id = req.id();
+        let mut fds = [usize::MAX];
+        req.obtain_fd(&self.shared.socket, syscall::flag::FobtainFdFlags::empty(), &mut fds).map_err(|err| {
+            say(&format!("client {id}: PRIME fd: obtaining it failed: {err}"));
+            err
+        })?;
+        let file = unsafe { <File as std::os::unix::io::FromRawFd>::from_raw_fd(fds[0] as i32) };
+        // Before the state lock: the check calls the display driver.
+        let scheme = check_prime_fd(&file).map_err(|err| {
+            say(&format!("client {id}: PRIME import refused: {err}"));
+            Error::new(EINVAL)
+        })?;
+        let shared = self.shared.clone();
+        let mut state = lock(&shared.state);
+        let Ok(Handle::Client(client)) = state.handles.get_mut(id) else {
+            say(&format!("client {id}: PRIME fd sent to a handle that is not a client"));
+            return Err(Error::new(EBADF));
+        };
+        let (handle, _) = client_import(&shared, client, file, scheme).map_err(|err| {
+            say(&format!("client {id}: PRIME import: {err}"));
+            Error::new(EINVAL)
+        })?;
+        client.prime_import = Some(handle);
+        Ok(handle as usize)
     }
 
     /// The client's queued jobs go; a running one ends first, and its BOs

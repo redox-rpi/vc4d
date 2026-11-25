@@ -93,9 +93,9 @@ dependencies = [
 [[package]]
 name = "common"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=eddcaa21fb2d11b4a6bd64478e0639153266dc04#eddcaa21fb2d11b4a6bd64478e0639153266dc04"
+source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd#59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd"
 dependencies = [
- "libredox",
+ "libredox 0.2.0",
  "log",
  "redox-log",
  "redox_syscall",
@@ -110,10 +110,10 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "daemon"
 version = "0.0.0"
-source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=eddcaa21fb2d11b4a6bd64478e0639153266dc04#eddcaa21fb2d11b4a6bd64478e0639153266dc04"
+source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd#59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd"
 dependencies = [
  "libc",
- "libredox",
+ "libredox 0.2.0",
  "redox-scheme",
  "redox_syscall",
 ]
@@ -121,7 +121,7 @@ dependencies = [
 [[package]]
 name = "driver-graphics"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=eddcaa21fb2d11b4a6bd64478e0639153266dc04#eddcaa21fb2d11b4a6bd64478e0639153266dc04"
+source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd#59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd"
 dependencies = [
  "common",
  "drm-fourcc",
@@ -129,7 +129,7 @@ dependencies = [
  "edid",
  "graphics-ipc",
  "inputd",
- "libredox",
+ "libredox 0.2.0",
  "log",
  "redox-ioctl",
  "redox-scheme",
@@ -235,7 +235,7 @@ dependencies = [
 [[package]]
 name = "graphics-ipc"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=eddcaa21fb2d11b4a6bd64478e0639153266dc04#eddcaa21fb2d11b4a6bd64478e0639153266dc04"
+source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd#59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd"
 dependencies = [
  "drm",
  "drm-sys",
@@ -268,14 +268,14 @@ dependencies = [
 [[package]]
 name = "inputd"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=eddcaa21fb2d11b4a6bd64478e0639153266dc04#eddcaa21fb2d11b4a6bd64478e0639153266dc04"
+source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd#59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd"
 dependencies = [
  "anyhow",
  "common",
  "daemon",
- "libredox",
+ "libredox 0.2.0",
  "log",
- "orbclient",
+ "orbclient 0.4.7",
  "redox-scheme",
  "redox_syscall",
  "scheme-utils",
@@ -309,6 +309,18 @@ name = "libredox"
 version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
+dependencies = [
+ "bitflags 2.13.1",
+ "libc",
+ "plain",
+ "redox_syscall",
+]
+
+[[package]]
+name = "libredox"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "482919959e69f0d67493e9220edb433ffc42ae98e59ceba4ed58697eb49b9bf8"
 dependencies = [
  "bitflags 2.13.1",
  "libc",
@@ -380,7 +392,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01f140a738f180203d7912dfd369936fff2fb0ad6f426c0aa007ed3e2b443e6b"
 dependencies = [
  "libc",
- "libredox",
+ "libredox 0.1.25",
+]
+
+[[package]]
+name = "orbclient"
+version = "0.4.7"
+source = "git+https://gitlab.redox-os.org/redox-os/orbclient.git#861606ee7aaca28e87dc2836f228e7b6b203dec4"
+dependencies = [
+ "libc",
+ "libredox 0.2.0",
  "sdl2",
 ]
 
@@ -417,7 +438,7 @@ dependencies = [
 [[package]]
 name = "redox-ioctl"
 version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/relibc.git#520d88127166309cf51945f367f2e4d86bcd9a31"
+source = "git+https://gitlab.redox-os.org/redox-os/relibc.git#82a552657ca3cb6d1852016e81c89aa25812d186"
 dependencies = [
  "drm-sys",
  "redox_syscall",
@@ -436,11 +457,10 @@ dependencies = [
 
 [[package]]
 name = "redox-scheme"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19c965a2cf25eaf2bab12a7aa83165b018b880293ce1005ab76eb9ab795cc89c"
+version = "0.13.0"
+source = "git+https://gitlab.redox-os.org/redox-os/redox-scheme.git#3514d5696fb8cbbe7d517d37d3074d7cd5cfdded"
 dependencies = [
- "libredox",
+ "libredox 0.2.0",
  "redox_syscall",
 ]
 
@@ -451,7 +471,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5018d583d6d2f5499352aea8d177e9067d1eb03ab17c78169d5ba7a30001b15"
 dependencies = [
  "bitflags 2.13.1",
- "libredox",
+ "libredox 0.1.25",
 ]
 
 [[package]]
@@ -485,9 +505,9 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "scheme-utils"
 version = "0.0.0"
-source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=eddcaa21fb2d11b4a6bd64478e0639153266dc04#eddcaa21fb2d11b4a6bd64478e0639153266dc04"
+source = "git+https://gitlab.redox-os.org/redox-os/base.git?rev=59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd#59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd"
 dependencies = [
- "libredox",
+ "libredox 0.2.0",
  "redox-scheme",
  "redox_syscall",
 ]
@@ -595,9 +615,11 @@ dependencies = [
  "driver-graphics",
  "drm-sys",
  "fdt",
- "orbclient",
+ "orbclient 0.4.6",
+ "redox-scheme",
  "redox_event",
  "redox_syscall",
+ "scheme-utils",
  "vc4-edid",
  "vc4-hvs",
  "vc4-mode",

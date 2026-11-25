@@ -20,6 +20,9 @@ pub const GET_UNIQUE: u64 = 0x01;
 pub const SET_VERSION: u64 = 0x07;
 pub const GET_CAP: u64 = 0x0C;
 pub const GEM_CLOSE: u64 = 0x09;
+/// PRIME_FD_TO_HANDLE: with no payload, the handle of the last fd sent
+/// (v3dd's on_sendfd).
+pub const PRIME_FD_TO_HANDLE: u64 = 0x2E;
 pub const SUBMIT_CL: u64 = 0x40;
 pub const WAIT_BO: u64 = 0x41;
 pub const CREATE_BO: u64 = 0x42;
@@ -139,6 +142,9 @@ pub const DRIVER_DESC: &str = "Broadcom V3D graphics";
 
 /// DRM_CAP_SYNCOBJ; capabilities up to DRM_CAP_SYNCOBJ_TIMELINE are known.
 pub const CAP_SYNCOBJ: u64 = 0x13;
+/// DRM_CAP_PRIME and its DRM_PRIME_CAP_IMPORT bit.
+pub const CAP_PRIME: u64 = 0x5;
+pub const PRIME_CAP_IMPORT: u64 = 1;
 pub const CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
 
 /// struct drm_version without its three string pointers (`pad0` is the
