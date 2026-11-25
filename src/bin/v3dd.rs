@@ -89,6 +89,24 @@
 // not signalled), TFU jobs, a render job without a bin job, perfmon. Both
 // interfaces work on the same handle.
 //
+// Display buffers (G4, redox-rpi#670): a client can hand v3dd a PRIME fd
+// of a vc4d dumb buffer (relibc sends it when PRIME_FD_TO_HANDLE names
+// another driver's fd); v3dd checks that it is one (check_prime_fd), maps
+// its pages into the client's address space as a BO, and the V3D draws
+// straight into memory the display shows. Three design choices:
+// - Memory: vc4d's screen-sized buffers stay normal, cached memory,
+//   because the CPU draws into them too (fbcond, Orbital) and reading
+//   uncached memory is slow. v3dd cleans and invalidates the CPU caches
+//   over a job's imported buffers before and after the job.
+// - Sync: no sync files (Redox has none). Jobs run in order, Mesa waits on
+//   the job's syncobj in glFinish, and a client finishes its frame before
+//   it shows the buffer. vc4d never waits for the V3D.
+// - Lifetime: v3dd keeps the fd and its mapping until the BO is freed, so
+//   the buffer stays even if the client destroys it on the display side
+//   or vc4d restarts (the kernel counts references to the pages); the V3D
+//   then draws into memory nobody shows, and the client opens the display
+//   again. A new import checks against the running vc4d.
+//
 // The binner's overflow memory belongs to v3dd: 512 KiB at the start of
 // every bin job, and another 512 KiB chunk each time the binner reports
 // it is out of memory (OUTOMEM), as Linux's v3d_overflow_mem_work().
@@ -421,7 +439,7 @@ impl Irq {
 const MAP_ID_SHIFT: u32 = 32;
 
 /// A BO's memory: v3dd's own contiguous pages, or another driver's buffer
-/// imported through its PRIME fd (G4 step 2, redox-rpi#670).
+/// imported through its PRIME fd (G4, redox-rpi#670).
 enum Mem {
     Own(Dma<[u32]>),
     Imported(Imported),
@@ -521,8 +539,8 @@ fn check_prime_fd(file: &File) -> std::result::Result<&'static str, String> {
         let fds = [display.as_raw_fd() as usize, file.as_raw_fd() as usize];
         match syscall::call_wo(&fds[..], &[], syscall::CallFlags::empty(), &[uapi::PRIME_FD_TO_HANDLE]) {
             Ok(_) => return Ok(scheme),
-            Err(err) if err.errno == syscall::error::EXDEV => refused.push(format!("{scheme}: another scheme's fd")),
-            Err(err) => refused.push(format!("{scheme}: not one of its buffers ({err})")),
+            Err(err) if err.errno == syscall::error::EXDEV => refused.push(format!("the fd is not {scheme}'s")),
+            Err(err) => refused.push(format!("the fd is {scheme}'s but no buffer ({err})")),
         }
     }
     Err(refused.join("; "))
