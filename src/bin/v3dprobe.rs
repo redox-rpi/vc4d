@@ -18,8 +18,11 @@
 //
 // v3dprobe [--csd] [--render [--triangle | --triangle-math] [--show SECONDS]]
 //          [--off] [--no-watchdog]
-// v3dprobe --via-v3dd [--loops N] [--render [--triangle | --triangle-math] | --faults]
-//          [--mapped]
+// v3dprobe --via-v3dd [--loops N] [--render [--triangle | --triangle-math] | --faults
+//          | --queue [--clients C]] [--mapped]
+//   --queue: v3dd's job queue (G2, redox-rpi#668): C clients (4) at once,
+//     each with N jobs (at most 64) in flight; an endless job in the middle
+//     of a queue; a client that closes with jobs in flight; no BOs left
 //   --show: the rendered picture in an Orbital window for SECONDS (step 2c)
 //   --render: step 2 (redox-rpi#596): bin and render control lists, see
 //     v3d/render.rs; clear only, or with --triangle a red triangle whose
@@ -218,6 +221,153 @@ fn leak_check() -> Result<String, String> {
     }
 }
 
+/// G2 (redox-rpi#668): one client of the queue test. All its jobs go in
+/// before it waits for the first; its code BO is freed right after the
+/// submits, and v3dd must keep it until the jobs are done.
+fn queue_client(n: u32, jobs: u32) -> Result<(), String> {
+    let mut v3d = client::Client::open()?;
+    let code = v3d.bo(4096)?;
+    v3d.put(&code, 0, &csd::shader_words())?;
+    let mut work = Vec::new();
+    for j in 0..jobs {
+        let unif = v3d.bo(4096)?;
+        let result = v3d.bo(4096)?;
+        let constant = csd::constant(n << 12 | j << 5);
+        v3d.fill(&result, 0, 16, 0xdead_0000)?;
+        v3d.put(&unif, 0, &[result.va, constant])?;
+        let job = v3d.submit(&csd::job_line(code.va, unif.va))?;
+        work.push((job, unif, result, constant));
+    }
+    v3d.free(&code)?;
+    for (job, unif, result, constant) in work {
+        v3d.wait(job).map_err(|err| format!("client {n}: job {job}: {err}"))?;
+        let got = v3d.get(&result, 0, 16)?;
+        if got != csd::want(constant) {
+            return Err(format!("client {n}: job {job}: result {got:#x?}, want {:#x?}", csd::want(constant)));
+        }
+        v3d.free(&unif)?;
+        v3d.free(&result)?;
+    }
+    Ok(())
+}
+
+/// G2: a good job, an endless one, a good one, submitted back to back:
+/// only the endless one fails (timeout, reset), the one after it runs.
+fn queue_hung() -> Result<String, String> {
+    let mut v3d = client::Client::open()?;
+    let code = v3d.bo(4096)?;
+    v3d.put(&code, 0, &csd::shader_words())?;
+    let mut good = Vec::new();
+    for k in 0..2u32 {
+        let unif = v3d.bo(4096)?;
+        let result = v3d.bo(4096)?;
+        let constant = csd::constant(0xf000 | k << 5);
+        v3d.fill(&result, 0, 16, 0xdead_0000)?;
+        v3d.put(&unif, 0, &[result.va, constant])?;
+        good.push((unif, result, constant));
+    }
+    let (endless_bo, endless) = render::endless_job(&mut v3d)?;
+    let a = v3d.submit(&csd::job_line(code.va, good[0].0.va))?;
+    let hung = v3d.submit(&endless)?;
+    let b = v3d.submit(&csd::job_line(code.va, good[1].0.va))?;
+    v3d.wait(a).map_err(|err| format!("the job before the endless one: {err}"))?;
+    let answer = match v3d.wait(hung) {
+        Ok(done) => return Err(format!("the endless job ended: {done}")),
+        Err(err) if err.contains("timeout") && err.contains("reset") => err,
+        Err(err) => return Err(format!("the endless job: not a timeout: {err}")),
+    };
+    v3d.wait(b).map_err(|err| format!("the job after the endless one: {err}"))?;
+    for (unif, result, constant) in &good {
+        if v3d.get(result, 0, 16)? != csd::want(*constant) {
+            return Err(format!("a good job next to the endless one: wrong result at {:#x}", result.va));
+        }
+        v3d.free(unif)?;
+        v3d.free(result)?;
+    }
+    v3d.free(&endless_bo)?;
+    v3d.free(&code)?;
+    Ok(answer)
+}
+
+/// G2: a client that closes with jobs in flight. v3dd drops the queued
+/// ones and frees the BOs once the running one is done.
+fn queue_close() -> Result<(), String> {
+    let mut v3d = client::Client::open()?;
+    let code = v3d.bo(4096)?;
+    v3d.put(&code, 0, &csd::shader_words())?;
+    let unif = v3d.bo(4096)?;
+    let result = v3d.bo(4096)?;
+    v3d.put(&unif, 0, &[result.va, csd::constant(0xe000)])?;
+    for _ in 0..4 {
+        v3d.submit(&csd::job_line(code.va, unif.va))?;
+    }
+    Ok(())
+}
+
+/// A number from a stats line.
+fn stat(stats: &str, name: &str) -> Option<u64> {
+    let mut it = stats.split(' ');
+    while let Some(key) = it.next() {
+        if key == name {
+            return it.next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// G2: the queue test (see queue_client, queue_hung, queue_close), then
+/// no client BO left in v3dd.
+fn queue_via_v3dd(clients: u32, jobs: u32) -> bool {
+    let mut ok = true;
+    let mut check = |name: &str, result: Result<String, String>| {
+        match &result {
+            Ok(what) => say(&format!("queue: {name}: PASS {what}")),
+            Err(err) => say(&format!("queue: {name}: FAIL {err}")),
+        }
+        ok &= result.is_ok();
+    };
+    let start = Instant::now();
+    let (results, hung) = thread::scope(|scope| {
+        let workers: Vec<_> = (0..clients).map(|n| scope.spawn(move || queue_client(n, jobs))).collect();
+        let hung = queue_hung();
+        let results: Vec<Result<(), String>> =
+            workers.into_iter().map(|w| w.join().unwrap_or_else(|_| Err("client thread panicked".into()))).collect();
+        (results, hung)
+    });
+    let failed: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+    check(
+        &format!("{clients} clients with {jobs} jobs in flight each"),
+        if failed.is_empty() {
+            Ok(format!("({} jobs right in {} ms)", clients * jobs, start.elapsed().as_millis()))
+        } else {
+            Err(failed.join("; "))
+        },
+    );
+    check("an endless job in the middle of a queue", hung.map(|answer| format!("(v3dd: {answer})")));
+    check("a client closed with jobs in flight", queue_close().map(|()| String::new()));
+    // The closed client's running job ends within its timeout.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let stats = loop {
+        let stats = client::Client::open().and_then(|mut v3d| v3d.ask("stats"));
+        let idle = stats.as_ref().is_ok_and(|s| {
+            stat(s, "queued") == Some(0) && stat(s, "zombies") == Some(0) && s.contains(" running - ")
+        });
+        if idle || Instant::now() > deadline {
+            break stats;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    check(
+        "no BOs left",
+        stats.and_then(|s| match (stat(&s, "live_bos"), stat(&s, "zombies"), stat(&s, "queued")) {
+            (Some(0), Some(0), Some(0)) => Ok(format!("({s})")),
+            _ => Err(format!("({s})")),
+        }),
+    );
+    say(if ok { "queue: PASS" } else { "queue: FAIL" });
+    ok
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     // Step 3 (redox-rpi#598): the CSD job through v3dd, no register access.
@@ -234,7 +384,11 @@ fn main() {
             }
         }
         let loops = args.iter().position(|a| a == "--loops").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(100);
-        let ok = if args.iter().any(|a| a == "--faults") {
+        let ok = if args.iter().any(|a| a == "--queue") {
+            let clients =
+                args.iter().position(|a| a == "--clients").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(4);
+            queue_via_v3dd(clients, loops.min(64))
+        } else if args.iter().any(|a| a == "--faults") {
             faults_via_v3dd()
         } else if args.iter().any(|a| a == "--render") {
             let draw = if args.iter().any(|a| a == "--triangle-math") {

@@ -55,7 +55,16 @@ impl Client {
         let mut reply = Vec::new();
         let mut buf = [0u8; 8192];
         while !reply.ends_with(b"\n") {
-            let n = self.file.read(&mut buf).map_err(|err| format!("{what}: read: {err}"))?;
+            // A signal ends v3dd's held read with EINTR; v3dd keeps the
+            // wait open, so reading again waits for the same answer.
+            let n = match self.file.read(&mut buf) {
+                Ok(n) => n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    eprintln!("v3dprobe: {what}: read interrupted, reading again");
+                    continue;
+                }
+                Err(err) => return Err(format!("{what}: read: {err}")),
+            };
             if n == 0 {
                 break;
             }
@@ -191,6 +200,19 @@ impl Client {
         let result = self.put(bo, first, words);
         self.maps = maps;
         result
+    }
+
+    /// "submit csd ..." or "submit cl ...": the job number, answered at once
+    /// (G2, redox-rpi#668).
+    pub fn submit(&mut self, job: &str) -> Result<u64, String> {
+        let reply = self.ask(&format!("submit {job}"))?;
+        reply.strip_prefix("job ").and_then(|n| n.parse().ok()).ok_or_else(|| format!("submit: bad reply {reply}"))
+    }
+
+    /// Waits for a submitted job: its "done ..." line, or Err with v3dd's
+    /// "error ..." line.
+    pub fn wait(&mut self, job: u64) -> Result<String, String> {
+        self.ask(&format!("wait {job}"))
     }
 
     /// "done US": the job's time in microseconds.
