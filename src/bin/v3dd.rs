@@ -490,6 +490,44 @@ impl std::ops::DerefMut for Mem {
 /// The largest buffer v3dd imports: a 3840x2160 XRGB8888 scanout buffer.
 const IMPORT_MAX: usize = 64 << 20;
 
+/// The display schemes whose buffers v3dd imports (redox-rpi#670).
+const IMPORT_SCHEMES: &[&str] = &["/scheme/display.vc4"];
+
+/// The VT v3dd opens on a display scheme to check a PRIME fd. Opening a VT
+/// only creates its state in driver-graphics; v3dd never sets a mode on it,
+/// and no console has a VT number this high.
+const CHECK_VT: usize = 0xFFFF;
+
+/// Checks that a PRIME fd really is a buffer of one of IMPORT_SCHEMES
+/// before v3dd maps it into a client's V3D address space. The fd's own
+/// answers (fpath, fstat) come from whichever scheme owns it and prove
+/// nothing. Instead, v3dd opens the display scheme itself, in its own
+/// namespace, and asks it to import the fd (PRIME_FD_TO_HANDLE with both
+/// fds in one call). The kernel lets one call name several fds only when
+/// they belong to the same scheme (EXDEV otherwise), and driver-graphics
+/// answers EINVAL unless the fd is one of its buffers (PRIME_HANDLE_TO_FD
+/// exports). The handle it gives back goes when v3dd closes its own fd.
+/// Which scheme owns the fd, or why it is refused.
+fn check_prime_fd(file: &File) -> std::result::Result<&'static str, String> {
+    let mut refused = Vec::new();
+    for &scheme in IMPORT_SCHEMES {
+        let display = match OpenOptions::new().read(true).write(true).open(format!("{scheme}/{CHECK_VT}")) {
+            Ok(display) => display,
+            Err(err) => {
+                refused.push(format!("{scheme}: open: {err}"));
+                continue;
+            }
+        };
+        let fds = [display.as_raw_fd() as usize, file.as_raw_fd() as usize];
+        match syscall::call_wo(&fds[..], &[], syscall::CallFlags::empty(), &[uapi::PRIME_FD_TO_HANDLE]) {
+            Ok(_) => return Ok(scheme),
+            Err(err) if err.errno == syscall::error::EXDEV => refused.push(format!("{scheme}: another scheme's fd")),
+            Err(err) => refused.push(format!("{scheme}: not one of its buffers ({err})")),
+        }
+    }
+    Err(refused.join("; "))
+}
+
 struct Bo {
     mem: Mem,
     va: u32,
@@ -1295,10 +1333,11 @@ fn client_bo(shared: &Shared, client: &mut Client, bytes: usize) -> std::result:
 }
 
 /// Imports another driver's buffer from the PRIME fd a client sent
-/// (PRIME_FD_TO_HANDLE across drivers, see relibc): maps the fd into
+/// (PRIME_FD_TO_HANDLE across drivers, see relibc), already checked to be
+/// a buffer of `scheme` (check_prime_fd): maps the fd into
 /// v3dd, looks up the physical pages of that mapping and maps them into the
 /// client's V3D address space. The new BO's handle.
-fn client_import(shared: &Shared, client: &mut Client, file: File) -> std::result::Result<(u32, usize), String> {
+fn client_import(shared: &Shared, client: &mut Client, file: File, scheme: &str) -> std::result::Result<(u32, usize), String> {
     use std::io::{Seek as _, SeekFrom};
     let mut file = file;
     let bytes = file.seek(SeekFrom::End(0)).map_err(|err| format!("size of the PRIME fd: {err}"))? as usize;
@@ -1333,7 +1372,7 @@ fn client_import(shared: &Shared, client: &mut Client, file: File) -> std::resul
     let bo_id = client.next_id;
     client.next_id += 1;
     say(&format!(
-        "imported a buffer of {bytes} bytes as BO {bo_id} at V3D {:#x} ({} pages, {})",
+        "imported a buffer of {scheme} of {bytes} bytes as BO {bo_id} at V3D {:#x} ({} pages, {})",
         bo.va,
         phys.len(),
         if contiguous { "contiguous" } else { "scattered" }
@@ -2008,9 +2047,10 @@ impl SchemeSync for V3dScheme {
     }
 
     /// A client sent a PRIME fd of another driver (relibc's
-    /// PRIME_FD_TO_HANDLE when the fd is not v3dd's): import it as a BO and
-    /// answer its handle. The fd is taken in any case, so a refused import
-    /// leaves nothing behind.
+    /// PRIME_FD_TO_HANDLE when the fd is not v3dd's): if it is a display
+    /// buffer (check_prime_fd), import it as a BO and answer its handle;
+    /// anything else answers EINVAL. The fd is taken in any case, so a
+    /// refused import leaves nothing behind.
     fn on_sendfd(&mut self, req: &redox_scheme::SendFdRequest) -> Result<usize> {
         if req.num_fds() != 1 {
             return Err(Error::new(EINVAL));
@@ -2022,13 +2062,18 @@ impl SchemeSync for V3dScheme {
             err
         })?;
         let file = unsafe { <File as std::os::unix::io::FromRawFd>::from_raw_fd(fds[0] as i32) };
+        // Before the state lock: the check calls the display driver.
+        let scheme = check_prime_fd(&file).map_err(|err| {
+            say(&format!("client {id}: PRIME import refused: {err}"));
+            Error::new(EINVAL)
+        })?;
         let shared = self.shared.clone();
         let mut state = lock(&shared.state);
         let Ok(Handle::Client(client)) = state.handles.get_mut(id) else {
             say(&format!("client {id}: PRIME fd sent to a handle that is not a client"));
             return Err(Error::new(EBADF));
         };
-        let (handle, _) = client_import(&shared, client, file).map_err(|err| {
+        let (handle, _) = client_import(&shared, client, file, scheme).map_err(|err| {
             say(&format!("client {id}: PRIME import: {err}"));
             Error::new(EINVAL)
         })?;
