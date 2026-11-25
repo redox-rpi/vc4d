@@ -6,19 +6,21 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
 
-# The Redox driver crates come from upstream base at the commit redox-rpi
-# pins in config/upstream.lock; redox-rpi does not patch them.
+# The Redox driver crates come from upstream base; redox-rpi does not patch
+# them. Branch g4-prime (G4 step 2, redox-rpi#670, spike): base 59a2abbe,
+# three commits after the base redox-rpi pins, for upstream's PRIME export
+# in driver-graphics. redox-scheme comes from git as in that base.
 [dependencies]
 orbclient = { version = "0.4.6", default-features = false, features = ["std"] }
 vc4-hvs = { path = "hvs" }
 vc4-edid = { path = "edid" }
 vc4-mode = { path = "mode" }
-common = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "eddcaa21fb2d11b4a6bd64478e0639153266dc04" }
-daemon = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "eddcaa21fb2d11b4a6bd64478e0639153266dc04" }
-driver-graphics = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "eddcaa21fb2d11b4a6bd64478e0639153266dc04" }
+common = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd" }
+daemon = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd" }
+driver-graphics = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd" }
 drm-sys = "0.8.1"
 fdt = { git = "https://github.com/repnop/fdt.git", rev = "059bb23" }
 redox_event = "0.4.8"
-redox-scheme = { version = "0.12.0", default-features = false }
-scheme-utils = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "eddcaa21fb2d11b4a6bd64478e0639153266dc04" }
+redox-scheme = { git = "https://gitlab.redox-os.org/redox-os/redox-scheme.git", default-features = false }
+scheme-utils = { git = "https://gitlab.redox-os.org/redox-os/base.git", rev = "59a2abbec4ab0e9f17a4b12ff7dcf57d72cc9ccd" }
 redox_syscall = { version = "0.9.5", features = ["std"] }

@@ -420,8 +420,55 @@ impl Irq {
 /// fmap offsets: the BO ID above this bit, the byte in the BO below.
 const MAP_ID_SHIFT: u32 = 32;
 
+/// A BO's memory: v3dd's own contiguous pages, or another driver's buffer
+/// imported through its PRIME fd (G4 step 2, redox-rpi#670).
+enum Mem {
+    Own(Dma<[u32]>),
+    Imported(Imported),
+}
+
+/// Another driver's buffer (vc4d's scanout buffer), imported through the
+/// PRIME fd a client sent (sendfd): v3dd keeps the fd and its own mapping
+/// of it, so the buffer stays while the BO exists. The physical pages come
+/// from the kernel for that mapping, never from a client.
+struct Imported {
+    /// Held open: the PRIME fd keeps the other driver's buffer alive.
+    _file: File,
+    addr: usize,
+    bytes: usize,
+}
+
+impl Drop for Imported {
+    fn drop(&mut self) {
+        // The MMU no longer maps the pages (free_bo); the file closes after.
+        let _ = unsafe { syscall::funmap(self.addr, self.bytes) };
+    }
+}
+
+impl std::ops::Deref for Mem {
+    type Target = [u32];
+    fn deref(&self) -> &[u32] {
+        match self {
+            Mem::Own(dma) => dma,
+            Mem::Imported(imp) => unsafe { std::slice::from_raw_parts(imp.addr as *const u32, imp.bytes / 4) },
+        }
+    }
+}
+
+impl std::ops::DerefMut for Mem {
+    fn deref_mut(&mut self) -> &mut [u32] {
+        match self {
+            Mem::Own(dma) => dma,
+            Mem::Imported(imp) => unsafe { std::slice::from_raw_parts_mut(imp.addr as *mut u32, imp.bytes / 4) },
+        }
+    }
+}
+
+/// The largest buffer v3dd imports: a 3840x2160 XRGB8888 scanout buffer.
+const IMPORT_MAX: usize = 64 << 20;
+
 struct Bo {
-    mem: Dma<[u32]>,
+    mem: Mem,
     va: u32,
     pages: usize,
     /// The address space it is mapped in (OVERFLOW_SPACES: all of them).
@@ -544,6 +591,13 @@ impl Space {
         }
     }
 
+    /// Maps pages that need not be contiguous (an imported buffer).
+    fn map_pages(&mut self, va: u32, phys: &[usize]) {
+        for (page, &addr) in phys.iter().enumerate() {
+            self.pt[va as usize / PAGE + page] = V3D_PTE_WRITEABLE | V3D_PTE_VALID | ((addr / PAGE) as u32);
+        }
+    }
+
     fn unmap(&mut self, va: u32, pages: usize) {
         self.pt[va as usize / PAGE..va as usize / PAGE + pages].fill(0);
     }
@@ -613,7 +667,22 @@ impl Mmu {
         let va = table.alloc_va(pages).ok_or("V3D address space full")?;
         table.map(va, mem.physical(), pages);
         lock(&self.stats).bos += 1;
-        let bo = Bo { mem, va, pages, space };
+        let bo = Bo { mem: Mem::Own(mem), va, pages, space };
+        if !self.flush_if_loaded(space) {
+            self.free_bo(bo);
+            return Err("MMU flush did not finish".into());
+        }
+        Ok(bo)
+    }
+
+    /// A BO over an imported buffer's pages, in a client's space.
+    fn import_bo(&mut self, space: u32, imported: Imported, phys: &[usize]) -> std::result::Result<Bo, String> {
+        let pages = phys.len();
+        let table = self.spaces.get_mut(&space).ok_or_else(|| format!("no address space {space}"))?;
+        let va = table.alloc_va(pages).ok_or("V3D address space full")?;
+        table.map_pages(va, phys);
+        lock(&self.stats).bos += 1;
+        let bo = Bo { mem: Mem::Imported(imported), va, pages, space };
         if !self.flush_if_loaded(space) {
             self.free_bo(bo);
             return Err("MMU flush did not finish".into());
@@ -647,7 +716,7 @@ impl Mmu {
         if !csd::mmu_flush(&self.hub) {
             return Err("MMU flush did not finish".into());
         }
-        Ok(Bo { mem, va, pages, space: OVERFLOW_SPACES })
+        Ok(Bo { mem: Mem::Own(mem), va, pages, space: OVERFLOW_SPACES })
     }
 }
 
@@ -1193,6 +1262,54 @@ fn client_bo(shared: &Shared, client: &mut Client, bytes: usize) -> std::result:
     Ok((bo_id, va))
 }
 
+/// Imports another driver's buffer from the PRIME fd a client sent
+/// (PRIME_FD_TO_HANDLE across drivers, see relibc): maps the fd into
+/// v3dd, looks up the physical pages of that mapping and maps them into the
+/// client's V3D address space. The new BO's handle.
+fn client_import(shared: &Shared, client: &mut Client, file: File) -> std::result::Result<(u32, usize), String> {
+    use std::io::{Seek as _, SeekFrom};
+    let mut file = file;
+    let bytes = file.seek(SeekFrom::End(0)).map_err(|err| format!("size of the PRIME fd: {err}"))? as usize;
+    if bytes == 0 || bytes > IMPORT_MAX || bytes % PAGE != 0 {
+        return Err(format!("buffer of {bytes} bytes (1..={IMPORT_MAX}, whole pages)"));
+    }
+    let map = syscall::Map {
+        offset: 0,
+        size: bytes,
+        flags: MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::MAP_SHARED,
+        ..Default::default()
+    };
+    let addr = unsafe { syscall::fmap(file.as_raw_fd() as usize, &map) }.map_err(|err| format!("fmap: {err}"))?;
+    let imported = Imported { _file: file, addr, bytes };
+    let translate = common::VirtaddrTranslationHandle::new().map_err(|err| format!("translation handle: {err}"))?;
+    let phys = (0..bytes / PAGE)
+        .map(|page| translate.translate(addr + page * PAGE).map_err(|err| format!("page {page}: {err}")))
+        .collect::<std::result::Result<Vec<usize>, String>>()?;
+    let contiguous = phys.windows(2).all(|w| w[1] == w[0] + PAGE);
+    let bo = {
+        let mut mmu = lock(&shared.mmu);
+        let space = match client.space {
+            Some(space) => space,
+            None => {
+                let space = mmu.new_space()?;
+                client.space = Some(space);
+                space
+            }
+        };
+        mmu.import_bo(space, imported, &phys)?
+    };
+    let bo_id = client.next_id;
+    client.next_id += 1;
+    say(&format!(
+        "imported a buffer of {bytes} bytes as BO {bo_id} at V3D {:#x} ({} pages, {})",
+        bo.va,
+        phys.len(),
+        if contiguous { "contiguous" } else { "scattered" }
+    ));
+    client.bos.insert(bo_id, bo);
+    Ok((bo_id, bytes))
+}
+
 /// Frees a client's BO now, or after the client's last pending job.
 fn client_free(shared: &Shared, zombies: &mut Vec<(u64, Zombie)>, client: &mut Client, bo_id: u32) -> bool {
     let Some(bo) = client.bos.remove(&bo_id) else { return false };
@@ -1557,7 +1674,10 @@ impl V3dScheme {
                 let (mut arg, _) = uapi::read::<uapi::GetCap>(payload).ok_or_else(einval)?;
                 arg.value = match arg.capability {
                     uapi::CAP_SYNCOBJ => 1,
-                    // No dumb buffers, PRIME, timelines or the rest.
+                    // PRIME: import of other drivers' buffers (G4 step 2),
+                    // no export.
+                    uapi::CAP_PRIME => uapi::PRIME_CAP_IMPORT,
+                    // No dumb buffers, timelines or the rest.
                     1..=uapi::CAP_SYNCOBJ_TIMELINE => 0,
                     _ => return Err(einval()),
                 };
@@ -1833,6 +1953,30 @@ impl SchemeSync for V3dScheme {
     fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
         lock(&self.shared.state).handles.get(id).map_err(|_| Error::new(EBADF))?;
         FpathWriter::with(buf, "v3d", |_| Ok(()))
+    }
+
+    /// A client sent a PRIME fd of another driver (relibc's
+    /// PRIME_FD_TO_HANDLE when the fd is not v3dd's): import it as a BO and
+    /// answer its handle. The fd is taken in any case, so a refused import
+    /// leaves nothing behind.
+    fn on_sendfd(&mut self, req: &redox_scheme::SendFdRequest) -> Result<usize> {
+        if req.num_fds() != 1 {
+            return Err(Error::new(EINVAL));
+        }
+        let mut fds = [usize::MAX];
+        req.obtain_fd(&self.shared.socket, syscall::flag::FobtainFdFlags::empty(), &mut fds)?;
+        let file = unsafe { <File as std::os::unix::io::FromRawFd>::from_raw_fd(fds[0] as i32) };
+        let shared = self.shared.clone();
+        let mut state = lock(&shared.state);
+        let id = req.id();
+        let Handle::Client(client) = state.handles.get_mut(id).map_err(|_| Error::new(EBADF))? else {
+            return Err(Error::new(EBADF));
+        };
+        let (handle, _) = client_import(&shared, client, file).map_err(|err| {
+            say(&format!("client {id}: PRIME import: {err}"));
+            Error::new(EINVAL)
+        })?;
+        Ok(handle as usize)
     }
 
     /// The client's queued jobs go; a running one ends first, and its BOs

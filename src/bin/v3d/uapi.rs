@@ -139,6 +139,9 @@ pub const DRIVER_DESC: &str = "Broadcom V3D graphics";
 
 /// DRM_CAP_SYNCOBJ; capabilities up to DRM_CAP_SYNCOBJ_TIMELINE are known.
 pub const CAP_SYNCOBJ: u64 = 0x13;
+/// DRM_CAP_PRIME and its DRM_PRIME_CAP_IMPORT bit.
+pub const CAP_PRIME: u64 = 0x5;
+pub const PRIME_CAP_IMPORT: u64 = 1;
 pub const CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
 
 /// struct drm_version without its three string pointers (`pad0` is the
