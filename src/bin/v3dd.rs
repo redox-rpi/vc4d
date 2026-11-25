@@ -438,6 +438,29 @@ struct Imported {
     bytes: usize,
 }
 
+/// Cleans and invalidates the CPU's data cache over a range (to the point
+/// of coherency, for every core): an imported buffer can be normal, cached
+/// memory (vc4d's screen-sized buffers are), which the V3D reads and writes
+/// past the cache. Before a job, so the V3D sees what the CPU wrote; after
+/// it, so no CPU reads stale lines. User space may do this here: the
+/// bootloader sets SCTLR_EL1.UCI.
+fn clean_invalidate(addr: usize, bytes: usize) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let ctr: u64;
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr);
+        let line = 4usize << ((ctr >> 16) & 0xf);
+        let mut at = addr & !(line - 1);
+        while at < addr + bytes {
+            core::arch::asm!("dc civac, {}", in(reg) at);
+            at += line;
+        }
+        core::arch::asm!("dsb sy");
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (addr, bytes);
+}
+
 impl Drop for Imported {
     fn drop(&mut self) {
         // The MMU no longer maps the pages (free_bo); the file closes after.
@@ -1133,6 +1156,10 @@ struct Job {
     /// The client's address space, loaded before the job runs.
     space: u32,
     kind: JobKind,
+    /// The client's imported buffers (address and size in v3dd's mapping),
+    /// whose caches are cleaned before and after the job. Zombies keep
+    /// the mappings until the job is done.
+    imported: Vec<(usize, usize)>,
 }
 
 enum JobKind {
@@ -1332,7 +1359,15 @@ fn submit_job(shared: &Shared, queue: &mut VecDeque<Job>, next_job: &mut u64, id
     let job = *next_job;
     client.pending.insert(job);
     let space = client.space.unwrap_or(DAEMON_SPACE);
-    queue.push_back(Job { id: job, client: id, space, kind });
+    let imported = client
+        .bos
+        .values()
+        .filter_map(|bo| match &bo.mem {
+            Mem::Imported(imp) => Some((imp.addr, imp.bytes)),
+            Mem::Own(_) => None,
+        })
+        .collect();
+    queue.push_back(Job { id: job, client: id, space, kind, imported });
     shared.work.notify_one();
     job
 }
@@ -1408,6 +1443,9 @@ impl Shared {
                     state = self.work.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
             };
+            for &(addr, bytes) in &job.imported {
+                clean_invalidate(addr, bytes);
+            }
             let answer = {
                 let mut v3d = lock(&self.v3d);
                 let loaded = lock(&self.mmu).load(job.space);
@@ -1422,6 +1460,9 @@ impl Shared {
                     }
                 }
             };
+            for &(addr, bytes) in &job.imported {
+                clean_invalidate(addr, bytes);
+            }
             let answer = answer.unwrap_or_else(|err| format!("error {err}"));
             let failed = answer.starts_with("error");
             let mut calls = Vec::new();
