@@ -11,6 +11,8 @@ license = "GPL-2.0-only"
 # three commits after the base redox-rpi pins, for upstream's PRIME export
 # in driver-graphics. redox-scheme comes from git as in that base.
 [dependencies]
+# The pixel formats of driver-graphics' framebuffers (the version base uses).
+drm-fourcc = "2.2.0"
 orbclient = { version = "0.4.6", default-features = false, features = ["std"] }
 vc4-hvs = { path = "hvs" }
 vc4-edid = { path = "edid" }

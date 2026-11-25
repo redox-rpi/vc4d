@@ -21,6 +21,7 @@ use driver_graphics::kms::framebuffer::KmsFramebuffer;
 use driver_graphics::kms::objects::{KmsObjectId, KmsObjects};
 use driver_graphics::kms::plane::{KmsPlane, KmsPlaneDriver, KmsPlaneState, KmsPlaneType};
 use driver_graphics::{Buffer, Damage, DumbBufferConfig, GraphicsAdapter};
+use drm_fourcc::DrmFourcc;
 use syscall::PAGE_SIZE;
 
 use crate::hvs::{self, Channel, Hvs, Plane};
@@ -553,11 +554,11 @@ impl GraphicsAdapter for Vc4Adapter {
                 // left corner is the hotspot away from it.
                 let (hot_x, hot_y) = new_plane_state.hotspot.unwrap_or((0, 0));
                 let rect = &new_plane_state.crtc_rect;
-                self.place(fb, rect.x - hot_x, rect.y - hot_y, true)
+                self.place(fb, rect.x - hot_x, rect.y - hot_y, has_alpha(fb))
             }
             (Some(fb), Some(_)) if overlay.is_some() => {
                 let rect = &new_plane_state.crtc_rect;
-                let shown = self.place(fb, rect.x, rect.y, true);
+                let shown = self.place(fb, rect.x, rect.y, has_alpha(fb));
                 if self.log_lists {
                     println!(
                         "vc4d: overlay {}: at {},{} fb {}x{} dma {} -> {}",
@@ -671,4 +672,11 @@ impl Buffer for Vc4Buffer {
     fn size(&self) -> usize {
         self.width * self.height * 4
     }
+}
+
+/// Whether the HVS blends a framebuffer by its alpha channel: ARGB8888 yes,
+/// XRGB8888 (ADDFB with depth 24) no, so its undefined alpha byte does not
+/// make the plane transparent.
+fn has_alpha<T: GraphicsAdapter>(fb: &KmsFramebuffer<T>) -> bool {
+    fb.pixel_format == DrmFourcc::Argb8888
 }
