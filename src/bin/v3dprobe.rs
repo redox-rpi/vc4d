@@ -19,7 +19,10 @@
 // v3dprobe [--csd] [--render [--triangle | --triangle-math] [--show SECONDS]]
 //          [--off] [--no-watchdog]
 // v3dprobe --via-v3dd [--loops N] [--render [--triangle | --triangle-math] | --faults
-//          | --queue [--clients C]] [--mapped]
+//          | --queue [--clients C] | --ioctl] [--mapped]
+//   --ioctl: v3dd's binary interface (G2 step 3, redox-rpi#668), Linux's
+//     V3D ioctls as scheme calls: N compute jobs by SUBMIT_CSD and WAIT_BO,
+//     wrong arguments, an endless job (WAIT_BO: ETIME, then EIO)
 //   --queue: v3dd's job queue (G2, redox-rpi#668): C clients (4) at once,
 //     each with N jobs (at most 64) in flight; an endless job in the middle
 //     of a queue; a client that closes with jobs in flight; a client's job
@@ -62,6 +65,9 @@ mod client;
 mod csd;
 #[path = "v3d/render.rs"]
 mod render;
+#[path = "v3d/uapi.rs"]
+#[allow(dead_code)]
+mod uapi;
 
 // The Pi 400's devicetree (bcm2711-rpi-400.dtb): /v3dbus/v3d@7ec04000 with
 // reg-names hub and core0, and /v3dbus ranges 0x7c500000 -> 0xfc500000. The
@@ -378,7 +384,14 @@ fn queue_via_v3dd(clients: u32, jobs: u32) -> bool {
     check("an endless job in the middle of a queue", hung.map(|answer| format!("(v3dd: {answer})")));
     check("a client closed with jobs in flight", queue_close().map(|()| String::new()));
     check("another client's BO is out of reach", queue_isolation());
-    // The closed client's running job ends within its timeout.
+    check("no BOs left", nothing_left());
+    say(if ok { "queue: PASS" } else { "queue: FAIL" });
+    ok
+}
+
+/// Once v3dd is idle (a closed client's running job ends within its
+/// timeout): no client BO, zombie or address space left.
+fn nothing_left() -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(3);
     let stats = loop {
         let stats = client::Client::open().and_then(|mut v3d| v3d.ask("stats"));
@@ -390,16 +403,117 @@ fn queue_via_v3dd(clients: u32, jobs: u32) -> bool {
         }
         thread::sleep(Duration::from_millis(50));
     };
-    check(
-        "no BOs left",
-        stats.and_then(|s| match (stat(&s, "live_bos"), stat(&s, "zombies"), stat(&s, "queued"), stat(&s, "spaces")) {
-            // The stats client itself has no BO, so no space.
-            (Some(0), Some(0), Some(0), Some(0)) => Ok(format!("({s})")),
-            _ => Err(format!("({s})")),
-        }),
-    );
-    say(if ok { "queue: PASS" } else { "queue: FAIL" });
-    ok
+    stats.and_then(|s| match (stat(&s, "live_bos"), stat(&s, "zombies"), stat(&s, "queued"), stat(&s, "spaces")) {
+        // The stats client itself has no BO, so no space.
+        (Some(0), Some(0), Some(0), Some(0)) => Ok(format!("({s})")),
+        _ => Err(format!("({s})")),
+    })
+}
+
+/// G2 step 3 (redox-rpi#668): the binary interface, Linux's V3D ioctls as
+/// scheme calls. GET_PARAM; BOs made, mapped, located and closed by ioctl;
+/// `loops` compute jobs by SUBMIT_CSD and WAIT_BO; wrong arguments; then an
+/// endless bin job by SUBMIT_CL: WAIT_BO answers ETIME at timeout 0 while
+/// it runs, and EIO when it has failed.
+fn ioctl_check(loops: u32) -> Result<String, String> {
+    use uapi::*;
+    let mut v3d = client::Client::open()?;
+    fn call<T: Copy>(v3d: &mut client::Client, func: u64, arg: &T, handles: &[u32]) -> Result<T, syscall::Error> {
+        let mut buf = bytes(arg, handles);
+        v3d.ioctl(func, &mut buf)?;
+        Ok(read::<T>(&buf).expect("short reply").0)
+    }
+    let expect_err = |what: &str, r: Result<(), syscall::Error>, errno: i32| -> Result<(), String> {
+        match r {
+            Err(e) if e.errno == errno => Ok(()),
+            Err(e) => Err(format!("{what}: {e}, want errno {errno}")),
+            Ok(()) => Err(format!("{what}: passed, want errno {errno}")),
+        }
+    };
+    let param = |v3d: &mut client::Client, param: u32| {
+        call(v3d, GET_PARAM, &GetParam { param, ..Default::default() }, &[]).map(|p| p.value)
+    };
+    let ident1 = param(&mut v3d, PARAM_HUB_IDENT1).map_err(|e| format!("GET_PARAM: {e}"))?;
+    if ident1 == 0 || param(&mut v3d, PARAM_SUPPORTS_CSD).ok() != Some(1) {
+        return Err(format!("GET_PARAM: HUB_IDENT1 {ident1:#x}, SUPPORTS_CSD not 1"));
+    }
+    expect_err("GET_PARAM 99", param(&mut v3d, 99).map(|_| ()), syscall::EINVAL)?;
+    let create = |v3d: &mut client::Client| -> Result<client::Bo, String> {
+        let bo = call(v3d, CREATE_BO, &CreateBo { size: 4096, ..Default::default() }, &[])
+            .map_err(|e| format!("CREATE_BO: {e}"))?;
+        let mapped = call(v3d, MMAP_BO, &MmapBo { handle: bo.handle, ..Default::default() }, &[])
+            .map_err(|e| format!("MMAP_BO: {e}"))?;
+        if mapped.offset != (bo.handle as u64) << 32 {
+            return Err(format!("MMAP_BO: offset {:#x}", mapped.offset));
+        }
+        let at = call(v3d, GET_BO_OFFSET, &GetBoOffset { handle: bo.handle, ..Default::default() }, &[])
+            .map_err(|e| format!("GET_BO_OFFSET: {e}"))?;
+        if at.offset != bo.offset {
+            return Err(format!("GET_BO_OFFSET {:#x}, CREATE_BO said {:#x}", at.offset, bo.offset));
+        }
+        let bo = client::Bo { id: bo.handle, va: bo.offset };
+        v3d.map(&bo, 4096)?;
+        Ok(bo)
+    };
+    expect_err(
+        "CREATE_BO with flags",
+        call(&mut v3d, CREATE_BO, &CreateBo { size: 4096, flags: 1, ..Default::default() }, &[]).map(|_| ()),
+        syscall::EINVAL,
+    )?;
+    let (code, unif, result) = (create(&mut v3d)?, create(&mut v3d)?, create(&mut v3d)?);
+    v3d.put(&code, 0, &csd::shader_words())?;
+    let wait = |v3d: &mut client::Client, bo: &client::Bo, timeout_ns: u64| {
+        call(v3d, WAIT_BO, &WaitBo { handle: bo.id, timeout_ns, ..Default::default() }, &[]).map(|_| ())
+    };
+    let start = Instant::now();
+    for i in 0..loops {
+        let constant = csd::constant(0xc000 | i << 5);
+        v3d.fill(&result, 0, 16, 0xdead_0000)?;
+        v3d.put(&unif, 0, &[result.va, constant])?;
+        let arg = SubmitCsd { cfg: csd::job_cfg(code.va, unif.va), bo_handle_count: 3, ..Default::default() };
+        call(&mut v3d, SUBMIT_CSD, &arg, &[code.id, unif.id, result.id]).map_err(|e| format!("SUBMIT_CSD: {e}"))?;
+        wait(&mut v3d, &result, u64::MAX).map_err(|e| format!("loop {i}: WAIT_BO: {e}"))?;
+        let got = v3d.get(&result, 0, 16)?;
+        if got != csd::want(constant) {
+            return Err(format!("loop {i}: result {got:#x?}, want {:#x?}", csd::want(constant)));
+        }
+    }
+    let us = start.elapsed().as_micros() / loops.max(1) as u128;
+    wait(&mut v3d, &result, 0).map_err(|e| format!("WAIT_BO on an idle BO with timeout 0: {e}"))?;
+    expect_err("WAIT_BO on handle 999", wait(&mut v3d, &client::Bo { id: 999, va: 0 }, 0), syscall::ENOENT)?;
+    let arg = SubmitCsd { cfg: csd::job_cfg(code.va, unif.va), bo_handle_count: 1, ..Default::default() };
+    expect_err("SUBMIT_CSD naming handle 999", call(&mut v3d, SUBMIT_CSD, &arg, &[999]).map(|_| ()), syscall::ENOENT)?;
+    let arg = SubmitCsd { extensions: 1, ..arg };
+    expect_err("SUBMIT_CSD with extensions", call(&mut v3d, SUBMIT_CSD, &arg, &[code.id]).map(|_| ()), syscall::EINVAL)?;
+    // The endless bin job: busy, then failed.
+    let (endless, _) = render::endless_job(&mut v3d)?;
+    let end = endless.va + 0x100;
+    let arg = SubmitCl {
+        bcl_start: endless.va,
+        bcl_end: end,
+        rcl_start: endless.va,
+        rcl_end: end,
+        bo_handle_count: 1,
+        ..Default::default()
+    };
+    call(&mut v3d, SUBMIT_CL, &arg, &[endless.id]).map_err(|e| format!("SUBMIT_CL: {e}"))?;
+    expect_err("WAIT_BO with timeout 0 on the endless job", wait(&mut v3d, &endless, 0), syscall::ETIME)?;
+    let start = Instant::now();
+    expect_err("WAIT_BO on the endless job", wait(&mut v3d, &endless, u64::MAX), syscall::EIO)?;
+    let waited = start.elapsed().as_millis();
+    for bo in [&code, &unif, &result, &endless] {
+        v3d.unmap(bo.id);
+        call(&mut v3d, GEM_CLOSE, &GemClose { handle: bo.id, ..Default::default() }, &[])
+            .map_err(|e| format!("GEM_CLOSE {}: {e}", bo.id))?;
+    }
+    expect_err(
+        "GEM_CLOSE twice",
+        call(&mut v3d, GEM_CLOSE, &GemClose { handle: code.id, ..Default::default() }, &[]).map(|_| ()),
+        syscall::ENOENT,
+    )?;
+    Ok(format!(
+        "HUB_IDENT1 {ident1:#x}; {loops} of {loops} jobs right, {us} us per job round trip; wrong arguments refused; endless job: ETIME, then EIO after {waited} ms"
+    ))
 }
 
 fn main() {
@@ -418,7 +532,14 @@ fn main() {
             }
         }
         let loops = args.iter().position(|a| a == "--loops").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(100);
-        let ok = if args.iter().any(|a| a == "--queue") {
+        let ok = if args.iter().any(|a| a == "--ioctl") {
+            let result = ioctl_check(loops).and_then(|done| nothing_left().map(|left| format!("{done}; no BOs left {left}")));
+            match &result {
+                Ok(what) => say(&format!("ioctl: PASS: {what}")),
+                Err(err) => say(&format!("ioctl: FAIL: {err}")),
+            }
+            result.is_ok()
+        } else if args.iter().any(|a| a == "--queue") {
             let clients =
                 args.iter().position(|a| a == "--clients").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(4);
             queue_via_v3dd(clients, loops.min(64))

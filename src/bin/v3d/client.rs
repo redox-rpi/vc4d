@@ -108,7 +108,13 @@ impl Client {
         Ok(())
     }
 
-    fn unmap(&mut self, id: u32) {
+    /// One ioctl of the binary interface (v3d/uapi.rs): a scheme call with
+    /// the function number as metadata.
+    pub fn ioctl(&mut self, func: u64, payload: &mut [u8]) -> Result<usize, syscall::Error> {
+        syscall::call_rw(self.file.as_raw_fd() as usize, payload, syscall::CallFlags::empty(), &[func])
+    }
+
+    pub fn unmap(&mut self, id: u32) {
         if let Some((addr, words)) = self.maps.remove(&id) {
             let _ = unsafe { syscall::funmap(addr, words * 4) };
         }

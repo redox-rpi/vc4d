@@ -300,6 +300,12 @@ pub fn shader_words() -> Vec<u32> {
 /// ... the "csd ..." command for code and uniforms (the uniforms: the
 /// result BO's address, then the constant) ...
 pub fn job_line(code_va: u32, unif_va: u32) -> String {
+    let cfg: Vec<String> = job_cfg(code_va, unif_va).iter().map(|w| format!("{w:#x}")).collect();
+    format!("csd {}", cfg.join(" "))
+}
+
+/// The seven CSD configuration words of that job.
+pub fn job_cfg(code_va: u32, unif_va: u32) -> [u32; 7] {
     let wg_size: u32 = 16;
     let wgs_per_sg: u32 = 16;
     let cfg = [
@@ -311,8 +317,7 @@ pub fn job_line(code_va: u32, unif_va: u32) -> String {
         code_va,
         unif_va,
     ];
-    let cfg: Vec<String> = cfg.iter().map(|w| format!("{w:#x}")).collect();
-    format!("csd {}", cfg.join(" "))
+    cfg
 }
 
 /// ... and the result it should leave: lane + constant in each lane, the
