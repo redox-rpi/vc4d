@@ -16,6 +16,62 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// put/get/fill through the BO mappings instead of command lines.
 pub static MAPPED: AtomicBool = AtomicBool::new(false);
 
+/// ioctl() through relibc with Linux's request numbers and structs
+/// (v3dprobe --libc, G3 of redox-rpi#669) instead of the scheme call:
+/// the path Mesa and libdrm take.
+pub static LIBC: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" {
+    fn ioctl(fd: i32, request: u64, arg: *mut u8) -> i32;
+}
+
+/// `_IOW`/`_IOWR('d', nr, size)` of Linux's drm.h and v3d_drm.h.
+fn drm_request(nr: u64, size: usize, read_back: bool) -> u64 {
+    let dir: u64 = if read_back { 3 } else { 1 };
+    dir << 30 | (size as u64) << 16 | (b'd' as u64) << 8 | nr
+}
+
+/// One ioctl through relibc. `payload` is the wire form (v3d/uapi.rs);
+/// Linux's struct differs from it only where a submit carries the
+/// pointer to its BO handles, which come after the fixed part.
+fn libc_ioctl(fd: i32, func: u64, payload: &mut [u8]) -> Result<usize, syscall::Error> {
+    // GEM_CLOSE 0x09, SUBMIT_CL 0x40, SUBMIT_CSD 0x47.
+    let (fixed, at, gap, read_back) = match func {
+        0x40 => (64, 40, 0, true),
+        // The wire form has 4 bytes of padding at 60 that Linux's struct
+        // does not have there; it has 4 at 44 instead.
+        0x47 => (80, 44, 4, false),
+        0x09 => (payload.len(), 0, 0, false),
+        _ => (payload.len(), 0, 0, true),
+    };
+    let handles = payload.get(fixed..).unwrap_or(&[]).as_ptr() as u64;
+    let mut linux: Vec<u8> = Vec::with_capacity(fixed + 12);
+    match func {
+        0x40 => {
+            linux.extend_from_slice(&payload[..at]);
+            linux.extend_from_slice(&handles.to_ne_bytes());
+            linux.extend_from_slice(&payload[at..fixed]);
+        }
+        0x47 => {
+            linux.extend_from_slice(&payload[..at]);
+            linux.extend_from_slice(&[0; 4][..gap]);
+            linux.extend_from_slice(&handles.to_ne_bytes());
+            linux.extend_from_slice(&payload[at..60]);
+            linux.extend_from_slice(&payload[64..fixed]);
+        }
+        _ => linux.extend_from_slice(payload),
+    }
+    let request = drm_request(func, linux.len(), read_back);
+    if unsafe { ioctl(fd, request, linux.as_mut_ptr()) } < 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(syscall::EIO);
+        return Err(syscall::Error::new(errno));
+    }
+    if func != 0x40 && func != 0x47 {
+        payload.copy_from_slice(&linux);
+    }
+    Ok(0)
+}
+
 /// v3dd's fmap offsets: the BO ID above bit 32.
 const MAP_ID_SHIFT: u32 = 32;
 const PAGE: usize = 4096;
@@ -111,6 +167,9 @@ impl Client {
     /// One ioctl of the binary interface (v3d/uapi.rs): a scheme call with
     /// the function number as metadata.
     pub fn ioctl(&mut self, func: u64, payload: &mut [u8]) -> Result<usize, syscall::Error> {
+        if LIBC.load(Ordering::Relaxed) {
+            return libc_ioctl(self.file.as_raw_fd(), func, payload);
+        }
         syscall::call_rw(self.file.as_raw_fd() as usize, payload, syscall::CallFlags::empty(), &[func])
     }
 
