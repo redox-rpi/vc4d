@@ -147,7 +147,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     }
     // The firmware's display runs: compare its pixel valve 2 with what
     // vc4d would write for the EDID's preferred mode (read only).
-    // The mode registers are the BCM283x's; the BCM2711 only logs its EDID.
+    // The mode registers below are the BCM283x's.
     if let (Some(edid), None, false) = (&edid, fake, vc5) {
         let same = mode::compare(fdt.as_ref(), edid);
         if env::var("VC4D_MODE").is_ok_and(|v| v == "write") {
@@ -181,6 +181,11 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     thread::sleep(Duration::from_millis(50));
     if fake.is_none() && hvs.frame_count(channel.index) == before {
         give_up(daemon, &format!("channel {} does not run", channel.index));
+    }
+    // The BCM2711 compares and dumps read only (redox-rpi#671 step 2), now
+    // that a channel is seen running: the HDMI block is clocked.
+    if let (Some(edid), None, true, Some(fdt)) = (&edid, fake, vc5, fdt.as_ref()) {
+        mode::compare_bcm2711(fdt, edid);
     }
     println!(
         "vc4d: taking over channel {} at {}x{}",
