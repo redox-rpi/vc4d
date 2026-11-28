@@ -631,6 +631,25 @@ impl Hvs {
             .then_some(Channel { index, width, height })
     }
 
+    /// SCALER_DISPCTRLX of the channel, raw.
+    pub fn channel_ctrl(&self, index: usize) -> u32 {
+        self.reg(scaler_dispctrlx(index))
+    }
+
+    /// Writes SCALER_DISPCTRLX of the channel as it is (restoring a saved
+    /// value).
+    pub fn set_channel_ctrl(&self, index: usize, ctrl: u32) {
+        self.set_reg(scaler_dispctrlx(index), ctrl);
+    }
+
+    /// Changes the channel's output size and keeps its other bits: for a
+    /// new mode, while the pixel valve that pulls from it is stopped.
+    pub fn set_channel_size(&self, index: usize, width: u32, height: u32) {
+        let (w, h) = self.generation.dispctrlx_size();
+        let ctrl = self.reg(scaler_dispctrlx(index)) & !(w.mask() | h.mask());
+        self.set_reg(scaler_dispctrlx(index), ctrl | w.set(width) | h.set(height));
+    }
+
     /// One line about the channel's registers, for the log.
     pub fn describe(&self, index: usize) -> String {
         let stat = self.reg(scaler_dispstatx(index));
