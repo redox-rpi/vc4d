@@ -185,7 +185,16 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     // The BCM2711 compares and dumps read only (redox-rpi#671 step 2), now
     // that a channel is seen running: the HDMI block is clocked.
     if let (Some(edid), None, true, Some(fdt)) = (&edid, fake, vc5, fdt.as_ref()) {
-        mode::compare_bcm2711(fdt, edid);
+        let same = mode::compare_bcm2711(fdt, edid);
+        // Step 3: write the same mode (VC4D_MODE=write or /etc/vc4d-mode-write).
+        if env::var("VC4D_MODE").is_ok_and(|v| v == "write") || std::path::Path::new("/etc/vc4d-mode-write").exists() {
+            match same {
+                Some(same) => {
+                    mode::write_mode_bcm2711(fdt, &same);
+                }
+                None => println!("vc4d: mode5: write: skipped, the mode registers differ from the firmware's"),
+            }
+        }
     }
     println!(
         "vc4d: taking over channel {} at {}x{}",

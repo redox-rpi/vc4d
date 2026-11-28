@@ -56,7 +56,10 @@ one HVS channel running. vc4d takes that channel over:
   `VC4D_EDID=off` skips the read. On the Pi 4 and 400 the read is opt-in
   (`VC4D_EDID=on` or `/etc/vc4d-edid-on`, redox-rpi#671): HDMI0's own I2C
   controller (`ddc_stb.rs`), taken over from the firmware's auto-i2c
-  engine. It only logs the EDID; the firmware's mode stays.
+  engine. vc4d then compares pixel valve 2 and the HDMI0 timing it
+  computes for the preferred mode with the firmware's (two pixels per
+  clock, BCM2711 offsets; read only), and with `VC4D_MODE=write` or
+  `/etc/vc4d-mode-write` writes them itself when they match.
 - **Mode registers** (HVS4 boards). vc4d computes pixel valve 2 and the
   HDMI core's timing from the EDID, laid out as Linux `vc4_crtc.c` and
   `vc4_hdmi.c` do, and compares them with the firmware's. With
@@ -84,7 +87,8 @@ Environment (set by the bootloader) and files:
 | `VC4D_FAKE=WxH` | runs against an HVS in normal memory, for QEMU (no HVS there) |
 | `VC4D_LOG=1` | logs every display list and overlay placement (the first four lists always) |
 | `VC4D_FLIP=off`, `/etc/vc4d-flip-off` | no flips, direct scanout of the client buffer |
-| `VC4D_MODE=write` | writes pixel valve 2 and the HDMI timing itself (HVS4) |
+| `VC4D_MODE=write` | writes pixel valve 2 and the HDMI timing itself (HVS4; on the Pi 4 and 400 with the EDID read on) |
+| `/etc/vc4d-mode-write` | the same as `VC4D_MODE=write` (Pi 4 and 400) |
 | `VC4D_EDID=off` | no EDID read |
 | `VC4D_EDID=on`, `/etc/vc4d-edid-on` | EDID read on the Pi 4 and 400 (log only) |
 | `VC4D_CHECK=off` | no check before the handover |
