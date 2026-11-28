@@ -195,23 +195,24 @@ fn node_addr(fdt: &Fdt, compatible: &str, index: usize) -> Option<usize> {
 /// the words that hold the active width and height. Called only
 /// while the firmware's display runs (an HVS channel is enabled), so the
 /// HDMI block is clocked.
-pub fn compare_bcm2711(fdt: &Fdt, edid: &vc4_edid::Edid) {
+pub fn compare_bcm2711(fdt: &Fdt, edid: &vc4_edid::Edid) -> Option<Same> {
     let Some(t) = edid.preferred() else {
         println!("vc4d: mode5: no preferred mode in the EDID");
-        return;
+        return None;
     };
     let mode = format!("{}x{}@{}", t.hactive, t.vactive, t.refresh_mhz() / 1000);
     let pv_bus = node_addr(fdt, "brcm,bcm2711-pixelvalve2", 0).unwrap_or(PV2_BCM2711_BUS_ADDR);
-    let mut pv_same = false;
+    let mut pv_same = None;
     if let Some(regs) = map(Some(fdt), pv_bus, PV_SIZE, common::Prot::RO, "pixel valve 2") {
         let read = |offset: usize| unsafe { (regs as *const u32).add(offset / 4).read_volatile() };
         match vc4_mode::pv_bcm2711(t) {
             Ok(pv) => {
-                pv_same = log_regs("pv2(2711)", &pv.regs(), read);
+                let same = log_regs("pv2(2711)", &pv.regs(), read);
                 println!(
                     "vc4d: mode5: {}: pixel valve 2 for {mode} equals the firmware's",
-                    if pv_same { "PASS" } else { "DIFFERENT" }
+                    if same { "PASS" } else { "DIFFERENT" }
                 );
+                pv_same = same.then_some(pv);
             }
             Err(err) => println!("vc4d: mode5: preferred mode not supported: {err:?}"),
         }
@@ -220,21 +221,23 @@ pub fn compare_bcm2711(fdt: &Fdt, edid: &vc4_edid::Edid) {
     }
     let Some(hdmi_bus) = node_addr(fdt, "brcm,bcm2711-hdmi0", 0) else {
         println!("vc4d: mode5: no brcm,bcm2711-hdmi0 node");
-        return;
+        return None;
     };
     let phys = phys(Some(fdt), hdmi_bus);
     let base = phys & !0xfff;
-    let Some(page) = map(None, base, 0x1000, common::Prot::RO, "the HDMI0 core") else { return };
+    let Some(page) = map(None, base, 0x1000, common::Prot::RO, "the HDMI0 core") else { return None };
     let regs = unsafe { (page as *const u8).add(phys - base) } as *const u32;
     let read = |offset: usize| unsafe { regs.add(offset / 4).read_volatile() };
+    let mut result = None;
     if let Ok(h) = vc4_mode::hdmi_timing_bcm2711(t) {
         let same = log_regs("hdmi(2711)", &vc4_mode::hdmi_bcm2711_regs(&h), read);
         println!(
             "vc4d: mode5: {}: HDMI0 timing for {mode} equals the firmware's",
             if same { "PASS" } else { "DIFFERENT" }
         );
-        if same && pv_same {
+        if let (true, Some(pv)) = (same, pv_same) {
             println!("vc4d: mode5: PASS: pixel valve 2 and HDMI0 timing for {mode} equal the firmware's");
+            result = Some(Same { pv, hdmi: Some(h), timing: *t });
         }
     }
     for row in (0..0x300).step_by(0x20) {
@@ -252,4 +255,56 @@ pub fn compare_bcm2711(fdt: &Fdt, edid: &vc4_edid::Edid) {
         }
     }
     println!("vc4d: mode5: hdmi words holding the active size in bits 12:0: {}", hits.join(" "));
+    result
+}
+
+/// redox-rpi#671 step 3 (VC4D_MODE=write): programs the BCM2711's pixel
+/// valve 2 and HDMI0 timing with the values that compared equal to the
+/// firmware's, in Linux's order (video off, valve off, FIFO emptied, HDMI
+/// timing, valve timing, valve and video on), and reads them back. Same
+/// mode, so the monitor keeps its picture; the screen is blank for a few
+/// frames.
+pub fn write_mode_bcm2711(fdt: &Fdt, same: &Same) -> bool {
+    let Some(h) = same.hdmi else { return false };
+    let pv_bus = node_addr(fdt, "brcm,bcm2711-pixelvalve2", 0).unwrap_or(PV2_BCM2711_BUS_ADDR);
+    let Some(pv_regs) = map(Some(fdt), pv_bus, PV_SIZE, common::Prot::RW, "pixel valve 2") else { return false };
+    let Some(hdmi_bus) = node_addr(fdt, "brcm,bcm2711-hdmi0", 0) else { return false };
+    let phys = phys(Some(fdt), hdmi_bus);
+    let base = phys & !0xfff;
+    let Some(page) = map(None, base, 0x1000, common::Prot::RW, "the HDMI0 core") else { return false };
+    let hregs = unsafe { (page as *mut u8).add(phys - base) } as *mut u32;
+    let hdmi = vc4_mode::hdmi_bcm2711_regs(&h);
+    let frame_ms = 1_000_000 / u64::from(same.timing.refresh_mhz().max(1000)) + 1;
+    println!("vc4d: mode5: write: programming pixel valve 2 and the HDMI0 timing (screen blank for a moment)");
+    for step in vc4_mode::mode_program_regs(&same.pv, Some(&hdmi)) {
+        match step {
+            Step::Write(offset, _, value) => unsafe { pv_regs.add(offset / 4).write_volatile(value) },
+            Step::Hdmi(offset, _, value) => unsafe { hregs.add(offset / 4).write_volatile(value) },
+            Step::WaitFrames(n) => thread::sleep(Duration::from_millis(frame_ms * u64::from(n))),
+        }
+    }
+    let mut ok = true;
+    for (offset, name, value) in same.pv.regs() {
+        let got = unsafe { pv_regs.add(offset / 4).read_volatile() };
+        let want = value & vc4_mode::readback_mask(offset);
+        ok &= got == want;
+        println!(
+            "vc4d: mode5: write: pv2 {name:<9} wrote {value:#010x} reads {got:#010x}{}",
+            if got == want { "" } else { "  DIFFERENT" }
+        );
+    }
+    for (offset, name, value) in hdmi {
+        let got = unsafe { hregs.add(offset / 4).read_volatile() };
+        ok &= got == value;
+        println!(
+            "vc4d: mode5: write: hdmi {name:<9} wrote {value:#010x} reads {got:#010x}{}",
+            if got == value { "" } else { "  DIFFERENT" }
+        );
+    }
+    println!(
+        "vc4d: mode5: write: {}: pixel valve 2 and the HDMI0 timing {}",
+        if ok { "PASS" } else { "FAILED" },
+        if ok { "read back as written" } else { "read back differently" }
+    );
+    ok
 }

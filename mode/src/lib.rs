@@ -247,6 +247,12 @@ pub fn pv_program(pv: &Pv) -> Vec<Step> {
 /// vc4_hdmi_set_timings()), which runs before vc4_crtc_config_pv(). The
 /// encoder itself stays on; only its timing registers are written.
 pub fn mode_program(pv: &Pv, hdmi: Option<&HdmiTiming>) -> Vec<Step> {
+    mode_program_regs(pv, hdmi.map(|h| h.regs()).as_ref().map(|r| &r[..]))
+}
+
+/// As `mode_program`, with the HDMI timing registers given as (offset,
+/// name, value), for the BCM2711's offsets (`hdmi_bcm2711_regs`).
+pub fn mode_program_regs(pv: &Pv, hdmi: Option<&[(usize, &'static str, u32)]>) -> Vec<Step> {
     let off = pv.control & !PV_CONTROL_EN;
     let mut steps = vec![
         Step::Write(PV_V_CONTROL, "V_CONTROL", pv.v_control & !PV_VCONTROL_VIDEN),
@@ -255,7 +261,7 @@ pub fn mode_program(pv: &Pv, hdmi: Option<&HdmiTiming>) -> Vec<Step> {
         Step::Write(PV_CONTROL, "CONTROL", off | PV_CONTROL_FIFO_CLR),
     ];
     if let Some(hdmi) = hdmi {
-        steps.extend(hdmi.regs().iter().map(|&(offset, name, value)| Step::Hdmi(offset, name, value)));
+        steps.extend(hdmi.iter().map(|&(offset, name, value)| Step::Hdmi(offset, name, value)));
     }
     for (offset, name, value) in pv.regs() {
         if offset != PV_CONTROL && offset != PV_V_CONTROL {
@@ -337,6 +343,17 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(differences(&hdmi_bcm2711_regs(&h), firmware).is_empty());
+    }
+
+    #[test]
+    fn bcm2711_program_writes_hdmi0_offsets() {
+        let pv = pv_bcm2711(&P1080).unwrap();
+        let h = hdmi_bcm2711_regs(&hdmi_timing_bcm2711(&P1080).unwrap());
+        let steps = mode_program_regs(&pv, Some(&h));
+        let hdmi: Vec<usize> = steps.iter().filter_map(|s| match s { Step::Hdmi(o, _, _) => Some(*o), _ => None }).collect();
+        assert_eq!(hdmi, vec![0x0e4, 0x0e8, 0x0ec, 0x0f0, 0x0f4, 0x0f8]);
+        assert_eq!(steps.last(), Some(&Step::WaitFrames(2)));
+        assert!(steps.contains(&Step::Write(PV_CONTROL, "CONTROL", 0x0717_4001)));
     }
 
     fn firmware_hdmi(offset: usize) -> u32 {
