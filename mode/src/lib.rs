@@ -298,6 +298,198 @@ pub fn differences(
         .collect()
 }
 
+// BCM2711 HDMI PHY (redox-rpi#671 step 4). The PHY's PLL makes the TMDS
+// clock from the 54 MHz crystal; its settings follow Linux
+// vc4_hdmi_phy.c, vc5_hdmi_phy_init() (GPL-2.0, Broadcom), with the
+// register offsets of vc4_hdmi_regs.h's HDMI0 table.
+
+/// The crystal the PHY's PLL runs from.
+const PHY5_REF_HZ: u64 = 54_000_000;
+
+/// Register offsets in HDMI0's "phy" region.
+pub const PHY5_RESET_CTL: usize = 0x000;
+pub const PHY5_POWERDOWN_CTL: usize = 0x004;
+pub const PHY5_CTL_0: usize = 0x008;
+pub const PHY5_CTL_1: usize = 0x00c;
+pub const PHY5_CTL_2: usize = 0x010;
+pub const PHY5_CTL_3: usize = 0x014;
+pub const PHY5_PLL_CTL_0: usize = 0x01c;
+pub const PHY5_PLL_CTL_1: usize = 0x020;
+pub const PHY5_CLK_DIV: usize = 0x028;
+pub const PHY5_PLL_CFG: usize = 0x034;
+pub const PHY5_TMDS_CLK_WORD_SEL: usize = 0x044;
+pub const PHY5_CHANNEL_SWAP: usize = 0x04c;
+pub const PHY5_PLL_CAL_1: usize = 0x050;
+pub const PHY5_PLL_CAL_2: usize = 0x054;
+pub const PHY5_PLL_CAL_4: usize = 0x05c;
+/// Register offsets in HDMI0's "rm" region (the rate manager).
+pub const RM5_CONTROL: usize = 0x000;
+pub const RM5_OFFSET: usize = 0x018;
+pub const RM5_FORMAT: usize = 0x01c;
+
+/// The PHY and rate manager registers vc4d writes, (region, offset, name),
+/// for saving and restoring the firmware's values.
+pub const PHY5_REGS: [(Region, usize, &str); 18] = [
+    (Region::Phy, PHY5_RESET_CTL, "RESET_CTL"),
+    (Region::Phy, PHY5_POWERDOWN_CTL, "POWERDOWN"),
+    (Region::Phy, PHY5_CTL_0, "CTL_0"),
+    (Region::Phy, PHY5_CTL_1, "CTL_1"),
+    (Region::Phy, PHY5_CTL_2, "CTL_2"),
+    (Region::Phy, PHY5_CTL_3, "CTL_3"),
+    (Region::Phy, PHY5_PLL_CTL_0, "PLL_CTL_0"),
+    (Region::Phy, PHY5_PLL_CTL_1, "PLL_CTL_1"),
+    (Region::Phy, PHY5_CLK_DIV, "CLK_DIV"),
+    (Region::Phy, PHY5_PLL_CFG, "PLL_CFG"),
+    (Region::Phy, PHY5_TMDS_CLK_WORD_SEL, "WORD_SEL"),
+    (Region::Phy, PHY5_CHANNEL_SWAP, "CH_SWAP"),
+    (Region::Phy, PHY5_PLL_CAL_1, "PLL_CAL_1"),
+    (Region::Phy, PHY5_PLL_CAL_2, "PLL_CAL_2"),
+    (Region::Phy, PHY5_PLL_CAL_4, "PLL_CAL_4"),
+    (Region::Rm, RM5_CONTROL, "RM_CTL"),
+    (Region::Rm, RM5_OFFSET, "RM_OFFSET"),
+    (Region::Rm, RM5_FORMAT, "RM_FORMAT"),
+];
+
+/// Which of HDMI0's register regions a PHY step writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    Phy,
+    Rm,
+}
+
+/// One write of the PHY sequence: the register becomes
+/// `(old & !clear) | set`; `clear == !0` writes `set` as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhyStep {
+    pub region: Region,
+    pub offset: usize,
+    pub name: &'static str,
+    pub clear: u32,
+    pub set: u32,
+}
+
+impl PhyStep {
+    pub fn apply(&self, old: u32) -> u32 {
+        (old & !self.clear) | self.set
+    }
+}
+
+/// The PHY settings for one TMDS character rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Phy5 {
+    pub tmds_hz: u64,
+    pub vco_hz: u64,
+    pub vco_div: u32,
+    pub vco_sel: u32,
+    /// The rate manager's offset, 9.22 fixed point of vco / 2 / 54 MHz.
+    pub rm_offset: u32,
+    pub ctl0: u32,
+    /// CTL_1 bits 19:0 (resistor selection).
+    pub ctl1: u32,
+    pub ctl2: u32,
+    pub ctl3: u32,
+    pub word_sel: u32,
+}
+
+/// (pre-emphasis, main driver, resistor, termination) of the data lanes
+/// and of the clock lane, by TMDS rate (Linux vc5_hdmi_phy_settings).
+fn phy5_lanes(tmds_hz: u64) -> ([u32; 4], [u32; 4]) {
+    match tmds_hz {
+        0..=50_000_000 => ([0, 0x0a, 0x12, 0], [0, 0x0a, 0x18, 0]),
+        50_000_001..=165_000_000 => ([0, 0x09, 0x12, 0], [0, 0x0c, 0x18, 3]),
+        165_000_001..=250_000_000 => ([0, 0x0f, 0x12, 1], [0, 0x0c, 0x18, 3]),
+        250_000_001..=340_000_000 => ([2, 0x0d, 0x12, 1], [0, 0x0c, 0x18, 0xf]),
+        340_000_001..=450_000_000 => ([0, 0x1b, 0x12, 0xf], [0, 0x0a, 0x12, 0xf]),
+        _ => ([0, 0x1c, 0x12, 0xf], [0, 0x0b, 0x13, 0xf]),
+    }
+}
+
+/// The PHY settings for `tmds_hz` (8 bits per colour: the pixel clock).
+pub fn phy5(tmds_hz: u64) -> Phy5 {
+    let mut vco_div = 0u32;
+    let mut vco_hz = tmds_hz;
+    while vco_hz < 3_000_000_000 {
+        vco_div += 1;
+        vco_hz = tmds_hz * u64::from(vco_div) * 10;
+    }
+    let vco_sel = u32::from(vco_hz > 4_500_000_000);
+    let cp = if vco_hz < 3_700_000_000 { 0x1c } else { 0x18 };
+    let gain = match vco_hz {
+        0..3_350_000_000 => 0xf,
+        3_350_000_000..3_700_000_000 => 0xc,
+        3_700_000_000..4_050_000_000 => 0x6,
+        4_050_000_000..4_800_000_000 => 0x5,
+        4_800_000_000..5_200_000_000 => 0x7,
+        _ => 0x2,
+    };
+    let rm_offset = ((((vco_hz * 2) << 22) / PHY5_REF_HZ) >> 2) as u32 & 0x7fff_ffff;
+    // HDMI0's lanes are not swapped: lane n is channel n, the clock lane 3.
+    let (d, c) = phy5_lanes(tmds_hz);
+    let ctl0 = d[0] << 13 | d[1] << 8 | d[0] << 21 | d[1] << 16 | d[0] << 29 | d[1] << 24 | c[0] << 5 | c[1];
+    let ctl1 = d[2] << 5 | d[2] << 10 | d[2] << 15 | c[2];
+    let ctl2 = d[3] << 4 | d[3] << 8 | d[3] << 12 | c[3] | gain << 16;
+    let ctl3 = cp | 1 << 8 | 1 << 10 | 3 << 6 | 4 << 17 | 6 << 12;
+    let word_sel = if tmds_hz >= 340_000_000 { 3 } else { 0 };
+    Phy5 { tmds_hz, vco_hz, vco_div, vco_sel, rm_offset, ctl0, ctl1, ctl2, ctl3, word_sel }
+}
+
+const fn w(region: Region, offset: usize, name: &'static str, set: u32) -> PhyStep {
+    PhyStep { region, offset, name, clear: !0, set }
+}
+const fn m(region: Region, offset: usize, name: &'static str, clear: u32, set: u32) -> PhyStep {
+    PhyStep { region, offset, name, clear, set }
+}
+
+/// The PHY's reset bits: PLL, PLL divider, then the clock and data lanes.
+const PHY5_RESET_PLL: u32 = 1 << 5 | 1 << 4;
+const PHY5_RESET_LANES: u32 = 0xf;
+
+/// The writes that bring the PHY up at `p`'s rate, in the order of
+/// vc5_hdmi_phy_init(): PHY in reset, lanes out of reset, rate manager
+/// and PLL settings, lane drive, then the PLL out of reset. Fields Linux
+/// ORs into a register it expects at reset are cleared first, since the
+/// firmware has set them already.
+pub fn phy5_program(p: &Phy5) -> Vec<PhyStep> {
+    use Region::{Phy, Rm};
+    vec![
+        w(Phy, PHY5_RESET_CTL, "RESET_CTL", 0x0f),
+        w(Phy, PHY5_POWERDOWN_CTL, "POWERDOWN", 1 << 10),
+        w(Phy, PHY5_POWERDOWN_CTL, "POWERDOWN", 1 << 4),
+        m(Phy, PHY5_RESET_CTL, "RESET_CTL", PHY5_RESET_LANES, 0),
+        m(Rm, RM5_CONTROL, "RM_CTL", 0, 1 << 19 | 1 << 17 | 1 << 4),
+        m(Phy, PHY5_PLL_CAL_1, "PLL_CAL_1", 0x0fff_ffff, 0),
+        m(Phy, PHY5_PLL_CAL_2, "PLL_CAL_2", 0x0fff_ffff, 0),
+        w(Rm, RM5_OFFSET, "RM_OFFSET", p.rm_offset | 1 << 31),
+        w(Phy, PHY5_CLK_DIV, "CLK_DIV", p.vco_div << 8),
+        w(Phy, PHY5_PLL_CAL_4, "PLL_CAL_4", 0xe14 << 16 | 0xe147),
+        w(Phy, PHY5_PLL_CTL_0, "PLL_CTL_0", 1 << 5 | 1 << 6 | 1 << 13 | p.vco_sel << 9),
+        m(Phy, PHY5_PLL_CTL_1, "PLL_CTL_1", 0x0fff_f800, 0x8a << 16 | 1 << 14 | 1 << 13 | 3 << 11),
+        m(Rm, RM5_FORMAT, "RM_FORMAT", 3 << 24, 2 << 24),
+        m(Phy, PHY5_PLL_CFG, "PLL_CFG", 0xf, 1),
+        w(Phy, PHY5_TMDS_CLK_WORD_SEL, "WORD_SEL", p.word_sel),
+        w(Phy, PHY5_CTL_3, "CTL_3", p.ctl3),
+        w(Phy, PHY5_CTL_0, "CTL_0", p.ctl0),
+        m(Phy, PHY5_CTL_1, "CTL_1", 0x000f_ffff, p.ctl1),
+        w(Phy, PHY5_CTL_2, "CTL_2", p.ctl2),
+        w(Phy, PHY5_CHANNEL_SWAP, "CH_SWAP", 3 << 12 | 2 << 8 | 1 << 4),
+        m(Phy, PHY5_RESET_CTL, "RESET_CTL", PHY5_RESET_PLL, 0),
+        m(Phy, PHY5_RESET_CTL, "RESET_CTL", 0, PHY5_RESET_PLL),
+    ]
+}
+
+/// What the PHY and rate manager registers hold after `phy5_program`
+/// from `old` (region, offset) values: for comparing with the firmware's.
+pub fn phy5_result(p: &Phy5, old: impl Fn(Region, usize) -> u32) -> Vec<(Region, usize, &'static str, u32)> {
+    let mut regs: Vec<(Region, usize, &'static str, u32)> =
+        PHY5_REGS.iter().map(|&(r, o, n)| (r, o, n, old(r, o))).collect();
+    for step in phy5_program(p) {
+        if let Some(reg) = regs.iter_mut().find(|(r, o, ..)| *r == step.region && *o == step.offset) {
+            reg.3 = step.apply(reg.3);
+        }
+    }
+    regs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,4 +685,53 @@ mod tests {
     /// The test monitor's EDID (Pi test row 387), the same bytes as the
     /// vc4-edid test.
     const NANOKVM: [u8; 256] = include!("../../edid/tests/nanokvm.in");
+
+    #[test]
+    fn phy5_720p_and_1080p() {
+        let p = phy5(74_250_000);
+        assert_eq!((p.vco_div, p.vco_hz, p.vco_sel), (5, 3_712_500_000, 0));
+        assert_eq!(p.rm_offset, 0x0898_0000, "137.5 in 9.22, shifted by 2");
+        assert_eq!((p.ctl0, p.ctl1, p.ctl2, p.ctl3), (0x0909_090c, 0x0009_4a58, 0x0006_0003, 0x0008_65d8));
+        let q = phy5(148_500_000);
+        assert_eq!((q.vco_div, q.vco_hz, q.vco_sel), (3, 4_455_000_000, 0));
+        assert_eq!(q.rm_offset, 0x0a50_0000);
+        assert_eq!((q.ctl0, q.ctl2, q.ctl3 & 0x3f), (0x0909_090c, 0x0005_0003, 0x18));
+        assert_eq!(phy5(297_000_000).word_sel, 0);
+        assert_eq!(phy5(594_000_000).word_sel, 3);
+    }
+
+    #[test]
+    fn phy5_program_ends_with_the_pll_out_of_reset() {
+        let p = phy5(74_250_000);
+        let steps = phy5_program(&p);
+        assert_eq!(steps[0].set, 0x0f);
+        let last = steps.last().unwrap();
+        assert_eq!((last.offset, last.clear, last.set), (PHY5_RESET_CTL, 0, 0x30));
+        let regs = phy5_result(&p, |_, _| 0xffff_ffff);
+        let get = |o| regs.iter().find(|r| r.0 == Region::Phy && r.1 == o).unwrap().3;
+        assert_eq!(get(PHY5_RESET_CTL), 0x30, "lanes out of reset, PLL running");
+        assert_eq!(get(PHY5_CLK_DIV), 5 << 8);
+        assert_eq!(get(PHY5_CTL_1), 0xfff0_0000 | 0x0009_4a58);
+        assert_eq!(get(PHY5_PLL_CTL_1) & 0x0fff_f800, 0x008a_7800);
+        assert_eq!(get(PHY5_PLL_CAL_1), 0xf000_0000);
+        let rm = regs.iter().find(|r| r.0 == Region::Rm && r.1 == RM5_OFFSET).unwrap().3;
+        assert_eq!(rm, 0x8898_0000);
+    }
+
+    /// CEA-861 VIC 4, 1280x720 at 60 Hz.
+    const P720: Timing = Timing {
+        pixel_khz: 74_250, hactive: 1280, hfp: 110, hsync: 40, hbp: 220,
+        vactive: 720, vfp: 5, vsync: 5, vbp: 20,
+        hsync_positive: true, vsync_positive: true, interlaced: false,
+    };
+
+    #[test]
+    fn bcm2711_720p() {
+        let pv = pv_bcm2711(&P720).unwrap();
+        assert_eq!((pv.horza, pv.horzb), (110 << 16 | 20, 55 << 16 | 640));
+        assert_eq!((pv.verta, pv.vertb), (20 << 16 | 5, 5 << 16 | 720));
+        let h = hdmi_timing_bcm2711(&P720).unwrap();
+        assert_eq!(h.horza, 110 << 16 | 1 << 15 | 1 << 14 | 1280);
+        assert_eq!(h.verta0, 5 << 24 | 5 << 16 | 720);
+    }
 }
