@@ -131,6 +131,26 @@ pub fn pv2(t: &Timing) -> Result<Pv, Error> {
     })
 }
 
+/// Pixel valve 2 (HDMI0) on the BCM2711, as a first guess for the
+/// read-only comparison of redox-rpi#671 step 2: the BCM2711's HDMI pixel
+/// valves take two pixels per clock, so every horizontal value is halved
+/// (Linux vc4_crtc.c divides by `pixels_per_clock`). CONTROL and V_CONTROL
+/// keep the BCM283x layout here; the comparison shows where the BCM2711
+/// differs.
+pub fn pv_bcm2711(t: &Timing) -> Result<Pv, Error> {
+    let mut pv = pv2(t)?;
+    let half = |name, v: u32| -> Result<u32, Error> {
+        if v % 2 != 0 {
+            Err(Error::TooWide(name, v))
+        } else {
+            field(name, v / 2, 16)
+        }
+    };
+    pv.horza = half("hbp", t.hbp)? << 16 | half("hsync", t.hsync)?;
+    pv.horzb = half("hfp", t.hfp)? << 16 | half("hactive", t.hactive)?;
+    Ok(pv)
+}
+
 /// The interlace bit of PV_V_CONTROL, for readers that decode it.
 pub const fn pv_interlaced(v_control: u32) -> bool {
     v_control & PV_VCONTROL_INTERLACE != 0
@@ -247,6 +267,15 @@ mod tests {
             0x18 => 0x0004_0438,
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn bcm2711_halves_horizontal() {
+        let pv = pv_bcm2711(&P1080).unwrap();
+        assert_eq!(pv.horza, 74 << 16 | 22);
+        assert_eq!(pv.horzb, 44 << 16 | 960);
+        assert_eq!(pv.verta, pv2(&P1080).unwrap().verta);
+        assert_eq!(pv.vertb, pv2(&P1080).unwrap().vertb);
     }
 
     fn firmware_hdmi(offset: usize) -> u32 {

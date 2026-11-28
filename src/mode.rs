@@ -180,3 +180,66 @@ pub fn write_mode(fdt: Option<&Fdt>, same: &Same) -> bool {
     }
     ok
 }
+
+/// Pixel valve 2 (HDMI0) on the BCM2711, if the devicetree has none.
+const PV2_BCM2711_BUS_ADDR: usize = 0x7e20_a000;
+
+fn node_addr(fdt: &Fdt, compatible: &str, index: usize) -> Option<usize> {
+    let node = fdt.find_compatible(&[compatible])?;
+    Some(node.reg()?.nth(index)?.starting_address as usize)
+}
+
+/// redox-rpi#671 step 2, read only: pixel valve 2 (HDMI0) as vc4d would
+/// compute it for the EDID's preferred mode, next to the firmware's, and a
+/// dump of the HDMI0 core's "hdmi" registers. The BCM2711's layouts are
+/// not documented; the log shows where they differ from the BCM283x's and
+/// which HDMI registers hold the active width and height. Called only
+/// while the firmware's display runs (an HVS channel is enabled), so the
+/// HDMI block is clocked.
+pub fn compare_bcm2711(fdt: &Fdt, edid: &vc4_edid::Edid) {
+    let Some(t) = edid.preferred() else {
+        println!("vc4d: mode5: no preferred mode in the EDID");
+        return;
+    };
+    let mode = format!("{}x{}@{}", t.hactive, t.vactive, t.refresh_mhz() / 1000);
+    let pv_bus = node_addr(fdt, "brcm,bcm2711-pixelvalve2", 0).unwrap_or(PV2_BCM2711_BUS_ADDR);
+    if let Some(regs) = map(Some(fdt), pv_bus, PV_SIZE, common::Prot::RO, "pixel valve 2") {
+        let read = |offset: usize| unsafe { (regs as *const u32).add(offset / 4).read_volatile() };
+        match vc4_mode::pv_bcm2711(t) {
+            Ok(pv) => {
+                let same = log_regs("pv2(2711)", &pv.regs(), read);
+                println!(
+                    "vc4d: mode5: {}: pixel valve 2 for {mode} (two pixels per clock)",
+                    if same { "PASS" } else { "DIFFERENT" }
+                );
+            }
+            Err(err) => println!("vc4d: mode5: preferred mode not supported: {err:?}"),
+        }
+        let words: Vec<String> = (0..0x40).step_by(4).map(|o| format!("{:08x}", read(o))).collect();
+        println!("vc4d: mode5: pv2 raw 00-3c: {}", words.join(" "));
+    }
+    let Some(hdmi_bus) = node_addr(fdt, "brcm,bcm2711-hdmi0", 0) else {
+        println!("vc4d: mode5: no brcm,bcm2711-hdmi0 node");
+        return;
+    };
+    let phys = phys(Some(fdt), hdmi_bus);
+    let base = phys & !0xfff;
+    let Some(page) = map(None, base, 0x1000, common::Prot::RO, "the HDMI0 core") else { return };
+    let regs = unsafe { (page as *const u8).add(phys - base) } as *const u32;
+    let read = |offset: usize| unsafe { regs.add(offset / 4).read_volatile() };
+    for row in (0..0x300).step_by(0x20) {
+        let words: Vec<String> = (row..row + 0x20).step_by(4).map(|o| format!("{:08x}", read(o))).collect();
+        println!("vc4d: mode5: hdmi {row:03x}: {}", words.join(" "));
+    }
+    let mut hits = Vec::new();
+    for offset in (0..0x300).step_by(4) {
+        let v = read(offset);
+        if v & 0x1fff == t.hactive {
+            hits.push(format!("{offset:#05x}={v:#010x}(hactive)"));
+        }
+        if v & 0x1fff == t.vactive {
+            hits.push(format!("{offset:#05x}={v:#010x}(vactive)"));
+        }
+    }
+    println!("vc4d: mode5: hdmi words holding the active size in bits 12:0: {}", hits.join(" "));
+}
