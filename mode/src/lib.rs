@@ -131,6 +131,74 @@ pub fn pv2(t: &Timing) -> Result<Pv, Error> {
     })
 }
 
+// BCM2711 (Pi 4, Pi 400), redox-rpi#671. The layouts below are read from
+// what Broadcom's firmware programs at 1080p60 (pi-tests Test 701,
+// HP 27 FHD on HDMI0) and agree with Linux vc4_crtc.c and vc4_hdmi.c's
+// BCM2711 paths; the code is our own.
+
+/// Bytes in the BCM2711's pixel valve 2 FIFO (HDMI0): the firmware's FIFO
+/// level is 238 = 256 - 3 * 6.
+const PV2_BCM2711_FIFO_BYTES: u32 = 256;
+/// The FIFO level's two high bits (BCM2711 pixel valves).
+const PV5_CONTROL_FIFO_LEVEL_HIGH_SHIFT: u32 = 25;
+/// Set by the firmware on HDMI0's valve; its meaning is not confirmed.
+const PV5_CONTROL_BIT24: u32 = 1 << 24;
+
+/// Pixel valve 2 (HDMI0) on the BCM2711. The valve takes two pixels per
+/// clock, so every horizontal value is halved (Linux divides by
+/// `pixels_per_clock`). CONTROL: 24-bit pixels, the FIFO level split over
+/// bits 20:15 and 26:25, clear at start, bit 24 as the firmware sets it,
+/// enabled; no WAIT_HSTART or TRIGGER_UNDERFLOW and clock select 0, as the
+/// firmware leaves them.
+pub fn pv_bcm2711(t: &Timing) -> Result<Pv, Error> {
+    let mut pv = pv2(t)?;
+    let half = |name, v: u32| -> Result<u32, Error> {
+        if v % 2 != 0 {
+            Err(Error::TooWide(name, v))
+        } else {
+            field(name, v / 2, 16)
+        }
+    };
+    pv.horza = half("hbp", t.hbp)? << 16 | half("hsync", t.hsync)?;
+    pv.horzb = half("hfp", t.hfp)? << 16 | half("hactive", t.hactive)?;
+    let level = PV2_BCM2711_FIFO_BYTES - 3 * HVS_FIFO_LATENCY_PIX;
+    pv.control = PV_CONTROL_FORMAT_24
+        | (level & 0x3f) << PV_CONTROL_FIFO_LEVEL_SHIFT
+        | (level >> 6) << PV5_CONTROL_FIFO_LEVEL_HIGH_SHIFT
+        | PV5_CONTROL_BIT24
+        | PV_CONTROL_CLR_AT_START
+        | PV_CONTROL_EN;
+    Ok(pv)
+}
+
+/// HDMI0 core timing registers on the BCM2711 (offsets in its "hdmi"
+/// region). Full pixel values, not halved.
+pub fn hdmi_timing_bcm2711(t: &Timing) -> Result<HdmiTiming, Error> {
+    if t.interlaced {
+        return Err(Error::Interlaced);
+    }
+    let horza = field("hfp", t.hfp, 16)? << 16
+        | if t.hsync_positive { 1 << 15 } else { 0 }
+        | if t.vsync_positive { 1 << 14 } else { 0 }
+        | field("hactive", t.hactive, 13)?;
+    let horzb = field("hbp", t.hbp, 16)? << 16 | field("hsync", t.hsync, 16)?;
+    let verta = field("vsync", t.vsync, 8)? << 24 | field("vfp", t.vfp, 8)? << 16 | field("vactive", t.vactive, 13)?;
+    let vertb = field("vbp", t.vbp, 16)?;
+    Ok(HdmiTiming { horza, horzb, verta0: verta, vertb0: vertb, verta1: verta, vertb1: vertb })
+}
+
+/// The BCM2711 HDMI0 timing registers: (offset, name, value).
+pub fn hdmi_bcm2711_regs(h: &HdmiTiming) -> [(usize, &'static str, u32); 6] {
+    [
+        (0x0e4, "HORZA", h.horza),
+        (0x0e8, "HORZB", h.horzb),
+        (0x0ec, "VERTA0", h.verta0),
+        (0x0f0, "VERTB0", h.vertb0),
+        (0x0f4, "VERTA1", h.verta1),
+        (0x0f8, "VERTB1", h.vertb1),
+    ]
+}
+
 /// The interlace bit of PV_V_CONTROL, for readers that decode it.
 pub const fn pv_interlaced(v_control: u32) -> bool {
     v_control & PV_VCONTROL_INTERLACE != 0
@@ -247,6 +315,28 @@ mod tests {
             0x18 => 0x0004_0438,
             _ => unreachable!(),
         }
+    }
+
+    /// What the firmware left in the BCM2711's pixel valve 2 and HDMI0
+    /// core at 1080p60 (pi-tests Test 701).
+    #[test]
+    fn bcm2711_equals_firmware_1080p() {
+        let pv = pv_bcm2711(&P1080).unwrap();
+        assert_eq!(pv.control, 0x0717_4001);
+        assert_eq!(pv.v_control, 0x0000_0003);
+        assert_eq!(pv.horza, 0x004a_0016);
+        assert_eq!(pv.horzb, 0x002c_03c0);
+        assert_eq!(pv.verta, 0x0024_0005);
+        assert_eq!(pv.vertb, 0x0004_0438);
+        let h = hdmi_timing_bcm2711(&P1080).unwrap();
+        let firmware = |o| match o {
+            0x0e4 => 0x0058_c780,
+            0x0e8 => 0x0094_002c,
+            0x0ec | 0x0f4 => 0x0504_0438,
+            0x0f0 | 0x0f8 => 0x0000_0024,
+            _ => unreachable!(),
+        };
+        assert!(differences(&hdmi_bcm2711_regs(&h), firmware).is_empty());
     }
 
     fn firmware_hdmi(offset: usize) -> u32 {
