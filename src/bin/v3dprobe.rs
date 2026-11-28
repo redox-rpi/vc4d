@@ -436,6 +436,26 @@ fn ioctl_check(loops: u32) -> Result<String, String> {
     let param = |v3d: &mut client::Client, param: u32| {
         call(v3d, GET_PARAM, &GetParam { param, ..Default::default() }, &[]).map(|p| p.value)
     };
+    // What libdrm's drmGetVersion does: lengths first, then the strings.
+    let version = |v3d: &mut client::Client, lens: [u64; 3]| -> Result<(Version, Vec<u8>), syscall::Error> {
+        let arg = Version { name_len: lens[0], date_len: lens[1], desc_len: lens[2], ..Default::default() };
+        let mut buf = bytes(&arg, &[]);
+        buf.resize(buf.len() + lens.iter().sum::<u64>() as usize, 0);
+        v3d.ioctl(VERSION, &mut buf)?;
+        let (got, rest) = read::<Version>(&buf).expect("short reply");
+        Ok((got, rest.to_vec()))
+    };
+    let (lens, _) = version(&mut v3d, [0; 3]).map_err(|e| format!("VERSION: {e}"))?;
+    let (got, strings) = version(&mut v3d, [lens.name_len, lens.date_len, lens.desc_len])
+        .map_err(|e| format!("VERSION with buffers: {e}"))?;
+    let name = String::from_utf8_lossy(&strings[..got.name_len as usize]).into_owned();
+    if name != DRIVER_NAME || got.version_major != 1 {
+        return Err(format!("VERSION: name {name:?}, version {}.{}", got.version_major, got.version_minor));
+    }
+    let cap = call(&mut v3d, GET_CAP, &GetCap { capability: CAP_SYNCOBJ, value: 0 }, &[]).map_err(|e| format!("GET_CAP: {e}"))?;
+    if cap.value != 1 {
+        return Err(format!("GET_CAP SYNCOBJ: {}", cap.value));
+    }
     let ident1 = param(&mut v3d, PARAM_HUB_IDENT1).map_err(|e| format!("GET_PARAM: {e}"))?;
     if ident1 == 0 || param(&mut v3d, PARAM_SUPPORTS_CSD).ok() != Some(1) {
         return Err(format!("GET_PARAM: HUB_IDENT1 {ident1:#x}, SUPPORTS_CSD not 1"));
@@ -567,8 +587,13 @@ fn ioctl_check(loops: u32) -> Result<String, String> {
         call(&mut v3d, GEM_CLOSE, &GemClose { handle: code.id, ..Default::default() }, &[]).map(|_| ()),
         syscall::ENOENT,
     )?;
+    let path = if client::LIBC.load(std::sync::atomic::Ordering::Relaxed) {
+        "relibc ioctl() on /dev/dri/renderD128"
+    } else {
+        "scheme calls on /scheme/v3d"
+    };
     Ok(format!(
-        "HUB_IDENT1 {ident1:#x}; {loops} of {loops} jobs right, {us} us per job round trip; wrong arguments refused; syncobjs signalled, reset and waited on; endless job: ETIME, then signalled after {waited} ms and EIO"
+        "{path}: driver {name:?}, HUB_IDENT1 {ident1:#x}; {loops} of {loops} jobs right, {us} us per job round trip; wrong arguments refused; syncobjs signalled, reset and waited on; endless job: ETIME, then signalled after {waited} ms and EIO"
     ))
 }
 

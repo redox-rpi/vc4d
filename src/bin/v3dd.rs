@@ -1523,6 +1523,47 @@ impl V3dScheme {
         };
         let einval = || Error::new(EINVAL);
         match func {
+            uapi::VERSION => {
+                let (mut arg, _) = uapi::read::<uapi::Version>(payload).ok_or_else(einval)?;
+                let fixed = size_of::<uapi::Version>();
+                let texts = [uapi::DRIVER_NAME, uapi::DRIVER_DATE, uapi::DRIVER_DESC];
+                uapi::put_strings(&mut payload[fixed..], &[arg.name_len, arg.date_len, arg.desc_len], &texts)
+                    .ok_or_else(einval)?;
+                (arg.version_major, arg.version_minor, arg.version_patchlevel) = (1, 0, 0);
+                (arg.name_len, arg.date_len, arg.desc_len) = (texts[0].len() as u64, texts[1].len() as u64, texts[2].len() as u64);
+                uapi::write(payload, &arg);
+                Ok(0)
+            }
+            uapi::GET_UNIQUE => {
+                let (mut arg, _) = uapi::read::<uapi::Unique>(payload).ok_or_else(einval)?;
+                let fixed = size_of::<uapi::Unique>();
+                uapi::put_strings(&mut payload[fixed..], &[arg.unique_len], &[uapi::DRIVER_NAME]).ok_or_else(einval)?;
+                arg.unique_len = uapi::DRIVER_NAME.len() as u64;
+                uapi::write(payload, &arg);
+                Ok(0)
+            }
+            uapi::SET_VERSION => {
+                // Interface 1.4 as Linux answers; the driver version is
+                // only checked, it does not change anything.
+                let (mut arg, _) = uapi::read::<uapi::SetVersion>(payload).ok_or_else(einval)?;
+                if arg.di_major > 1 || (arg.di_major == 1 && arg.di_minor > 4) || arg.dd_major > 1 {
+                    return Err(einval());
+                }
+                arg = uapi::SetVersion { di_major: 1, di_minor: 4, dd_major: 1, dd_minor: 0 };
+                uapi::write(payload, &arg);
+                Ok(0)
+            }
+            uapi::GET_CAP => {
+                let (mut arg, _) = uapi::read::<uapi::GetCap>(payload).ok_or_else(einval)?;
+                arg.value = match arg.capability {
+                    uapi::CAP_SYNCOBJ => 1,
+                    // No dumb buffers, PRIME, timelines or the rest.
+                    1..=uapi::CAP_SYNCOBJ_TIMELINE => 0,
+                    _ => return Err(einval()),
+                };
+                uapi::write(payload, &arg);
+                Ok(0)
+            }
             uapi::CREATE_BO => {
                 let (mut arg, _) = uapi::read::<uapi::CreateBo>(payload).ok_or_else(einval)?;
                 if arg.flags != 0 || arg.size == 0 || arg.size as usize > BO_MAX {

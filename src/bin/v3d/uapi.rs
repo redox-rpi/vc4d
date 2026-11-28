@@ -13,6 +13,12 @@
 // Mesa's v3d driver also needs DRM sync objects (G3 step 2): v3dd keeps
 // them per file, next to the BOs.
 
+// Core DRM ioctls, so libdrm (drmGetVersion, drmGetCap) and Mesa's
+// loader see a "v3d" device (G3 step 3).
+pub const VERSION: u64 = 0x00;
+pub const GET_UNIQUE: u64 = 0x01;
+pub const SET_VERSION: u64 = 0x07;
+pub const GET_CAP: u64 = 0x0C;
 pub const GEM_CLOSE: u64 = 0x09;
 pub const SUBMIT_CL: u64 = 0x40;
 pub const WAIT_BO: u64 = 0x41;
@@ -124,6 +130,69 @@ pub struct SubmitCsd {
     pub extensions: u64,
     pub flags: u32,
     pub pad: u32,
+}
+
+/// The device as Linux's v3d driver names it.
+pub const DRIVER_NAME: &str = "v3d";
+pub const DRIVER_DATE: &str = "20180419";
+pub const DRIVER_DESC: &str = "Broadcom V3D graphics";
+
+/// DRM_CAP_SYNCOBJ; capabilities up to DRM_CAP_SYNCOBJ_TIMELINE are known.
+pub const CAP_SYNCOBJ: u64 = 0x13;
+pub const CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
+
+/// struct drm_version without its three string pointers (`pad0` is the
+/// alignment gap before `name_len`); then the name, date and description
+/// buffers, each as long as its length said on the way in.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Version {
+    pub version_major: i32,
+    pub version_minor: i32,
+    pub version_patchlevel: i32,
+    pub pad0: i32,
+    pub name_len: u64,
+    pub date_len: u64,
+    pub desc_len: u64,
+}
+
+/// struct drm_unique without its pointer; then the buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Unique {
+    pub unique_len: u64,
+}
+
+/// struct drm_set_version.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SetVersion {
+    pub di_major: i32,
+    pub di_minor: i32,
+    pub dd_major: i32,
+    pub dd_minor: i32,
+}
+
+/// struct drm_get_cap.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GetCap {
+    pub capability: u64,
+    pub value: u64,
+}
+
+/// Copies `text` into the buffers after a fixed part, as far as each
+/// buffer goes, as Linux does for drm_version and drm_unique.
+pub fn put_strings(rest: &mut [u8], lens: &[u64], texts: &[&str]) -> Option<()> {
+    let mut at: usize = 0;
+    for (&len, text) in lens.iter().zip(texts) {
+        let len = usize::try_from(len).ok()?;
+        let buf = rest.get_mut(at..at.checked_add(len)?)?;
+        let n = len.min(text.len());
+        buf[..n].copy_from_slice(&text.as_bytes()[..n]);
+        at += len;
+    }
+    (at == rest.len()).then_some(())
 }
 
 /// struct drm_syncobj_create.
