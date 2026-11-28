@@ -44,6 +44,7 @@ use crate::hvs::{Gen, Hvs, CHANNELS, HVS_BUS_ADDR};
 mod adapter;
 mod check;
 mod ddc;
+mod ddc_stb;
 mod irqprobe;
 mod vblank;
 mod mode;
@@ -94,13 +95,21 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     let dtb = std::fs::read("/scheme/kernel.dtb").unwrap_or_default();
     let fdt = Fdt::new(&dtb).ok();
     let generation = fdt.as_ref().map_or(Gen::Vc4, hvs_generation);
-    if generation == Gen::Vc5 {
-        println!("vc4d: BCM2711, HVS5: the firmware's mode, no EDID and no mode registers (HDMI is not the BCM2835's)");
+    // On the BCM2711 the EDID read is opt-in (VC4D_EDID=on, redox-rpi#671
+    // step 1): it takes the DDC bus from the firmware's auto-i2c engine.
+    let vc5 = generation == Gen::Vc5;
+    let edid_on =
+        env::var("VC4D_EDID").is_ok_and(|v| v == "on") || std::path::Path::new("/etc/vc4d-edid-on").exists();
+    if vc5 {
+        println!(
+            "vc4d: BCM2711, HVS5: the firmware's mode, no mode registers{}",
+            if edid_on { "" } else { ", no EDID (VC4D_EDID=on or /etc/vc4d-edid-on reads it)" }
+        );
     }
-    let edid = if env::var("VC4D_EDID").is_ok_and(|v| v == "off") || generation == Gen::Vc5 {
+    let edid = if env::var("VC4D_EDID").is_ok_and(|v| v == "off") || (vc5 && !edid_on) {
         None
     } else {
-        ddc::log_edid(fdt.as_ref())
+        ddc::log_edid(fdt.as_ref(), vc5)
     };
     let bus_addr = fdt
         .as_ref()
@@ -138,7 +147,8 @@ fn daemon(daemon: daemon::Daemon) -> ! {
     }
     // The firmware's display runs: compare its pixel valve 2 with what
     // vc4d would write for the EDID's preferred mode (read only).
-    if let (Some(edid), None) = (&edid, fake) {
+    // The mode registers are the BCM283x's; the BCM2711 only logs its EDID.
+    if let (Some(edid), None, false) = (&edid, fake, vc5) {
         let same = mode::compare(fdt.as_ref(), edid);
         if env::var("VC4D_MODE").is_ok_and(|v| v == "write") {
             match same {

@@ -148,6 +148,41 @@ impl Ddc {
     }
 }
 
+/// The DDC controller of the SoC: the BCM283x's BSC2, or the BCM2711's
+/// HDMI I2C controller (ddc_stb.rs).
+enum Bus {
+    Bsc(Ddc),
+    Stb(crate::ddc_stb::StbDdc),
+}
+
+impl Bus {
+    fn open(fdt: Option<&Fdt>, vc5: bool) -> Result<Bus, String> {
+        if vc5 {
+            let fdt = fdt.ok_or("no devicetree, so no BCM2711 DDC controller")?;
+            return crate::ddc_stb::StbDdc::open(fdt).map(Bus::Stb);
+        }
+        Ddc::open(fdt).map(Bus::Bsc)
+    }
+
+    fn log_where(&self) {
+        match self {
+            Bus::Bsc(ddc) => println!("vc4d: edid: DDC controller at {:#x}", ddc.phys),
+            Bus::Stb(ddc) => println!(
+                "vc4d: edid: BCM2711 HDMI0 DDC controller at {:#x}, auto-i2c {}",
+                ddc.phys,
+                ddc.auto_phys.map_or("none".to_string(), |a| format!("at {a:#x}, released"))
+            ),
+        }
+    }
+
+    fn read_edid(&self, offset: u8, buf: &mut [u8]) -> Result<(), String> {
+        match self {
+            Bus::Bsc(ddc) => ddc.read_edid(offset, buf),
+            Bus::Stb(ddc) => ddc.read_edid(offset, buf),
+        }
+    }
+}
+
 /// The bus address of the controller in the hdmi node's `ddc` property.
 fn ddc_bus_addr(fdt: &Fdt) -> Option<usize> {
     let hdmi = fdt.find_compatible(&["brcm,bcm2835-hdmi"])?;
@@ -159,15 +194,15 @@ fn ddc_bus_addr(fdt: &Fdt) -> Option<usize> {
 /// Reads the EDID (base block and the first extension, if there is one)
 /// and logs what the monitor says it can show, with the raw bytes.
 /// Returns the EDID when it parsed.
-pub fn log_edid(fdt: Option<&Fdt>) -> Option<vc4_edid::Edid> {
-    let ddc = match Ddc::open(fdt) {
+pub fn log_edid(fdt: Option<&Fdt>, vc5: bool) -> Option<vc4_edid::Edid> {
+    let ddc = match Bus::open(fdt, vc5) {
         Ok(ddc) => ddc,
         Err(err) => {
             println!("vc4d: edid: {err}");
             return None;
         }
     };
-    println!("vc4d: edid: DDC controller at {:#x}", ddc.phys);
+    ddc.log_where();
     let mut data = vec![0u8; vc4_edid::BLOCK];
     if let Err(err) = ddc.read_edid(0, &mut data) {
         println!("vc4d: edid: FAIL: {err}");
