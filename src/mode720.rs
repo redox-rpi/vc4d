@@ -18,12 +18,12 @@
 //
 // No person needed to see a black screen: after the change vc4d checks
 // that every register reads back as written, that the HDMI encoder's
-// frame counter and the HVS channel count the new mode's frames per
-// second (the frame rate follows the PHY's pixel clock and the timing:
+// frame counter and the HVS channel count as fast as in the firmware's
+// mode, scaled by the refresh rates (the frame rate follows the PHY's pixel clock and the timing:
 // 74.25 MHz / (1650 x 750) = 60 Hz), that the HVS reports no underrun, that
 // the packet scheduler is active and the FIFO recentres, and that the
-// monitor still answers on DDC (EDID, and SCDC status on HDMI 2.0
-// monitors). Any check failing restores the firmware's values at once.
+// monitor still answers on DDC (EDID, and no SCDC lock bit lost against
+// the firmware's mode on HDMI 2.0 monitors). Any check failing restores the firmware's values at once.
 // Otherwise vc4d keeps 720p for a few seconds and then restores the
 // firmware's mode and checks it again ("restore N" in the file, default
 // 15), unless the file says "keep": then the desktop starts at 720p.
@@ -202,6 +202,8 @@ fn save(b: &Blocks, hvs: &Hvs, ch: usize) -> Saved {
 }
 
 /// The target of one change: a computed mode, or the saved firmware state.
+/// Only passed by reference, so the size of the variants does not matter.
+#[allow(clippy::large_enum_variant)]
 enum Target<'a> {
     Mode { t: &'a Timing, pv: Pv, hdmi: [(usize, &'static str, u32); 6], phy: vc4_mode::Phy5 },
     Firmware(&'a Saved),
@@ -302,8 +304,49 @@ fn measure(b: &Blocks, hvs: &Hvs, ch: usize) -> (u32, u32) {
     (b.hd.rd(HD_FRAME_COUNT).wrapping_sub(hd0), frames)
 }
 
+/// What the counters and the monitor show in the firmware's own mode,
+/// before the switch: the checks compare with it. The HVS5's frame field
+/// counts four per frame (Test 707: 240 at the firmware's 60 Hz), and a
+/// monitor may report fewer SCDC lock bits at HDMI 1.4 rates (0x03 on the
+/// HP 27 FHD in the firmware's mode).
+struct Base {
+    hz: u32,
+    hd_fps: u32,
+    hvs_fps: u32,
+    scdc: Option<u8>,
+}
+
+/// SCDC version and status flags 0, if the monitor answers at 0x54.
+fn scdc(fdt: &Fdt) -> Result<(u8, u8), String> {
+    let ddc = crate::ddc_stb::StbDdc::open(fdt)?;
+    let (mut version, mut flags) = ([0u8; 1], [0u8; 1]);
+    ddc.read_reg(SCDC_ADDR, SCDC_SINK_VERSION, &mut version)?;
+    ddc.read_reg(SCDC_ADDR, SCDC_STATUS_FLAGS_0, &mut flags)?;
+    Ok((version[0], flags[0]))
+}
+
+fn scdc_text(f: u8) -> String {
+    format!(
+        "clock {}, locked ch0 {} ch1 {} ch2 {}",
+        if f & 1 != 0 { "detected" } else { "NOT detected" },
+        f >> 1 & 1,
+        f >> 2 & 1,
+        f >> 3 & 1
+    )
+}
+
 /// The checks without a person; true when all pass.
-fn verify(b: &Blocks, hvs: &Hvs, ch: usize, target: &Target, t: &Timing, hd_counts: bool, fdt: &Fdt, what: &str) -> bool {
+/// The hardware the checks look at.
+#[derive(Clone, Copy)]
+struct Hw<'a> {
+    b: &'a Blocks,
+    hvs: &'a Hvs,
+    ch: usize,
+    fdt: &'a Fdt<'a>,
+}
+
+fn verify(hw: Hw, target: &Target, t: &Timing, base: &Base, what: &str) -> bool {
+    let Hw { b, hvs, ch, fdt } = hw;
     let mut ok = true;
     let mut fail = |why: String| {
         println!("vc4d: mode5: {what}: check FAILED: {why}");
@@ -337,17 +380,26 @@ fn verify(b: &Blocks, hvs: &Hvs, ch: usize, target: &Target, t: &Timing, hd_coun
     thread::sleep(Duration::from_millis(300));
     hvs.clear_errors(ch);
     let (hd_fps, hvs_fps) = measure(b, hvs, ch);
+    // Expected counts: the firmware mode's counts, scaled by the refresh
+    // rates (the counters need not count one per frame).
     let want = t.refresh_mhz().div_ceil(1000);
-    let near = |fps: u32| fps + 2 >= want && fps <= want + 2;
+    let expect = |before: u32| before * want / base.hz.max(1);
+    let near = |fps: u32, before: u32| {
+        let e = expect(before);
+        let slack = (e / 25).max(2);
+        fps + slack >= e && fps <= e + slack
+    };
     println!(
-        "vc4d: mode5: {what}: {hvs_fps} HVS frames/s, {hd_fps} encoder frames/s (frame count {:#010x}), {want} expected",
+        "vc4d: mode5: {what}: {hvs_fps} HVS counts/s (expected {}), {hd_fps} encoder frames/s (expected {}), frame count {:#010x}",
+        expect(base.hvs_fps),
+        expect(base.hd_fps),
         b.hd.rd(HD_FRAME_COUNT)
     );
-    if !near(hvs_fps) {
-        fail(format!("HVS channel counts {hvs_fps} frames/s, not {want}"));
+    if base.hvs_fps > 0 && !near(hvs_fps, base.hvs_fps) {
+        fail(format!("HVS channel counts {hvs_fps}/s, expected {}", expect(base.hvs_fps)));
     }
-    if hd_counts && !near(hd_fps) {
-        fail(format!("encoder frame counter counts {hd_fps} frames/s, not {want}"));
+    if base.hd_fps > 0 && !near(hd_fps, base.hd_fps) {
+        fail(format!("encoder frame counter counts {hd_fps}/s, expected {}", expect(base.hd_fps)));
     }
     let errors = hvs.errors(ch);
     if !errors.is_empty() {
@@ -376,29 +428,21 @@ fn verify(b: &Blocks, hvs: &Hvs, ch: usize, target: &Target, t: &Timing, hd_coun
                 Ok(()) => fail("EDID checksum bad after the change".into()),
                 Err(err) => fail(format!("EDID no longer answers: {err}")),
             }
-            let mut version = [0u8; 1];
-            match ddc.read_reg(SCDC_ADDR, SCDC_SINK_VERSION, &mut version) {
-                Ok(()) => {
-                    let mut flags = [0u8; 1];
-                    match ddc.read_reg(SCDC_ADDR, SCDC_STATUS_FLAGS_0, &mut flags) {
-                        Ok(()) => {
-                            let f = flags[0];
-                            println!(
-                                "vc4d: mode5: {what}: SCDC version {} status {f:#04x}: clock {}, channels locked {}{}{}",
-                                version[0],
-                                if f & 1 != 0 { "detected" } else { "NOT detected" },
-                                f >> 1 & 1,
-                                f >> 2 & 1,
-                                f >> 3 & 1
-                            );
-                            if f & 0x0f != 0x0f {
-                                fail(format!("the monitor's SCDC reports no lock (status {f:#04x})"));
-                            }
-                        }
-                        Err(err) => println!("vc4d: mode5: {what}: SCDC status not read: {err}"),
+            match (scdc(fdt), base.scdc) {
+                (Ok((version, f)), Some(before)) => {
+                    println!(
+                        "vc4d: mode5: {what}: SCDC version {version} status {f:#04x}: {} (firmware's mode {before:#04x})",
+                        scdc_text(f)
+                    );
+                    if f & before & 0x0f != before & 0x0f {
+                        fail(format!("the monitor's SCDC lost lock bits: {f:#04x}, firmware's mode {before:#04x}"));
                     }
                 }
-                Err(_) => println!("vc4d: mode5: {what}: no SCDC (monitor without HDMI 2.0 status), lock not readable"),
+                (Ok((version, f)), None) => {
+                    println!("vc4d: mode5: {what}: SCDC version {version} status {f:#04x}: {} (no value before)", scdc_text(f))
+                }
+                (Err(_), Some(before)) => fail(format!("SCDC no longer answers (firmware's mode {before:#04x})")),
+                (Err(_), None) => println!("vc4d: mode5: {what}: no SCDC (monitor without HDMI 2.0 status)"),
             }
         }
         Err(err) => println!("vc4d: mode5: {what}: DDC not opened: {err}"),
@@ -408,8 +452,11 @@ fn verify(b: &Blocks, hvs: &Hvs, ch: usize, target: &Target, t: &Timing, hd_coun
 }
 
 /// The firmware's HDMI clocks, raised where 720p needs more (it never
-/// does after 1080p). False if a clock is too slow and cannot be raised.
-fn clocks(tmds_hz: u64) -> bool {
+/// does after 1080p). A clock the firmware reports as 0 Hz is not one it
+/// tracks (the HSM clock, id 13, in Test 707) and is left alone. Returns
+/// None if a clock is too slow and cannot be raised, else the clocks set
+/// with their old rates, for the restore.
+fn clocks(tmds_hz: u64) -> Option<Vec<(u32, u32)>> {
     let need_hsm = (tmds_hz / 100 * 101) as u32;
     let need_bvb: u32 = if tmds_hz > 297_000_000 {
         300_000_000
@@ -422,12 +469,14 @@ fn clocks(tmds_hz: u64) -> bool {
         Ok(fw) => fw,
         Err(err) => {
             println!("vc4d: mode5: 720p: clocks not read ({err}), left as the firmware set them for its mode");
-            return true;
+            return Some(Vec::new());
         }
     };
     let mut ok = true;
+    let mut set = Vec::new();
     for (id, name, need) in [(CLOCK_HDMI, "hdmi (HSM)", need_hsm), (CLOCK_BVB, "bvb", need_bvb)] {
         match fw.clock_rate(id) {
+            Ok(0) => println!("vc4d: mode5: 720p: clock {name} (firmware id {id}) reported as 0 Hz: not tracked, left alone"),
             Ok(rate) if rate >= need => {
                 println!("vc4d: mode5: 720p: clock {name} (firmware id {id}) {rate} Hz, needs {need}: kept")
             }
@@ -435,6 +484,7 @@ fn clocks(tmds_hz: u64) -> bool {
                 Ok(new) => {
                     println!("vc4d: mode5: 720p: clock {name} (firmware id {id}) {rate} Hz, needs {need}: set, now {new}");
                     ok &= new >= need;
+                    set.push((id, rate));
                 }
                 Err(err) => {
                     println!("vc4d: mode5: 720p: clock {name} {rate} Hz, needs {need}: setting failed: {err}");
@@ -444,7 +494,18 @@ fn clocks(tmds_hz: u64) -> bool {
             Err(err) => println!("vc4d: mode5: 720p: clock {name} (firmware id {id}) not read: {err}"),
         }
     }
-    ok
+    ok.then_some(set)
+}
+
+/// Puts the clocks `clocks` raised back to their old rates.
+fn restore_clocks(set: &[(u32, u32)]) {
+    let Ok(fw) = Firmware::open() else { return };
+    for &(id, rate) in set {
+        match fw.set_clock_rate(id, rate) {
+            Ok(now) => println!("vc4d: mode5: restore: clock id {id} back to {rate} Hz, now {now}"),
+            Err(err) => println!("vc4d: mode5: restore: clock id {id} not set back: {err}"),
+        }
+    }
 }
 
 /// Step 4. `same` is the firmware's mode as vc4d computed it (step 2
@@ -484,17 +545,27 @@ pub fn switch(fdt: &Fdt, hvs: &Hvs, ch: usize, same: &Same, after: After) -> boo
         );
     }
     println!("vc4d: mode5: phy({}): {phy_same} of {} registers equal the firmware's", fw_t.vactive, ours.len());
-    if !clocks(tmds) {
+    let Some(raised) = clocks(tmds) else {
         println!("vc4d: mode5: 720p: skipped, the HDMI clocks are too slow");
         return false;
-    }
+    };
     let (hd_fps, hvs_fps) = measure(&b, hvs, ch);
     println!(
         "vc4d: mode5: before: {hvs_fps} HVS frames/s, {hd_fps} encoder frames/s (frame count {:#010x}, VID_CTL {:#010x})",
         b.hd.rd(HD_FRAME_COUNT),
         b.hd.rd(HD_VID_CTL)
     );
-    let hd_counts = hd_fps > 0;
+    let scdc_before = match scdc(fdt) {
+        Ok((version, f)) => {
+            println!("vc4d: mode5: before: SCDC version {version} status {f:#04x}: {}", scdc_text(f));
+            Some(f)
+        }
+        Err(err) => {
+            println!("vc4d: mode5: before: no SCDC ({err})");
+            None
+        }
+    };
+    let base = Base { hz: fw_t.refresh_mhz().div_ceil(1000), hd_fps, hvs_fps, scdc: scdc_before };
     // The firmware's picture, its top left 1280x720, while the switch is
     // checked; vc4d's own list replaces it when it takes over.
     let first = hvs::decode_list(hvs.generation(), &hvs.read_list(saved.hvs_list, 32)).into_iter().next();
@@ -515,12 +586,14 @@ pub fn switch(fdt: &Fdt, hvs: &Hvs, ch: usize, same: &Same, after: After) -> boo
     let target = Target::Mode { t: &t, pv, hdmi: vc4_mode::hdmi_bcm2711_regs(&h), phy: vc4_mode::phy5(tmds) };
     println!("vc4d: mode5: 720p: switching (screen blank for a moment)");
     apply(&b, hvs, ch, &target, &fw_t);
-    let good = verify(&b, hvs, ch, &target, &t, hd_counts, fdt, "720p");
+    let hw = Hw { b: &b, hvs, ch, fdt };
+    let good = verify(hw, &target, &t, &base, "720p");
     let restore = |why: &str| {
         println!("vc4d: mode5: restore: {why}, back to the firmware's mode");
         let fw = Target::Firmware(&saved);
         apply(&b, hvs, ch, &fw, &t);
-        verify(&b, hvs, ch, &fw, &fw_t, hd_counts, fdt, "restore")
+        restore_clocks(&raised);
+        verify(hw, &fw, &fw_t, &base, "restore")
     };
     if !good {
         restore("720p failed its checks");
