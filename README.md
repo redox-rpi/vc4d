@@ -53,7 +53,10 @@ one HVS channel running. vc4d takes that channel over:
 - **EDID** (HVS4 boards). At start vc4d reads the monitor's EDID over HDMI
   DDC (BSC2 on the BCM2837) and logs it decoded: maker, name, the preferred
   mode with its timing, the other modes, and the CEA-861 extension.
-  `VC4D_EDID=off` skips the read.
+  `VC4D_EDID=off` skips the read. On the Pi 4 and 400 the read is opt-in
+  (`VC4D_EDID=on` or `/etc/vc4d-edid-on`, redox-rpi#671): HDMI0's own I2C
+  controller (`ddc_stb.rs`), taken over from the firmware's auto-i2c
+  engine. It only logs the EDID; the firmware's mode stays.
 - **Mode registers** (HVS4 boards). vc4d computes pixel valve 2 and the
   HDMI core's timing from the EDID, laid out as Linux `vc4_crtc.c` and
   `vc4_hdmi.c` do, and compares them with the firmware's. With
@@ -83,6 +86,7 @@ Environment (set by the bootloader) and files:
 | `VC4D_FLIP=off`, `/etc/vc4d-flip-off` | no flips, direct scanout of the client buffer |
 | `VC4D_MODE=write` | writes pixel valve 2 and the HDMI timing itself (HVS4) |
 | `VC4D_EDID=off` | no EDID read |
+| `VC4D_EDID=on`, `/etc/vc4d-edid-on` | EDID read on the Pi 4 and 400 (log only) |
 | `VC4D_CHECK=off` | no check before the handover |
 | `VC4D_TRACE=<file>`, `/etc/vc4d-trace` | CSV trace |
 | `VC4D_VBLANK=off` | flips on the 4 ms timer instead of the vertical blank (Pi 4 and 400) |
