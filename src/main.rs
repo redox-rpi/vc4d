@@ -24,7 +24,9 @@
 // runs first, also without an HVS (QEMU with an i2c-ddc device).
 // VC4D_MODE=write lets vc4d program pixel valve 2 and the HDMI timing
 // itself when its values equal the firmware's (mode.rs, stages 3a and 3b);
-// without it vc4d only compares. VC4D_FLIP=off scans the client's buffer
+// without it vc4d only compares. VC4D_MODE=720p (or /etc/vc4d-mode-720p)
+// switches the BCM2711 to 1280x720 and back (mode720.rs, redox-rpi#671
+// step 4). VC4D_FLIP=off scans the client's buffer
 // out directly, as before (adapter.rs, Flip): without it the primary
 // plane is double buffered.
 
@@ -45,9 +47,11 @@ mod adapter;
 mod check;
 mod ddc;
 mod ddc_stb;
+mod firmware;
 mod irqprobe;
 mod vblank;
 mod mode;
+mod mode720;
 use vc4_hvs as hvs;
 mod shot;
 mod trace;
@@ -172,7 +176,7 @@ fn daemon(daemon: daemon::Daemon) -> ! {
             found.get_or_insert(channel);
         }
     }
-    let Some(channel) = found else {
+    let Some(mut channel) = found else {
         give_up(daemon, "no HVS channel enabled");
     };
     // A channel the firmware set up but does not scan out would show
@@ -188,11 +192,23 @@ fn daemon(daemon: daemon::Daemon) -> ! {
         let same = mode::compare_bcm2711(fdt, edid);
         // Step 3: write the same mode (VC4D_MODE=write or /etc/vc4d-mode-write).
         if env::var("VC4D_MODE").is_ok_and(|v| v == "write") || std::path::Path::new("/etc/vc4d-mode-write").exists() {
-            match same {
+            match &same {
                 Some(same) => {
-                    mode::write_mode_bcm2711(fdt, &same);
+                    mode::write_mode_bcm2711(fdt, same);
                 }
                 None => println!("vc4d: mode5: write: skipped, the mode registers differ from the firmware's"),
+            }
+        }
+        // Step 4: 1280x720, then back to the firmware's mode unless kept
+        // (VC4D_MODE=720p or /etc/vc4d-mode-720p).
+        if let Some(after) = mode720::wanted() {
+            match &same {
+                Some(same) => {
+                    if mode720::switch(fdt, &hvs, channel.index, same, after) {
+                        channel = hvs.channel(channel.index).unwrap_or(channel);
+                    }
+                }
+                None => println!("vc4d: mode5: 720p: skipped, the firmware's mode registers differ from vc4d's"),
             }
         }
     }

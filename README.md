@@ -60,6 +60,20 @@ one HVS channel running. vc4d takes that channel over:
   computes for the preferred mode with the firmware's (two pixels per
   clock, BCM2711 offsets; read only), and with `VC4D_MODE=write` or
   `/etc/vc4d-mode-write` writes them itself when they match.
+- **Mode change** (Pi 4 and 400, opt-in, redox-rpi#671 step 4). With the
+  EDID read on and the firmware's mode understood (the step above found it
+  equal), `VC4D_MODE=720p` or `/etc/vc4d-mode-720p` switches HDMI0 to
+  1280x720 at 60 Hz (`mode720.rs`): pixel valve 2 off, HVS channel size,
+  HDMI PHY for 74.25 MHz (Linux `vc5_hdmi_phy_init()`, arithmetic in the
+  mode crate), HDMI0 and valve timing, valve on, HDMI FIFO recentred. The
+  firmware's HDMI clocks are read through rpi-firmwared's `property` file
+  and raised only if too slow. Checks without a person: read-back, frames
+  per second of the HDMI encoder and the HVS channel (they follow the PHY
+  clock), no HVS underrun, packet scheduler active, EDID still readable,
+  SCDC lock flags on HDMI 2.0 monitors. A failed check restores the
+  firmware's values at once. The file holds `restore N` (back to the
+  firmware's mode after N seconds, the default with 15) or `keep` (the
+  desktop starts at 1280x720).
 - **Mode registers** (HVS4 boards). vc4d computes pixel valve 2 and the
   HDMI core's timing from the EDID, laid out as Linux `vc4_crtc.c` and
   `vc4_hdmi.c` do, and compares them with the firmware's. With
@@ -89,6 +103,7 @@ Environment (set by the bootloader) and files:
 | `VC4D_FLIP=off`, `/etc/vc4d-flip-off` | no flips, direct scanout of the client buffer |
 | `VC4D_MODE=write` | writes pixel valve 2 and the HDMI timing itself (HVS4; on the Pi 4 and 400 with the EDID read on) |
 | `/etc/vc4d-mode-write` | the same as `VC4D_MODE=write` (Pi 4 and 400) |
+| `VC4D_MODE=720p`, `/etc/vc4d-mode-720p` | 1280x720 on the Pi 4 and 400, then back (`restore N`, default 15 s) or `keep` |
 | `VC4D_EDID=off` | no EDID read |
 | `VC4D_EDID=on`, `/etc/vc4d-edid-on` | EDID read on the Pi 4 and 400 (log only) |
 | `VC4D_CHECK=off` | no check before the handover |

@@ -99,13 +99,18 @@ impl StbDdc {
 
     /// One transfer: `tx` to the device, or `rx.len()` bytes from it.
     fn transfer(&self, tx: &[u8], rx: Option<&mut [u8]>) -> Result<(), String> {
+        self.transfer_at(EDID_ADDR, tx, rx)
+    }
+
+    /// One transfer with the device at 7-bit address `addr`.
+    fn transfer_at(&self, addr: u32, tx: &[u8], rx: Option<&mut [u8]>) -> Result<(), String> {
         let (len, read) = match &rx {
             Some(buf) => (buf.len(), true),
             None => (tx.len(), false),
         };
         assert!(len > 0 && len <= MAX_XFER);
         self.write(IIC_ENABLE, 0);
-        self.write(CHIP_ADDRESS, (EDID_ADDR << 1) | u32::from(read));
+        self.write(CHIP_ADDRESS, (addr << 1) | u32::from(read));
         for (i, chunk) in tx.chunks(4).enumerate() {
             let word = chunk.iter().enumerate().fold(0u32, |w, (j, &b)| w | (u32::from(b) << (8 * j)));
             self.write(DATA_IN + 4 * i, word);
@@ -129,7 +134,7 @@ impl StbDdc {
         };
         self.write(IIC_ENABLE, 0);
         if status & IIC_NOACK != 0 {
-            return Err("no acknowledge (no monitor, or it does not answer at 0x50)".into());
+            return Err(format!("no acknowledge (no monitor, or it does not answer at {addr:#04x})"));
         }
         if let Some(buf) = rx {
             for (i, chunk) in buf.chunks_mut(4).enumerate() {
@@ -151,5 +156,14 @@ impl StbDdc {
             at += chunk.len();
         }
         Ok(())
+    }
+
+    /// Reads `buf.len()` bytes from register `offset` of the device at
+    /// `addr`, as for the EDID (offset first, then the bytes): the SCDC
+    /// of HDMI 2.0 monitors (0x54), whose status flags say whether the
+    /// monitor locks onto the clock and the three data channels.
+    pub fn read_reg(&self, addr: u8, offset: u8, buf: &mut [u8]) -> Result<(), String> {
+        self.transfer_at(u32::from(addr), &[offset], None)?;
+        self.transfer_at(u32::from(addr), &[], Some(buf))
     }
 }
